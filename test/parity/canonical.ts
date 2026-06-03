@@ -19,11 +19,18 @@ function normalizeScalars(v: unknown): unknown {
     return v;
   }
   if (typeof v === "string") {
-    const t = Date.parse(v);
-    if (/^\d{4}-\d{2}-\d{2}T/.test(v) && !Number.isNaN(t)) {
-      const d = new Date(t);
-      const us = (d.getUTCMilliseconds() * 1000).toString().padStart(6, "0");
-      return d.toISOString().replace(/\.\d{3}Z$/, `.${us}+00:00`);
+    // Datetime instant-parity: normalize RFC3339 to `.ffffff+00:00` via STRING ops (NOT JS Date,
+    // which is millisecond-only and would drop Python's microseconds). The Python ref runner
+    // (tools/parity/run_python_ref.py::_norm_dt) applies the IDENTICAL transform, so datetime fields
+    // compare as the same instant regardless of Z/+00:00 or fractional-digit count. Pydantic emits
+    // `str` datetime fields verbatim (often Z) but `datetime` fields as `.ffffff+00:00`; this reconciles
+    // both. Non-datetime strings pass through verbatim. (UTC assumed; non-UTC offsets kept as-is.)
+    // eslint-disable-next-line security/detect-unsafe-regex -- anchored, no nested/ambiguous quantifiers (no ReDoS)
+    const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(v);
+    if (m) {
+      const frac = (m[2] ?? "").padEnd(6, "0").slice(0, 6);
+      const offset = m[3] === "Z" ? "+00:00" : m[3];
+      return `${m[1]}.${frac}${offset}`;
     }
     return v;
   }

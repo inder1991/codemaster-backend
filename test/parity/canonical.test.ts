@@ -14,14 +14,11 @@ describe("canonicalize", () => {
     expect(canonicalize({ cost: "1.50" })).toBe('{"cost":"1.50"}');
   });
 
-  it("normalizes an RFC3339 timestamp to microsecond-precision UTC (matches Python isoformat)", () => {
-    expect(canonicalize({ t: "2026-06-03T10:00:00.000000+00:00" })).toBe(
-      '{"t":"2026-06-03T10:00:00.000000+00:00"}',
-    );
-    // a "Z"/millisecond form normalizes to the same canonical microsecond+offset form
-    expect(canonicalize({ t: "2026-06-03T10:00:00.000Z" })).toBe(
-      '{"t":"2026-06-03T10:00:00.000000+00:00"}',
-    );
+  it("normalizes datetime instants to .ffffff+00:00 via string ops (mirrors the Python ref runner)", () => {
+    // string-based (not JS Date), so microseconds survive; Z and +00:00 unify
+    expect(canonicalize({ t: "2026-06-03T10:00:00Z" })).toBe('{"t":"2026-06-03T10:00:00.000000+00:00"}');
+    expect(canonicalize({ t: "2026-06-03T10:00:00.123456Z" })).toBe('{"t":"2026-06-03T10:00:00.123456+00:00"}');
+    expect(canonicalize({ t: "2026-06-03T10:00:00.5+00:00" })).toBe('{"t":"2026-06-03T10:00:00.500000+00:00"}');
   });
 
   it("throws on a bare float (contracts must emit Decimal-as-string or int)", () => {

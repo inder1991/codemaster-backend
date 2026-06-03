@@ -15,9 +15,30 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import re
 from decimal import Decimal
 from enum import Enum
 from typing import Any
+
+# Datetime instant-parity: normalize RFC3339 to `.ffffff+00:00` (IDENTICAL transform to the TS
+# canonicalizer test/parity/canonical.ts). Reconciles Pydantic's verbatim `str` datetime fields
+# (often Z) with its `datetime` fields (.ffffff+00:00). UTC assumed; non-UTC offsets kept as-is.
+_DT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _norm_dt(obj: Any) -> Any:
+    if isinstance(obj, str):
+        m = _DT_RE.match(obj)
+        if m:
+            frac = (m.group(2) or "").ljust(6, "0")[:6]
+            offset = "+00:00" if m.group(3) == "Z" else m.group(3)
+            return f"{m.group(1)}.{frac}{offset}"
+        return obj
+    if isinstance(obj, list):
+        return [_norm_dt(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _norm_dt(v) for k, v in obj.items()}
+    return obj
 
 
 def _to_jsonable(result: Any) -> Any:
@@ -33,7 +54,9 @@ def _to_jsonable(result: Any) -> Any:
 
 
 def _canonical(obj: Any) -> str:
-    # Match the TS canonicalizer: Decimal -> string, sort keys, tight separators.
+    # Match the TS canonicalizer: datetime -> `.ffffff+00:00`, Decimal -> string, sort keys, tight separators.
+    obj = _norm_dt(obj)
+
     def default(o: Any) -> Any:
         if isinstance(o, Decimal):
             return str(o)
