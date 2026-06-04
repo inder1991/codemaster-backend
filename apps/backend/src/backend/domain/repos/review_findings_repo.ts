@@ -37,19 +37,30 @@
  * {@link getPool}) and installs the {@link TenancyPlugin} centrally. The repo accepts a `Kysely`
  * (and a `Clock` seam) by injection so callers share one engine across all repos.
  *
- * DEFERRED cross-subsystem wiring (documented, signatures kept 1:1 so it is purely additive later):
- *   - The Python `persistAggregated` + the three lifecycle setters wire the AD-4 stale-write guard
- *     (`codemaster.domain.stale_write_guard.assert_current_run`) inside the mutation transaction, and
- *     `persistAggregated` additionally emits the `FINDINGS_PERSISTED` milestone into
- *     `audit.workflow_events`. Both depend on TS ports that DO NOT YET EXIST in this repo
- *     (`stale_write_guard` + `emit_workflow_event` — workflow-orchestration concerns, not the
- *     `core.review_findings` data layer). They are NOT ported here; the `run_id` / `review_id`
- *     parameters are preserved on every signature so the guard threads through unchanged once those
- *     modules land. The Python observability emits (OTel lifecycle counters + structlog) are likewise
- *     best-effort side-effects outside the data layer and are not part of this port.
+ * WIRED cross-subsystem composition (Phase 2.1 stale-write gate, part B of 3):
+ *   - `persistAggregated` now runs its whole body inside ONE transaction and, as the first step inside
+ *     that transaction, calls the AD-4 stale-write guard ({@link assertCurrentRun} from
+ *     `../stale_write_guard.js`, the TS port of `codemaster.domain.stale_write_guard.assert_current_run`)
+ *     framed in a raw Postgres SAVEPOINT — mirroring the frozen Python `async with
+ *     session.begin_nested() as sp: try: assert_current_run(...) except: await sp.commit(); raise`.
+ *     The savepoint is RELEASEd (not rolled back to) on a {@link StaleWriteError} so the guard's
+ *     `STALE_WRITE_BLOCKED` forensic INSERT is structurally retained per the Python idiom before the
+ *     re-raise propagates out of `.execute()` and rolls the outer transaction back.
+ *   - After the guard passes, `persistAggregated` emits the idempotent `FINDINGS_PERSISTED` milestone
+ *     into `audit.workflow_events` ({@link emitWorkflowEvent} from `../../ingest/_workflow_events_repository.js`),
+ *     guarded by a pre-emit SELECT so a Temporal retry does not double-emit. Both the bulk INSERT and
+ *     the milestone share the one transaction's fate.
+ *   - OTel side-effects the guard queues are fired by {@link PendingEmits.drain} (from
+ *     `../../infra/post_commit_emit.js`) AFTER the transaction commits — never on rollback.
+ *
+ * FOLLOW-ON (NOT in this task): the three Phase-D lifecycle setters (`insertTier1Finding`,
+ * `updateTier2Arbitration`, and the ADR-0056 delivery-lifecycle setters) are arbitration / delivery
+ * persistence, NOT on the Sprint-2.5 dual-run findings path; wiring the SAME guard into them is a
+ * same-shaped, additive follow-on. Their `runId` / `reviewId` parameters are already preserved on
+ * every signature so threading the guard later is purely additive.
  */
 
-import { type Kysely, sql } from "kysely";
+import { type Kysely, sql, type Transaction } from "kysely";
 import { createHash } from "node:crypto";
 
 import { tenantKysely } from "#platform/db/database.js";
@@ -58,6 +69,10 @@ import type { Clock } from "#platform/clock.js";
 
 import type { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
 import { DEGRADED_OUTCOMES } from "#contracts/finding_lifecycle_inputs.v1.js";
+
+import { assertCurrentRun, StaleWriteError } from "../stale_write_guard.js";
+import { PendingEmits } from "../../infra/post_commit_emit.js";
+import { emitWorkflowEvent } from "../../ingest/_workflow_events_repository.js";
 
 // ─── uuid5 (deterministic; NOT randomness — outside the clock/random gate's scope) ──────────────
 //
@@ -194,9 +209,15 @@ export class PostgresReviewFindingsRepo {
    * `policyMetadata` is per-finding aligned by index (None / out-of-range → `{}`), 1:1 with the
    * Python T-8b semantics.
    *
-   * DEFERRED (see module header): the AD-4 stale-write guard + FINDINGS_PERSISTED milestone emit the
-   * Python version runs inside this transaction are NOT wired here (un-ported cross-subsystem deps).
-   * `runId` / `reviewId` are accepted and preserved so threading the guard later is additive.
+   * WIRED (Phase 2.1 stale-write gate, part B): the whole body runs inside ONE transaction. FIRST,
+   * inside a raw Postgres SAVEPOINT, the AD-4 stale-write guard ({@link assertCurrentRun}) validates
+   * that `runId` is still `core.pull_request_reviews.current_run_id`; on a {@link StaleWriteError} the
+   * savepoint is RELEASEd (retaining the guard's `STALE_WRITE_BLOCKED` forensic INSERT, per the frozen
+   * Python `begin_nested → sp.commit() → raise` idiom) and the error re-raises out of the transaction,
+   * rolling back the (un-persisted) findings. THEN the bulk INSERT runs (skipped on 0 findings — an
+   * empty VALUES clause is illegal in Postgres, BF-8). THEN the idempotent `FINDINGS_PERSISTED`
+   * milestone is emitted (a pre-emit SELECT dedupes a Temporal retry). The OTel counter the guard
+   * queued fires only after the transaction commits (via {@link PendingEmits.drain}).
    */
   public async persistAggregated(args: {
     prId: string;
@@ -206,7 +227,7 @@ export class PostgresReviewFindingsRepo {
     reviewId: string;
     policyMetadata?: ReadonlyArray<Record<string, unknown>> | null;
   }): Promise<ReadonlyArray<string>> {
-    const { prId, installationId, aggregated } = args;
+    const { prId, installationId, aggregated, runId, reviewId } = args;
     const policyMetadata = args.policyMetadata ?? null;
 
     // S20.DM-FIX M4 — Clock injection (was: datetime.now(UTC)); recorded as created_at on each row.
@@ -264,27 +285,112 @@ export class PostgresReviewFindingsRepo {
       });
     });
 
-    // BF-8 smoke fix: a clean PR (0 findings) flows through WITHOUT an empty VALUES clause; the
-    // INSERT is skipped. (The FINDINGS_PERSISTED milestone emit the Python version runs in this case
-    // is deferred — see module header.)
-    if (rows.length > 0) {
-      // S20.DM-FIX I5 — single multi-row INSERT. Build the VALUES tuples with `sql.join`; every bind
-      // value flows through parameterised `sql` fragments (no user data interpolated).
-      const valueTuples = rows.map(
-        (r) =>
-          sql`(${r.rfid}, ${installationId}, ${prId}, ${r.file_path}, ${r.start_line}, ${r.end_line}, ${r.severity}, ${r.category}, ${r.title}, ${r.body}, ${r.suggestion}, ${r.confidence}, CAST(${r.citations} AS JSONB), CAST(${r.policy_metadata} AS JSONB), ${r.scope}, CAST(${r.evidence_refs} AS JSONB), ${now})`,
-      );
-      await sql`
-        INSERT INTO core.review_findings
-          (review_finding_id, installation_id, pr_id,
-           file_path, start_line, end_line,
-           severity, category, title, body, suggestion,
-           confidence, citations, policy_metadata,
-           scope, evidence_refs, created_at)
-        VALUES ${sql.join(valueTuples)}
-        ON CONFLICT (review_finding_id) DO NOTHING
-      `.execute(this.db);
-    }
+    // Phase 2.1 stale-write gate, part B — the WHOLE body (guard + bulk INSERT + milestone emit) runs
+    // inside ONE transaction so they share fate. The post-commit OTel collector is created BEFORE the
+    // transaction; it is drained ONLY after `.execute()` resolves (i.e. after a successful commit), so
+    // a rollback drops every queued emit (mirrors the Python after_commit/after_rollback listener pair).
+    const pending = new PendingEmits();
+
+    await this.db.transaction().execute(async (txTyped) => {
+      // The cross-subsystem seams ({@link assertCurrentRun} / {@link emitWorkflowEvent}) accept a
+      // schema-agnostic `Transaction<unknown>` — they run raw `sql` and do their own `instanceof
+      // Transaction` runtime check, so the DB-schema generic is irrelevant to them. Kysely's
+      // `Transaction<DB>` is invariant in `DB`, so we widen ONCE here (the runtime object is the same
+      // transaction handle the raw `sql\`...\`.execute(...)` calls below also run on).
+      const tx = txTyped as unknown as Transaction<unknown>;
+
+      // FIRST: the AD-4 stale-write guard, framed in a raw Postgres SAVEPOINT. 1:1 with the frozen
+      // Python `async with session.begin_nested() as sp: try: assert_current_run(...) except: await
+      // sp.commit(); raise`. Kysely's auto-managed nested `tx.transaction().execute(...)` would ROLL
+      // BACK to the savepoint on a throw (discarding the guard's STALE_WRITE_BLOCKED INSERT), so we use
+      // raw SAVEPOINT / RELEASE SAVEPOINT to reproduce Python's RELEASE-on-error: the forensic INSERT is
+      // structurally retained at the outer-transaction level, then the re-raise propagates out of
+      // `.execute()` and the outer transaction rolls back (so a STALE write persists NEITHER the
+      // findings NOR — at the outer level — the merged STALE_WRITE_BLOCKED row).
+      await sql`SAVEPOINT sp_stale_write_guard`.execute(tx);
+      try {
+        await assertCurrentRun({
+          tx,
+          runId,
+          reviewId,
+          site: "findings_repository.persist_aggregated",
+          pending,
+          clock: this.clock,
+        });
+      } catch (err) {
+        // RELEASE (not ROLLBACK TO) the savepoint so the guard's STALE_WRITE_BLOCKED INSERT is merged
+        // into the outer transaction, exactly as the Python `sp.commit()` does, THEN re-raise. The
+        // StaleWriteError propagates out of `.execute()` → outer rollback. Narrow to StaleWriteError per
+        // the primitive's caller-idiom contract (any other throw is a real fault — let it surface raw).
+        if (err instanceof StaleWriteError) {
+          await sql`RELEASE SAVEPOINT sp_stale_write_guard`.execute(tx);
+        }
+        throw err;
+      }
+      // Guard passed: release the savepoint to keep the nesting clean (no-op on the data).
+      await sql`RELEASE SAVEPOINT sp_stale_write_guard`.execute(tx);
+
+      // THEN (guard passed): bulk INSERT. BF-8 — a clean PR (0 findings) flows through WITHOUT an empty
+      // VALUES clause (the INSERT is skipped) but STILL reaches the FINDINGS_PERSISTED emit below.
+      if (rows.length > 0) {
+        // S20.DM-FIX I5 — single multi-row INSERT. Build the VALUES tuples with `sql.join`; every bind
+        // value flows through parameterised `sql` fragments (no user data interpolated).
+        const valueTuples = rows.map(
+          (r) =>
+            sql`(${r.rfid}, ${installationId}, ${prId}, ${r.file_path}, ${r.start_line}, ${r.end_line}, ${r.severity}, ${r.category}, ${r.title}, ${r.body}, ${r.suggestion}, ${r.confidence}, CAST(${r.citations} AS JSONB), CAST(${r.policy_metadata} AS JSONB), ${r.scope}, CAST(${r.evidence_refs} AS JSONB), ${now})`,
+        );
+        await sql`
+          INSERT INTO core.review_findings
+            (review_finding_id, installation_id, pr_id,
+             file_path, start_line, end_line,
+             severity, category, title, body, suggestion,
+             confidence, citations, policy_metadata,
+             scope, evidence_refs, created_at)
+          VALUES ${sql.join(valueTuples)}
+          ON CONFLICT (review_finding_id) DO NOTHING
+        `.execute(tx);
+      }
+
+      // THEN: the idempotent FINDINGS_PERSISTED milestone, 1:1 with the Python (lines 511-539). A
+      // Temporal retry re-runs this body (the INSERT is absorbed by ON CONFLICT DO NOTHING); the
+      // pre-emit SELECT checks whether a row already exists for (run_id, FINDINGS_PERSISTED) and skips
+      // the re-emit if so. The SELECT and the emit run in the SAME txn as the INSERT, so the milestone
+      // and the durable mutation share fate.
+      // tenant:exempt reason=audit-milestone-keyed-by-run-id follow_up=PERMANENT-EXEMPTION-workflow-events-seq
+      const existing = await sql<{ one: number }>`
+        SELECT 1 AS one FROM audit.workflow_events
+         WHERE run_id = ${runId} AND event_type = ${"FINDINGS_PERSISTED"}
+         LIMIT 1
+      `.execute(tx);
+      if (existing.rows[0] === undefined) {
+        // Provider is looked up from core.pull_request_reviews so the emit carries the canonical value
+        // rather than a hardcoded default. The FK on workflow_events.review_id guarantees the row
+        // exists; provider is NOT NULL there. Defensive fallback to "github" preserves the emit under a
+        // stale-cache race that doesn't see the FK target.
+        // tenant:exempt reason=provider-lookup-by-review-id-pk follow_up=FOLLOW-UP-gf3-error-mode
+        const providerResult = await sql<{ provider: string }>`
+          SELECT provider FROM core.pull_request_reviews WHERE review_id = ${reviewId}
+        `.execute(tx);
+        const provider: string = providerResult.rows[0]?.provider ?? "github";
+
+        await emitWorkflowEvent({
+          dbOrTx: tx,
+          provider,
+          runId,
+          reviewId,
+          eventType: "FINDINGS_PERSISTED",
+          payload: { findings_persisted: findingIds.length },
+          deliveryId: null,
+          installationId,
+          clock: this.clock,
+        });
+      }
+    });
+
+    // After the transaction COMMITS: fire the queued OTel emits (the guard's stale-write counter, if it
+    // queued one — but on the happy path it does not). On rollback we never reach here, so the emits are
+    // dropped (the "drop unfired on rollback" semantics).
+    pending.drain();
 
     return findingIds;
   }

@@ -8,6 +8,7 @@ import {
   deriveReviewFindingId,
   PostgresReviewFindingsRepo,
 } from "#backend/domain/repos/review_findings_repo.js";
+import { StaleWriteError } from "#backend/domain/stale_write_guard.js";
 
 import { TenancyPlugin } from "#platform/db/tenancy_plugin.js";
 import { FakeClock } from "#platform/clock.js";
@@ -69,14 +70,30 @@ type Seed = {
   repositoryId: string;
   ghUserId: string;
   prId: string;
+  /** core.pull_request_reviews.review_id — FK target of audit.workflow_events.review_id. */
+  reviewId: string;
+  /** The run set as core.pull_request_reviews.current_run_id (the AUTHORITATIVE run for this review). */
+  currentRunId: string;
 };
 
-/** Seed the FK chain (installation → repository → gh_user → pull_request) for one tenant. */
+/**
+ * Seed the FK chain (installation → repository → gh_user → pull_request) for one tenant, PLUS a
+ * core.pull_request_reviews row and the core.review_runs row that is its authoritative current_run_id.
+ *
+ * The stale-write guard now wired into persistAggregated reads
+ * core.pull_request_reviews.current_run_id under FOR SHARE and throws StaleWriteError unless the caller
+ * passes runId === current_run_id, so every persistAggregated call in this suite must reference a real
+ * (review_id, current_run_id) pair. The review→run→review insert dance resolves the circular FK
+ * (review_runs.review_id RESTRICT vs pull_request_reviews.current_run_id SET NULL): INSERT the review
+ * with current_run_id NULL, INSERT the run, then UPDATE current_run_id.
+ */
 async function seedTenant(): Promise<Seed> {
   const installationId = newUuid();
   const repositoryId = newUuid();
   const ghUserId = newUuid();
   const prId = newUuid();
+  const reviewId = newUuid();
+  const currentRunId = newUuid();
   const ghInstall = uniqueBigint();
   const ghRepo = uniqueBigint();
   const ghUser = uniqueBigint();
@@ -107,7 +124,45 @@ async function seedTenant(): Promise<Seed> {
              'main', $7, 'feature', $8, now())`,
     [prId, installationId, repositoryId, ghPr, (ghPr % 9999) + 1, ghUserId, "a".repeat(40), "b".repeat(40)],
   );
-  return { installationId, repositoryId, ghUserId, prId };
+  // pull_request_reviews + review_runs (circular-FK insert dance; see docstring).
+  await pool.query(
+    `INSERT INTO core.pull_request_reviews
+       (review_id, provider, repo_id, pr_number, provider_pr_id, current_run_id)
+     VALUES ($1, 'github', $2, $3, $4, NULL)`,
+    [reviewId, ghRepo, (ghPr % 9999) + 1, `pr-${ghRepo}-${ghPr}`],
+  );
+  await seedRun(reviewId, currentRunId);
+  await pool.query(`UPDATE core.pull_request_reviews SET current_run_id = $1 WHERE review_id = $2`, [
+    currentRunId,
+    reviewId,
+  ]);
+  return { installationId, repositoryId, ghUserId, prId, reviewId, currentRunId };
+}
+
+/** Seed a core.review_runs row for `reviewId` (FK target of workflow_events.run_id; review FK RESTRICT). */
+async function seedRun(reviewId: string, runId: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO core.review_runs (run_id, review_id, trigger_type) VALUES ($1, $2, 'pr_opened')`,
+    [runId, reviewId],
+  );
+}
+
+/** Count audit.workflow_events rows of a given event_type for a review (chain-link assertions). */
+async function countEvents(reviewId: string, eventType: string): Promise<number> {
+  const r = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM audit.workflow_events WHERE review_id = $1 AND event_type = $2`,
+    [reviewId, eventType],
+  );
+  return Number(r.rows[0]?.n);
+}
+
+/** Count core.review_findings rows for a tenant. */
+async function countFindings(installationId: string): Promise<number> {
+  const r = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM core.review_findings WHERE installation_id = $1`,
+    [installationId],
+  );
+  return Number(r.rows[0]?.n);
 }
 
 /** Seed a posted_reviews row (FK target for posted_review_pr_id; pr_id is its PK). */
@@ -124,6 +179,14 @@ async function seedPostedReview(prId: string): Promise<void> {
 async function cleanupTenant(seed: Seed): Promise<void> {
   await pool.query(`DELETE FROM core.review_findings WHERE installation_id = $1`, [seed.installationId]);
   await pool.query(`DELETE FROM core.posted_reviews WHERE pr_id = $1`, [seed.prId]);
+  // workflow_events (run_id/review_id FK RESTRICT) must go before the runs/review. Then null the
+  // review's current_run_id pointer so review_runs can be deleted (review_runs.review_id is RESTRICT).
+  await pool.query(`DELETE FROM audit.workflow_events WHERE review_id = $1`, [seed.reviewId]);
+  await pool.query(`UPDATE core.pull_request_reviews SET current_run_id = NULL WHERE review_id = $1`, [
+    seed.reviewId,
+  ]);
+  await pool.query(`DELETE FROM core.review_runs WHERE review_id = $1`, [seed.reviewId]);
+  await pool.query(`DELETE FROM core.pull_request_reviews WHERE review_id = $1`, [seed.reviewId]);
   await pool.query(`DELETE FROM core.pull_requests WHERE installation_id = $1`, [seed.installationId]);
   await pool.query(`DELETE FROM core.repositories WHERE installation_id = $1`, [seed.installationId]);
   await pool.query(`DELETE FROM core.gh_users WHERE gh_user_id = $1`, [seed.ghUserId]);
@@ -187,8 +250,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
 
       // Returned ids are uuid5-derived (stable per finding tuple), in input order.
@@ -256,8 +319,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       expect(ids2).toEqual(ids);
       const countAfter = await pool.query<{ n: string }>(
@@ -277,8 +340,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated: aggregatedOf([]),
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       expect(ids).toEqual([]);
       const n = await pool.query<{ n: string }>(
@@ -330,8 +393,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
         policyMetadata: [{ rule: "R0", matched: true }], // index 1 out-of-range → {} default
       });
       const rows = await pool.query<{ title: string; policy_metadata: unknown }>(
@@ -372,15 +435,15 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: a.prId,
         installationId: a.installationId,
         aggregated: mk("a.py"),
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: a.currentRunId,
+        reviewId: a.reviewId,
       });
       await repo.persistAggregated({
         prId: b.prId,
         installationId: b.installationId,
         aggregated: mk("b.py"),
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: b.currentRunId,
+        reviewId: b.reviewId,
       });
 
       // Flip A's row to skipped so it surfaces in fetchSkippedForWalkthrough.
@@ -520,8 +583,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: a.prId,
         installationId: a.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: a.currentRunId,
+        reviewId: a.reviewId,
       });
       const rfid = ids[0]!;
 
@@ -589,8 +652,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       await seedPostedReview(seed.prId);
 
@@ -691,8 +754,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       await seedPostedReview(seed.prId);
 
@@ -761,8 +824,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       await seedPostedReview(seed.prId);
 
@@ -817,8 +880,8 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         prId: seed.prId,
         installationId: seed.installationId,
         aggregated,
-        runId: newUuid(),
-        reviewId: newUuid(),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
       });
       await seedPostedReview(seed.prId);
 
@@ -866,6 +929,146 @@ describeDb("PostgresReviewFindingsRepo (integration, disposable PG)", () => {
         "nit:z.py:1",
       ]);
       expect(skipped.every((r) => r.eligibilityReason === "file_not_in_diff")).toBe(true);
+    } finally {
+      await cleanupTenant(seed);
+    }
+  });
+
+  // ─── Phase 2.1 stale-write gate, part B — guard + FINDINGS_PERSISTED emit wired into persistAggregated ─
+
+  it("HAPPY: persistAggregated(runId=current_run_id) persists findings + emits exactly one FINDINGS_PERSISTED, no STALE_WRITE_BLOCKED", async () => {
+    const seed = await seedTenant();
+    try {
+      const aggregated = aggregatedOf([
+        mkFinding("h1.py", 1, "issue", "h-1"),
+        mkFinding("h2.py", 2, "blocker", "h-2"),
+      ]);
+      const ids = await repo.persistAggregated({
+        prId: seed.prId,
+        installationId: seed.installationId,
+        aggregated,
+        runId: seed.currentRunId, // == current_run_id → guard passes
+        reviewId: seed.reviewId,
+      });
+      expect(ids.length).toBe(2);
+
+      // N findings persisted.
+      expect(await countFindings(seed.installationId)).toBe(2);
+      // Exactly one FINDINGS_PERSISTED milestone; no STALE_WRITE_BLOCKED forensic row.
+      expect(await countEvents(seed.reviewId, "FINDINGS_PERSISTED")).toBe(1);
+      expect(await countEvents(seed.reviewId, "STALE_WRITE_BLOCKED")).toBe(0);
+
+      // The milestone payload carries the persisted count and the canonical provider.
+      const ev = await pool.query<{ payload: { findings_persisted: number }; provider: string }>(
+        `SELECT payload, provider FROM audit.workflow_events
+          WHERE review_id = $1 AND event_type = 'FINDINGS_PERSISTED'`,
+        [seed.reviewId],
+      );
+      expect(ev.rows[0]?.payload).toEqual({ findings_persisted: 2 });
+      expect(ev.rows[0]?.provider).toBe("github");
+    } finally {
+      await cleanupTenant(seed);
+    }
+  });
+
+  it("SUPERSEDED: persistAggregated(runId != current_run_id) throws StaleWriteError and rolls back the findings", async () => {
+    const seed = await seedTenant();
+    // A second, NON-authoritative run on the same review (current_run_id still points at seed.currentRunId).
+    const supersededRunId = newUuid();
+    try {
+      await seedRun(seed.reviewId, supersededRunId);
+
+      const aggregated = aggregatedOf([
+        mkFinding("s1.py", 1, "issue", "s-1"),
+        mkFinding("s2.py", 2, "issue", "s-2"),
+      ]);
+
+      await expect(
+        repo.persistAggregated({
+          prId: seed.prId,
+          installationId: seed.installationId,
+          aggregated,
+          runId: supersededRunId, // != current_run_id → guard blocks
+          reviewId: seed.reviewId,
+        }),
+      ).rejects.toBeInstanceOf(StaleWriteError);
+
+      // The N findings were NOT persisted — the outer transaction rolled back.
+      expect(await countFindings(seed.installationId)).toBe(0);
+      // No FINDINGS_PERSISTED milestone was emitted (it never ran — the guard threw first).
+      expect(await countEvents(seed.reviewId, "FINDINGS_PERSISTED")).toBe(0);
+      // EMPIRICAL PARITY (verified against the frozen Python on a real PG): the STALE_WRITE_BLOCKED
+      // forensic row does NOT survive the outer rollback. The guard INSERTs it inside a SAVEPOINT and
+      // the caller RELEASEs that savepoint on StaleWriteError, but RELEASE only MERGES the row into the
+      // outer transaction — it does not independently commit, so the propagating exception rolls the
+      // whole transaction (findings + forensic row) back together. Python's persist_aggregated behaves
+      // identically (0 rows). Locking this in as a regression guard against a future "make it survive"
+      // change that would silently diverge from the reference.
+      expect(await countEvents(seed.reviewId, "STALE_WRITE_BLOCKED")).toBe(0);
+    } finally {
+      // workflow_events for BOTH runs + both runs are cleaned by run_id-independent review_id deletes,
+      // but null the pointer + delete the extra superseded run explicitly first.
+      await pool.query(`DELETE FROM audit.workflow_events WHERE run_id = $1`, [supersededRunId]);
+      await pool.query(`DELETE FROM core.review_runs WHERE run_id = $1`, [supersededRunId]);
+      await cleanupTenant(seed);
+    }
+  });
+
+  it("EMPTY: persistAggregated with 0 findings persists nothing but STILL emits FINDINGS_PERSISTED once (BF-8)", async () => {
+    const seed = await seedTenant();
+    try {
+      const ids = await repo.persistAggregated({
+        prId: seed.prId,
+        installationId: seed.installationId,
+        aggregated: aggregatedOf([]),
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
+      });
+      expect(ids).toEqual([]);
+
+      // No findings rows (the bulk INSERT was skipped — empty VALUES is illegal in Postgres) …
+      expect(await countFindings(seed.installationId)).toBe(0);
+      // … but the milestone STILL fires for a clean PR (BF-8 chain-link (e) fix).
+      expect(await countEvents(seed.reviewId, "FINDINGS_PERSISTED")).toBe(1);
+      const ev = await pool.query<{ payload: { findings_persisted: number } }>(
+        `SELECT payload FROM audit.workflow_events
+          WHERE review_id = $1 AND event_type = 'FINDINGS_PERSISTED'`,
+        [seed.reviewId],
+      );
+      expect(ev.rows[0]?.payload).toEqual({ findings_persisted: 0 });
+    } finally {
+      await cleanupTenant(seed);
+    }
+  });
+
+  it("IDEMPOTENT: a Temporal-retry double-call persists once (ON CONFLICT) and emits FINDINGS_PERSISTED exactly once", async () => {
+    const seed = await seedTenant();
+    try {
+      const aggregated = aggregatedOf([
+        mkFinding("i1.py", 1, "issue", "i-1"),
+        mkFinding("i2.py", 2, "issue", "i-2"),
+      ]);
+      const first = await repo.persistAggregated({
+        prId: seed.prId,
+        installationId: seed.installationId,
+        aggregated,
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
+      });
+      const second = await repo.persistAggregated({
+        prId: seed.prId,
+        installationId: seed.installationId,
+        aggregated,
+        runId: seed.currentRunId,
+        reviewId: seed.reviewId,
+      });
+      // Same uuid5-derived ids both times.
+      expect(second).toEqual(first);
+
+      // ON CONFLICT (review_finding_id) DO NOTHING → still exactly N rows.
+      expect(await countFindings(seed.installationId)).toBe(2);
+      // The pre-emit SELECT dedupes the milestone: emitted EXACTLY ONCE across both calls.
+      expect(await countEvents(seed.reviewId, "FINDINGS_PERSISTED")).toBe(1);
     } finally {
       await cleanupTenant(seed);
     }
