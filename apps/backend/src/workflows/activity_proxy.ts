@@ -67,6 +67,10 @@ import type {
 } from "#contracts/policy_compute.v1.js";
 import type { PersistReviewFindingsInputV1 } from "#contracts/persist_review_findings.v1.js";
 import type { PersistReviewWalkthroughInputV1 } from "#contracts/persist_review_walkthrough.v1.js";
+import type { CitationValidateInputV1 } from "#contracts/citation_validate_input.v1.js";
+import type { CitationValidationResultV1 } from "#contracts/citation_validation.v1.js";
+import type { EmitOutputSafetyAuditEventInput } from "#contracts/emit_output_safety_audit.v1.js";
+import type { SkippedInputV1 } from "#contracts/finding_lifecycle_inputs.v1.js";
 import type {
   ClassifyInput,
   ChunkAndRedactInput,
@@ -83,7 +87,7 @@ import type {
 // transform (sandbox-safe; no clock/random/network). Every value is byte-identical to the transcribed
 // Python source; this adapter only re-shapes the readonly-ness the two type systems disagree on.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-function toActivityOptions(policy: RetryActivityOptions): ActivityOptions {
+export function toActivityOptions(policy: RetryActivityOptions): ActivityOptions {
   const retry = policy.retry;
   const options: ActivityOptions = {};
   if (policy.startToCloseTimeout !== undefined) {
@@ -209,6 +213,23 @@ export function makeActivityPorts(): ReviewActivityPorts {
     releaseWorkspace(input: ReleaseWorkspaceInput): Promise<void>;
   }>(toActivityOptions(RETRY_POLICIES.cleanup));
 
+  // ── Stage-3 ports ──
+  // citation_validate_activity — Step 7.5 (drops findings citing missing repo_paths). Registered name
+  // `citationValidate`.
+  const { citationValidate } = proxyActivities<{
+    citationValidate(input: CitationValidateInputV1): Promise<CitationValidationResultV1>;
+  }>(toActivityOptions(RETRY_POLICIES.citationValidate));
+  // emit_output_safety_audit_event_activity — dispatched on a chunk/walkthrough sanitization_event.
+  // Registered name `emitOutputSafetyAuditEvent`.
+  const { emitOutputSafetyAuditEvent } = proxyActivities<{
+    emitOutputSafetyAuditEvent(input: EmitOutputSafetyAuditEventInput): Promise<void>;
+  }>(toActivityOptions(RETRY_POLICIES.emitOutputSafetyAudit));
+  // record_delivery_skipped_activity — the H-2 inline skip dispatch on the post-review dropped-state
+  // failure path. Registered name `recordDeliverySkipped`.
+  const { recordDeliverySkipped } = proxyActivities<{
+    recordDeliverySkipped(input: SkippedInputV1): Promise<number>;
+  }>(toActivityOptions(RETRY_POLICIES.recordDeliverySkipped));
+
   return {
     clone: cloneRepoIntoWorkspace,
     loadRepoConfig: loadRepoConfigActivity,
@@ -228,5 +249,9 @@ export function makeActivityPorts(): ReviewActivityPorts {
     postReview: postReviewResults,
     postCheckRun,
     cleanup: releaseWorkspace,
+    // Stage-3 ports — the orchestrator dispatches these (Step 7.5 / sanitization-event emit / H-2 skip).
+    citationValidate,
+    emitOutputSafetyAudit: emitOutputSafetyAuditEvent,
+    recordDeliverySkipped,
   };
 }

@@ -40,7 +40,10 @@ import { StaticAnalysisResultV1 } from "#contracts/static_analysis_result.v1.js"
 import { CarryForwardSelectionV1 } from "#contracts/carry_forward.v1.js";
 import { EmbedQueryResultV1 } from "#contracts/embed_query.v1.js";
 import { RetrieveKnowledgeResultV1 } from "#contracts/retrieve_knowledge.v1.js";
-import { ReviewChunkResponseV1 } from "#contracts/review_chunk_response.v1.js";
+import {
+  ReviewChunkResponseV1,
+  OutputSafetySanitizationEventV1,
+} from "#contracts/review_chunk_response.v1.js";
 import { DedupedFindingsV1 } from "#contracts/dedup_findings.v1.js";
 import { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
 import { WalkthroughV1 } from "#contracts/walkthrough.v1.js";
@@ -48,6 +51,9 @@ import { PostedReviewV1, PublicationOutcome } from "#contracts/posted_review.v1.
 import { PostedCheckRunV1 } from "#contracts/posted_check_run.v1.js";
 import { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { ResolvedGuidanceBundleV1 } from "#contracts/resolved_guidance.v1.js";
+import { CitationValidationResultV1 } from "#contracts/citation_validation.v1.js";
+import type { CitationValidateInputV1 } from "#contracts/citation_validate_input.v1.js";
+import type { EmitOutputSafetyAuditEventInput } from "#contracts/emit_output_safety_audit.v1.js";
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Fixtures — built through the Zod schemas so contract defaults / validators apply.
@@ -121,6 +127,16 @@ type StubOverrides = {
   dedupSemanticSkipped?: boolean;
   reviewChunkThrows?: boolean;
   chunkCount?: number;
+  // ── Stage-3 wiring overrides ──
+  /** When set, the citationValidate port is injected and drops this many findings (the rest survive). */
+  withCitationValidate?: boolean;
+  citationDropCount?: number;
+  /** When set, the emitOutputSafetyAudit port is injected (the orchestrator dispatches it on events). */
+  withAuditEmit?: boolean;
+  /** When true, reviewChunk attaches a sanitization_event to its envelope. */
+  chunkSanitizationEvent?: boolean;
+  /** When true, generateWalkthrough attaches a sanitization_event to its envelope. */
+  walkthroughSanitizationEvent?: boolean;
 };
 
 type RecordingStub = {
@@ -128,13 +144,30 @@ type RecordingStub = {
   calls: Array<string>;
   reviewChunkInputs: Array<ReviewContextV1>;
   embedCalls: Array<string>;
+  citationInputs: Array<CitationValidateInputV1>;
+  auditEvents: Array<EmitOutputSafetyAuditEventInput>;
   cleanupCalled: () => boolean;
 };
+
+/** A valid OutputSafetySanitizationEventV1 for the given stage (chunk / walkthrough). */
+function sanitizationEventFor(stage: string): OutputSafetySanitizationEventV1 {
+  return OutputSafetySanitizationEventV1.parse({
+    installation_id: uuidFor(2),
+    request_id: uuidFor(700),
+    original_text: "secret token AKIA1234",
+    redacted_text: "secret token [REDACTED]",
+    spans_redacted: 1,
+    detector_kinds: ["aws_key"],
+    stage,
+  });
+}
 
 function makeStub(o: StubOverrides = {}): RecordingStub {
   const calls: Array<string> = [];
   const reviewChunkInputs: Array<ReviewContextV1> = [];
   const embedCalls: Array<string> = [];
+  const citationInputs: Array<CitationValidateInputV1> = [];
+  const auditEvents: Array<EmitOutputSafetyAuditEventInput> = [];
   let cleanupCalled = false;
 
   const reviewFiles = o.reviewFiles ?? ["src/a.ts", "src/b.ts"];
@@ -215,7 +248,11 @@ function makeStub(o: StubOverrides = {}): RecordingStub {
       if (o.reviewChunkThrows) {
         throw new Error("review-chunk boom");
       }
-      return ReviewChunkResponseV1.parse({ findings: [findingFor(1)], arbitration_intents: [] });
+      return ReviewChunkResponseV1.parse({
+        findings: [findingFor(1)],
+        arbitration_intents: [],
+        sanitization_event: o.chunkSanitizationEvent ? sanitizationEventFor("chunk") : null,
+      });
     },
     dedupFindings: async (input) => {
       calls.push("dedupFindings");
@@ -246,7 +283,12 @@ function makeStub(o: StubOverrides = {}): RecordingStub {
     },
     generateWalkthrough: async () => {
       calls.push("generateWalkthrough");
-      return WalkthroughV1.parse({ tldr: "all good" });
+      return WalkthroughV1.parse({
+        tldr: "all good",
+        sanitization_event: o.walkthroughSanitizationEvent
+          ? sanitizationEventFor("walkthrough")
+          : null,
+      });
     },
     persistReviewWalkthrough: async () => {
       calls.push("persistReviewWalkthrough");
@@ -271,11 +313,35 @@ function makeStub(o: StubOverrides = {}): RecordingStub {
     },
   };
 
+  // ── Stage-3 optional ports (only attached when the override requests them) ──
+  if (o.withCitationValidate) {
+    const dropCount = o.citationDropCount ?? 0;
+    ports.citationValidate = async (input: CitationValidateInputV1) => {
+      calls.push("citationValidate");
+      citationInputs.push(input);
+      const all = [...input.findings];
+      const dropped = all.slice(0, dropCount);
+      const surviving = all.slice(dropCount);
+      return CitationValidationResultV1.parse({
+        surviving,
+        dropped: dropped.map((f) => ({ finding: f, reason: "repo_path not found" })),
+      });
+    };
+  }
+  if (o.withAuditEmit) {
+    ports.emitOutputSafetyAudit = async (input: EmitOutputSafetyAuditEventInput) => {
+      calls.push("emitAudit");
+      auditEvents.push(input);
+    };
+  }
+
   return {
     ports,
     calls,
     reviewChunkInputs,
     embedCalls,
+    citationInputs,
+    auditEvents,
     cleanupCalled: () => cleanupCalled,
   };
 }
@@ -636,6 +702,109 @@ describe("orchestrate — logger injection", () => {
     await orchestrate(makeCtx(stub, { warning: (m) => warnings.push(m) }));
     // the persist_findings stageOutcome emitted a WARN line naming the stage.
     expect(warnings.some((w) => w.includes("persist_findings failed"))).toBe(true);
+  });
+});
+
+describe("orchestrate — Stage-3 citation validation (Step 7.5)", () => {
+  it("is skipped entirely when ctx.activities.citationValidate is omitted (back-compat)", async () => {
+    const stub = makeStub({ chunkCount: 1 });
+    const result = await orchestrate(makeCtx(stub));
+    expect(stub.calls).not.toContain("citationValidate");
+    expect(result.findingsCount).toBe(1);
+  });
+
+  it("dispatches citationValidate between aggregate and persist (skip-mode knowledge_chunk_ids=null)", async () => {
+    const stub = makeStub({ chunkCount: 1, withCitationValidate: true, citationDropCount: 0 });
+    await orchestrate(makeCtx(stub));
+    const aggIdx = stub.calls.indexOf("aggregate");
+    const citIdx = stub.calls.indexOf("citationValidate");
+    const persistIdx = stub.calls.indexOf("persistReviewFindings");
+    expect(aggIdx).toBeGreaterThanOrEqual(0);
+    expect(citIdx).toBeGreaterThan(aggIdx);
+    expect(persistIdx).toBeGreaterThan(citIdx);
+    // skip-mode: knowledge_chunk_ids travels as null (NOT [] — the null/array distinction is load-bearing).
+    expect(stub.citationInputs[0]!.knowledge_chunk_ids).toBeNull();
+    // observe-mode policy citation context (empty rule_ids — no bundles in this fixture).
+    expect(stub.citationInputs[0]!.policy_citation?.enforcement).toBe("observe");
+    expect(stub.citationInputs[0]!.workspace_path).toBe("/ws/abc/repo");
+  });
+
+  it("drops findings citing missing paths + appends a degradation note + filters the downstream set", async () => {
+    // 2 chunks → 2 findings reach aggregate; citation drops 1 → 1 survives into persist/walkthrough/post.
+    const stub = makeStub({ chunkCount: 2, withCitationValidate: true, citationDropCount: 1 });
+    const result = await orchestrate(makeCtx(stub));
+    expect(result.findingsCount).toBe(1); // surviving partition after the drop
+    expect(
+      result.degradationNotes.some((n) =>
+        n.startsWith("citation-validator dropped 1 finding(s) with unresolvable sources"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT append a degradation note when no findings are dropped", async () => {
+    const stub = makeStub({ chunkCount: 1, withCitationValidate: true, citationDropCount: 0 });
+    const result = await orchestrate(makeCtx(stub));
+    expect(result.degradationNotes.some((n) => n.startsWith("citation-validator dropped"))).toBe(
+      false,
+    );
+  });
+});
+
+describe("orchestrate — Stage-3 output-safety audit emit", () => {
+  it("does NOT dispatch the audit when no sanitization_event is present", async () => {
+    const stub = makeStub({ chunkCount: 1, withAuditEmit: true });
+    await orchestrate(makeCtx(stub));
+    expect(stub.calls).not.toContain("emitAudit");
+    expect(stub.auditEvents.length).toBe(0);
+  });
+
+  it("dispatches the audit emit when a chunk envelope carries a sanitization_event", async () => {
+    const stub = makeStub({ chunkCount: 1, withAuditEmit: true, chunkSanitizationEvent: true });
+    await orchestrate(makeCtx(stub));
+    expect(stub.calls.filter((c) => c === "emitAudit").length).toBe(1);
+    expect(stub.auditEvents[0]!.event.stage).toBe("chunk");
+  });
+
+  it("dispatches the audit emit when the walkthrough envelope carries a sanitization_event", async () => {
+    const stub = makeStub({
+      chunkCount: 1,
+      withAuditEmit: true,
+      walkthroughSanitizationEvent: true,
+    });
+    await orchestrate(makeCtx(stub));
+    expect(stub.calls.filter((c) => c === "emitAudit").length).toBe(1);
+    expect(stub.auditEvents[0]!.event.stage).toBe("walkthrough");
+  });
+
+  it("dispatches BOTH chunk + walkthrough audits when both carry a sanitization_event", async () => {
+    const stub = makeStub({
+      chunkCount: 1,
+      withAuditEmit: true,
+      chunkSanitizationEvent: true,
+      walkthroughSanitizationEvent: true,
+    });
+    await orchestrate(makeCtx(stub));
+    expect(stub.calls.filter((c) => c === "emitAudit").length).toBe(2);
+    expect(stub.auditEvents.map((a) => a.event.stage).sort()).toEqual(["chunk", "walkthrough"]);
+  });
+
+  it("is a no-op when the emit port is omitted even if a sanitization_event is present", async () => {
+    const stub = makeStub({ chunkCount: 1, chunkSanitizationEvent: true });
+    const result = await orchestrate(makeCtx(stub));
+    expect(stub.calls).not.toContain("emitAudit");
+    expect(result.status).toBe("accepted");
+  });
+});
+
+describe("orchestrate — Stage-3 post capture population (posting.ts)", () => {
+  it("populates state.postedReview from the PostedReviewV1 after the post lands", async () => {
+    const stub = makeStub({ chunkCount: 1 });
+    const ctx = makeCtx(stub);
+    await orchestrate(ctx);
+    expect(ctx.state.postedReview.reviewId).toBe(7);
+    expect(ctx.state.postedReview.publicationOutcome).toBe(PublicationOutcome.enum.inline_posted);
+    // posted_review_pr_id is bound to pr_meta.pr_id (the core.posted_reviews PK keyed by PR).
+    expect(ctx.state.postedReview.postedReviewPrId).toBe(PR_META.pr_id);
   });
 });
 

@@ -41,6 +41,7 @@ import { WalkthroughV1 } from "#contracts/walkthrough.v1.js";
 import { PostedReviewV1, PublicationOutcome } from "#contracts/posted_review.v1.js";
 import { PostedCheckRunV1 } from "#contracts/posted_check_run.v1.js";
 import { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
+import { CitationValidationResultV1 } from "#contracts/citation_validation.v1.js";
 import { CodemasterConfigV1 } from "#contracts/codemaster_config.v1.js";
 import { ComputedPolicyRulesV1 } from "#contracts/policy_compute.v1.js";
 import { WorkspaceHandle } from "#contracts/workspace_handle.v1.js";
@@ -136,6 +137,48 @@ function makeStubActivities(calls: Array<string>): Record<string, (input: never)
         derived_path: "/ws/abc",
         state: "ALLOCATED",
       });
+    },
+    // ── Stage-3 run-lifecycle: ANALYSIS_STARTED (before orchestrate) + ANALYZED (after bookkeeping) ──
+    // The body dispatches recordReviewLifecycleEvent for both event types; the stub records the event_type
+    // so the trace distinguishes the two milestone emits.
+    recordReviewLifecycleEvent: async (input: { event_type?: string }): Promise<void> => {
+      calls.push(input.event_type === "ANALYZED" ? "analyzed" : "analysisStarted");
+    },
+    // ── Stage-3 run-lifecycle: RUNNING → COMPLETED (after ANALYZED) ──
+    finalizeReviewRun: async (): Promise<void> => {
+      calls.push("finalizeReviewRun");
+    },
+    // ── Stage-3 run-lifecycle: terminal-transition setters (not fired on the happy path) ──
+    recordRunFailed: async (): Promise<void> => {
+      calls.push("recordRunFailed");
+    },
+    recordRunCancelled: async (): Promise<void> => {
+      calls.push("recordRunCancelled");
+    },
+    // ── Stage-3 finding-delivery setters (the lifecycle-bookkeeping block + the H-2 inline skip) ──
+    // The happy-path post returns publication_outcome=inline_posted with empty comment_ids/kept_indices,
+    // so NONE of these fire (keptRfids is empty → no finalized; no dropped → no skipped; inline → no
+    // degraded). They are registered so a future fixture that exercises them does not ActivityNotRegistered.
+    recordDeliveryFinalized: async (): Promise<number> => {
+      calls.push("recordDeliveryFinalized");
+      return 0;
+    },
+    recordDeliverySkipped: async (): Promise<number> => {
+      calls.push("recordDeliverySkipped");
+      return 0;
+    },
+    recordDeliveryDegraded: async (): Promise<number> => {
+      calls.push("recordDeliveryDegraded");
+      return 0;
+    },
+    // ── Stage-3 citation validation (Step 7.5) — surviving=input findings, no drops (happy path) ──
+    citationValidate: async (input: { findings?: ReadonlyArray<unknown> }): Promise<unknown> => {
+      calls.push("citationValidate");
+      return CitationValidationResultV1.parse({ surviving: [...(input.findings ?? [])], dropped: [] });
+    },
+    // ── Stage-3 output-safety audit emit (no sanitization_event in the happy-path fixtures → never fires) ──
+    emitOutputSafetyAuditEvent: async (): Promise<void> => {
+      calls.push("emitAudit");
     },
     // ── Stage-2 lifecycle: lease renewal (still-held=true) — fired by the claim-check at clone/classify/
     //    aggregate. The result type comes from the string-name proxy's interface (boolean). ──
@@ -378,6 +421,7 @@ describeTemporal("review-pipeline composition (in-process TestWorkflowEnvironmen
       "gate",
       "postPlaceholder",
       "allocateWorkspace",
+      "analysisStarted", // ANALYSIS_STARTED milestone (before the BF-5 try opens / orchestrate)
       "renewLease", // claim-check before clone
       "clone",
       "loadRepoConfig",
@@ -392,12 +436,15 @@ describeTemporal("review-pipeline composition (in-process TestWorkflowEnvironmen
       "dedupFindings",
       "renewLease", // claim-check before aggregate
       "aggregate",
+      "citationValidate", // Step 7.5 — between aggregate and persist
       "persistReviewFindings",
       "generateWalkthrough",
       "persistReviewWalkthrough",
       "PAIR2", // {postReview, postCheckRun} (order-free within the pair)
       "deletePlaceholder", // onPlaceholderTeardown after the post pair
       "cleanup", // orchestrator finally (releaseWorkspace)
+      "analyzed", // ANALYZED milestone (after orchestrate + bookkeeping, inside the BF-5 try)
+      "finalizeReviewRun", // RUNNING → COMPLETED
       "releaseMutex", // body non-cancellable finally (releasePrReviewMutex)
       "cleanup", // body backstop (releaseWorkspace again — idempotent)
     ]);
@@ -410,6 +457,21 @@ describeTemporal("review-pipeline composition (in-process TestWorkflowEnvironmen
     expect(calls).toContain("releaseMutex");
     // The lease was renewed at all three claim-check boundaries.
     expect(calls.filter((c) => c === "renewLease").length).toBe(3);
+
+    // ── PROOF 3: the Stage-3 run-lifecycle milestones fired (ANALYSIS_STARTED → ANALYZED → COMPLETED) ──
+    expect(calls.filter((c) => c === "analysisStarted").length).toBe(1);
+    expect(calls.filter((c) => c === "analyzed").length).toBe(1);
+    expect(calls.filter((c) => c === "finalizeReviewRun").length).toBe(1);
+    // No FAILED / CANCELLED transition on the happy path.
+    expect(calls).not.toContain("recordRunFailed");
+    expect(calls).not.toContain("recordRunCancelled");
+    // ── PROOF 4: NO finding-delivery setter fired (post returned inline_posted with no kept/dropped rfids,
+    // so the bookkeeping block's three gated dispatches are all inert) AND no audit emit (no
+    // sanitization_event in the happy-path fixtures). ──
+    expect(calls).not.toContain("recordDeliveryFinalized");
+    expect(calls).not.toContain("recordDeliverySkipped");
+    expect(calls).not.toContain("recordDeliveryDegraded");
+    expect(calls).not.toContain("emitAudit");
   }, 60_000);
 
   it("short-circuits the whole workflow when the gate does NOT accept (skipped_busy)", async () => {

@@ -43,27 +43,34 @@
  * {@link WallClock} is the seam the mutex helper carries for call-site stability (the DB `now()` is the
  * authoritative lease clock).
  *
- * ## DEFERRED (Stage-3): encrypted audit emit
+ * ## Encrypted audit emit (Stage-3 wire — was FOLLOW-UP-stage3-gate-audit-emit)
  *
- * The Python gate also writes an `audit.audit_events` row on every branch (`pr.accepted`,
- * `pr.skipped_disabled`, `pr.skipped_busy`, `pr.skipped_legacy_payload`) via the encrypted
- * (AES-256-GCM, per-column AAD) `emit_audit_event` / `bind_audit_context` helpers. Per the staged port
- * plan (`docs/superpowers/plans/2026-06-05-review-orchestrator-full-port.md`: the encrypted audit writer
- * lands in "Stage 3 … + citation/audit"), that subsystem is NOT yet ported. The audit-emit calls are
- * DEFERRED here with this explicit marker — NOT silently dropped — and tracked for the Stage-3 wire:
- *   FOLLOW-UP-stage3-gate-audit-emit — wire `bind_audit_context` + `emit_audit_event` onto each gate
- *   branch (running on the SAME transaction client) once the TS `audit/emit` (encrypted bytea before/
- *   after) helper is ported.
- * The gate's return-value semantics (the observable behaviour) are fully ported and tested here.
+ * The gate writes an `audit.audit_events` row on every branch (`pr.accepted`, `pr.skipped_disabled`,
+ * `pr.skipped_busy`, `pr.skipped_legacy_payload`) via the encrypted (AES-256-GCM, per-column AAD)
+ * {@link emitAuditEvent} / {@link bindAuditContext} helpers — the TS port of the frozen-Python
+ * `codemaster/audit/emit.py`. The emit runs on the SAME transaction client as the tenancy re-check + the
+ * mutex acquire, so the audit row commits atomically with the gate's decision (1:1 with the Python
+ * `session.begin()` wrapping both). The `after` payloads are byte-for-byte the Python shapes:
+ *   - `pr.accepted`              → `{ head_sha }` (the I3 fix: the SHA, not the repo full_name).
+ *   - `pr.skipped_disabled`      → `{ reason: "repository.enabled=false" }`.
+ *   - `pr.skipped_busy`          → `{ holder_workflow_id }` (the live lease's holder).
+ *   - `pr.skipped_legacy_payload`→ `{ schema_version_received, delivery_id }`.
+ * The encryption key comes from the audit field-encryption registry seam (populated at startup by the
+ * dev env loader or the Vault loader — FOLLOW-UP-audit-vault-key-loader); encrypt fails closed if no key
+ * is installed.
  */
+
+import { type Pool } from "pg";
 
 import {
   acquirePrReviewMutex,
   withMutexTransaction,
 } from "#backend/concurrency/pr_mutex.js";
 
+import { bindAuditContext, emitAuditEvent } from "#backend/audit/emit.js";
+
 import { getPool } from "#platform/db/database.js";
-import { WallClock } from "#platform/clock.js";
+import { WallClock, type Clock } from "#platform/clock.js";
 
 import { ReviewPullRequestPayloadV1, ReviewPullRequestResultV1 } from "#contracts/review_pull_request.v1.js";
 
@@ -75,12 +82,25 @@ function isLegacyV1Payload(payloadDict: Record<string, unknown>): boolean {
   return !("pr_id" in payloadDict);
 }
 
+/** Canonical RFC4122 UUID syntax (case-insensitive) — the gate's tolerant installation_id parse. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * The V1-tolerance shim — rolling-deploy window. Returns a clear `skipped_legacy_payload` signal so an
- * operator drains the v1 rows. 1:1 with the Python `_handle_legacy_v1_payload` (minus the deferred
- * encrypted audit-row emit — see the module DEFERRED note).
+ * The V1-tolerance shim — rolling-deploy window. Emits a `pr.skipped_legacy_payload` audit row (so an
+ * operator can drain the v1 rows) and returns the clear `skipped_legacy_payload` signal. 1:1 with the
+ * Python `_handle_legacy_v1_payload`, INCLUDING the installation_id-parse tolerance: the audit row is
+ * only emitted when the legacy payload's `installation_id` parses as a UUID (the audit tenancy context
+ * cannot bind otherwise); a non-parseable id still returns the signal, just without the audit row.
+ *
+ * The emit runs in its OWN short transaction on a fresh client (the Python opens a separate
+ * `session.begin()` here — the legacy path never touches the mutex, so it does not share the
+ * withMutexTransaction client).
  */
-function handleLegacyV1Payload(payloadDict: Record<string, unknown>): ReviewPullRequestResultV1 {
+async function handleLegacyV1Payload(
+  payloadDict: Record<string, unknown>,
+  pool: Pool,
+  clock: Clock,
+): Promise<ReviewPullRequestResultV1> {
   // Python: `int(payload_dict.get("pr_number", -1))` with a try/except → -1 on a non-coercible value,
   // then `max(1, pr_number)` on return.
   const rawPrNumber = payloadDict["pr_number"];
@@ -91,6 +111,46 @@ function handleLegacyV1Payload(payloadDict: Record<string, unknown>): ReviewPull
     const parsed = Number.parseInt(rawPrNumber, 10);
     if (!Number.isNaN(parsed)) prNumber = parsed;
   }
+
+  // Tolerant installation_id parse — bind + emit only when it is a syntactically-valid UUID (mirrors the
+  // Python `uuid.UUID(install_uuid_str)` try/except → None on failure → skip the bind).
+  const rawIid = payloadDict["installation_id"];
+  const installationId = typeof rawIid === "string" && UUID_RE.test(rawIid) ? rawIid : null;
+
+  if (installationId !== null) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      bindAuditContext(client, { installationId });
+      await emitAuditEvent({
+        client,
+        actorKind: "system",
+        actorId: null,
+        action: "pr.skipped_legacy_payload",
+        targetKind: "pull_request",
+        targetId: String(prNumber),
+        before: null,
+        after: {
+          // The RAW received values (could be any JSON type) — 1:1 with the Python
+          // `payload_dict.get("schema_version")` / `.get("delivery_id")` (→ null when absent).
+          schema_version_received: (payloadDict["schema_version"] ?? null) as unknown,
+          delivery_id: (payloadDict["delivery_id"] ?? null) as unknown,
+        },
+        clock,
+      });
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // best-effort rollback; surface the original error
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   return ReviewPullRequestResultV1.parse({
     status: "skipped_legacy_payload",
     pr_number: Math.max(1, prNumber),
@@ -107,21 +167,6 @@ function handleLegacyV1Payload(payloadDict: Record<string, unknown>): ReviewPull
 export async function startReviewForWebhook(
   payloadDict: unknown,
 ): Promise<ReviewPullRequestResultV1> {
-  // The legacy-v1 shim keys off field PRESENCE (missing `pr_id`), so it needs an object to inspect. A
-  // non-object input is a hard contract violation — fall straight through to the v2 Zod parse below,
-  // which raises the precise validation error (Temporal's payload converter only ever hands us the
-  // decoded dict, so this guard is belt-and-suspenders for the `unknown` activity-input type).
-  if (typeof payloadDict === "object" && payloadDict !== null) {
-    const rawDict = payloadDict as Record<string, unknown>;
-    if (isLegacyV1Payload(rawDict)) {
-      return handleLegacyV1Payload(rawDict);
-    }
-  }
-
-  // v2 path: re-validate INDEPENDENTLY (don't trust the dispatcher). 1:1 with
-  // `ReviewPullRequestPayloadV1.model_validate(payload_dict)`.
-  const payload = ReviewPullRequestPayloadV1.parse(payloadDict);
-
   const dsn = process.env.CODEMASTER_PG_CORE_DSN;
   if (dsn === undefined || dsn === "") {
     throw new Error("CODEMASTER_PG_CORE_DSN is not set; cannot run the start-review gate");
@@ -129,9 +174,27 @@ export async function startReviewForWebhook(
   const pool = getPool(dsn);
   const clock = new WallClock();
 
+  // The legacy-v1 shim keys off field PRESENCE (missing `pr_id`), so it needs an object to inspect. A
+  // non-object input is a hard contract violation — fall straight through to the v2 Zod parse below,
+  // which raises the precise validation error (Temporal's payload converter only ever hands us the
+  // decoded dict, so this guard is belt-and-suspenders for the `unknown` activity-input type).
+  if (typeof payloadDict === "object" && payloadDict !== null) {
+    const rawDict = payloadDict as Record<string, unknown>;
+    if (isLegacyV1Payload(rawDict)) {
+      return handleLegacyV1Payload(rawDict, pool, clock);
+    }
+  }
+
+  // v2 path: re-validate INDEPENDENTLY (don't trust the dispatcher). 1:1 with
+  // `ReviewPullRequestPayloadV1.model_validate(payload_dict)`.
+  const payload = ReviewPullRequestPayloadV1.parse(payloadDict);
+
   // ONE transaction on ONE client: the tenancy re-check SELECT + the mutex acquire (advisory xact lock +
-  // FOR UPDATE + INSERT) are atomic against the race window, mirroring the Python `session.begin()`.
+  // FOR UPDATE + INSERT) + the audit emit are atomic against the race window, mirroring the Python
+  // `session.begin()`. Bind the audit tenancy context on this client so emitAuditEvent attributes rows.
   return withMutexTransaction(pool, async (client) => {
+    bindAuditContext(client, { installationId: payload.installation_id });
+
     // Race-window re-check: the webhook handler skipped enqueue if enabled=false, but the flag could
     // have flipped between then and now. Last line of defence (CLAUDE.md "default deny"). Tenant-
     // filtered: installation_id is in the WHERE clause.
@@ -144,14 +207,24 @@ export async function startReviewForWebhook(
     if (enabledRow === undefined) {
       // Repository row deleted between webhook enqueue and gate execution — a reconcile race. Raise so
       // Temporal retries; subsequent retries will likely also fail and dead-letter, which is the right
-      // behaviour. 1:1 with the Python RuntimeError.
+      // behaviour. 1:1 with the Python RuntimeError. (No audit row — the Python raises before emit too.)
       throw new Error(
         `repository_id=${payload.repository_id} not found for ` +
           `installation_id=${payload.installation_id}; reconcile race`,
       );
     }
     if (!enabledRow.enabled) {
-      // FOLLOW-UP-stage3-gate-audit-emit: `pr.skipped_disabled` audit row deferred (see module note).
+      await emitAuditEvent({
+        client,
+        actorKind: "system",
+        actorId: null,
+        action: "pr.skipped_disabled",
+        targetKind: "pull_request",
+        targetId: String(payload.pr_number),
+        before: null,
+        after: { reason: "repository.enabled=false" },
+        clock,
+      });
       return ReviewPullRequestResultV1.parse({
         status: "skipped_disabled",
         pr_number: payload.pr_number,
@@ -170,7 +243,17 @@ export async function startReviewForWebhook(
       clock,
     });
     if (!acquired.acquired) {
-      // FOLLOW-UP-stage3-gate-audit-emit: `pr.skipped_busy` audit row deferred (see module note).
+      await emitAuditEvent({
+        client,
+        actorKind: "system",
+        actorId: null,
+        action: "pr.skipped_busy",
+        targetKind: "pull_request",
+        targetId: String(payload.pr_number),
+        before: null,
+        after: { holder_workflow_id: acquired.holderWorkflowId },
+        clock,
+      });
       return ReviewPullRequestResultV1.parse({
         status: "skipped_busy",
         pr_number: payload.pr_number,
@@ -178,7 +261,20 @@ export async function startReviewForWebhook(
     }
 
     // Mutex stays held; the workflow's finally block releases it via the release activity.
-    // FOLLOW-UP-stage3-gate-audit-emit: `pr.accepted` audit row deferred (see module note).
+    //
+    // I3 fix (S19.SMOKE.2): the `after` carries head_sha=the actual SHA (a pre-PR#115 bug set it to the
+    // repo full_name); `action` is dropped (no downstream consumer). 1:1 with the Python emit.
+    await emitAuditEvent({
+      client,
+      actorKind: "system",
+      actorId: null,
+      action: "pr.accepted",
+      targetKind: "pull_request",
+      targetId: String(payload.pr_number),
+      before: null,
+      after: { head_sha: payload.head_sha },
+      clock,
+    });
     return ReviewPullRequestResultV1.parse({
       status: "accepted",
       pr_number: payload.pr_number,

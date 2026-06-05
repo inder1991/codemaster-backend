@@ -28,6 +28,11 @@
 import { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { PublicationOutcome } from "#contracts/posted_review.v1.js";
 
+import type { PostReviewCapture } from "./state.js";
+import type { ReviewPipelineResult } from "./pipeline_result.js";
+import type { ResolvedGuidanceBundleV1 } from "#contracts/resolved_guidance.v1.js";
+import type { PolicyCitationContextV1, PolicyCitationEnforcement } from "#contracts/policy_citation.v1.js";
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // _stage_outcome_for_publication (review_pull_request.py:155)
 //
@@ -88,6 +93,80 @@ export function resolveDegradedPayload(
     return { rfidsToFlip: keptRfids, outcomeValue: "failed" };
   }
   return { rfidsToFlip: [], outcomeValue: null };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// _build_analyzed_payload (review_pull_request.py:269)
+//
+// Build the ANALYZED-event payload dict the workflow body dispatches to
+// record_review_lifecycle_event_activity at Step 5.5. Pure projection over its inputs (no clock / random /
+// uuid / I/O) → workflow-sandbox-safe + replay-deterministic.
+//
+// ── GATE COLLAPSE (analyzed-on-degraded-pipeline-result collapse-on) ──
+// The frozen Python branches on `workflow.patched("analyzed-on-degraded-pipeline-result")`: the unpatched
+// branch emits the v7-A baseline shape `{findings_count, head_sha}`, the patched branch adds the three
+// publication/degradation fields. This is a NEW Temporal workflow type with ZERO histories, so the gate is
+// unconditionally TRUE — only the PATCHED branch is ported (straight-line). The pre-patch baseline branch
+// is dead code and is NOT ported.
+//
+// Provenance preservation is LOAD-BEARING: `publication_degradation_notes` (delivery-state) and
+// `pipeline_degradation_notes` (system-orchestration-state) are SEPARATE lists, never merged — downstream
+// consumers (Grafana panels, alert routing, SLOs, RCA tooling) filter by provenance. The payload is an
+// untyped `dict[str, Any]` in Python (tactical observability plumbing, NOT a versioned event-schema
+// contract); the TS analogue is `Record<string, unknown>` (the audit payload the event input accepts).
+//
+// `publication_outcome` is the PublicationOutcome wire .value string (or null when no publication happened,
+// e.g. the orchestrator raised before reaching post_review). `pipeline_degradation_notes` is sourced from
+// `pipeline_result.degradationNotes` (null pipeline_result → []).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+export function buildAnalyzedPayload(args: {
+  findingsCount: number;
+  headSha: string;
+  postedReviewCapture: PostReviewCapture;
+  pipelineResult: ReviewPipelineResult | null;
+}): Record<string, unknown> {
+  const publicationOutcome: string | null = args.postedReviewCapture.publicationOutcome;
+  const pipelineDegradationNotes: ReadonlyArray<string> =
+    args.pipelineResult !== null ? args.pipelineResult.degradationNotes : [];
+  return {
+    findings_count: args.findingsCount,
+    head_sha: args.headSha,
+    publication_outcome: publicationOutcome,
+    publication_degradation_notes: [...args.postedReviewCapture.degradationNotes],
+    pipeline_degradation_notes: [...pipelineDegradationNotes],
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// build_policy_citation_context (codemaster/policy/citation_context_builder.py:37)
+//
+// Union `rule_id` across all per-changed-path policy bundles into a single PolicyCitationContextV1 the
+// citationValidate activity consumes as its policy-citation context. Pure helper (no clock / random / uuid
+// / I/O) → workflow-sandbox-safe + replay-deterministic.
+//
+// Deduplicates rule_ids that apply across multiple changed paths (e.g. a repo-root CLAUDE.md rule the
+// scope resolver surfaced in every bundle). Emits in SORTED order for determinism (replay/log-diff
+// stability). An empty bundle map yields an empty-rule_ids context (legal: "no policy rules apply"; under
+// enforce-mode the validator drops ALL policy_rule citations when valid_rule_ids is empty).
+//
+// Default enforcement = "observe" per the phased-rollout plan (log mismatches, keep findings; operators
+// flip to "enforce" after the drift-window data stabilizes).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+export function buildPolicyCitationContext(
+  policyBundles: ReadonlyMap<string, ResolvedGuidanceBundleV1>,
+  enforcement: PolicyCitationEnforcement = "observe",
+): PolicyCitationContextV1 {
+  const ruleIds = new Set<string>();
+  for (const bundle of policyBundles.values()) {
+    for (const deduped of bundle.applicable_rules) {
+      ruleIds.add(deduped.rule.rule_id);
+    }
+  }
+  return {
+    schema_version: 1,
+    valid_rule_ids: [...ruleIds].sort(),
+    enforcement,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

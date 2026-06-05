@@ -17,22 +17,29 @@
  *   - the v1-tolerance shim: a legacy payload (no pr_id) → status='skipped_legacy_payload'.
  *   - a missing repository row (reconcile race) → the activity RAISES (Temporal retries / dead-letters).
  *
- * NOTE: the Python gate also emits an `audit.audit_events` row on each branch via the encrypted
- * (AES-256-GCM AAD) audit-emit subsystem. Per the Stage-2/Stage-3 split in the full-port plan
- * (`docs/superpowers/plans/2026-06-05-review-orchestrator-full-port.md` §"Stage 3 … + citation/audit"),
- * the encrypted audit writer is a Stage-3 surface; this Stage-2 port covers the gate's return-value
- * semantics (the observable behaviour these tests assert). The audit-emit calls are deferred with an
- * explicit marker in the activity (see its doc comment) — NOT silently dropped.
+ * NOTE: the gate now emits an `audit.audit_events` row on each branch via the encrypted (AES-256-GCM
+ * AAD) audit-emit subsystem — the Stage-3 wire-through of the previously-deferred
+ * FOLLOW-UP-stage3-gate-audit-emit. These tests install a deterministic dev key registry in `beforeAll`
+ * so the encryption path has a key (encrypt fails closed otherwise), and clean up the audit rows. The
+ * `after`-payload assertions for each branch live in the dedicated
+ * test/integration/audit/gate_audit_emit.integration.test.ts; here we assert the gate's return-value
+ * semantics (the original Stage-2 surface) still hold with audit-emit wired.
  */
 
 import { createHash, randomInt } from "node:crypto";
 
 import { type Pool } from "pg";
-import { afterAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { startReviewForWebhook } from "#backend/activities/start_review_for_webhook.activity.js";
 
+import {
+  resetAuditKeyRegistryForTesting,
+  setAuditKeyRegistry,
+} from "#backend/security/audit_field_codec.js";
+
 import { getPool, disposePool } from "#platform/db/database.js";
+import { KeyRegistry, makeKeySet } from "#platform/crypto/key_registry.js";
 
 import { describeDb, INTEGRATION_DSN } from "../_db.js";
 
@@ -45,7 +52,16 @@ if (INTEGRATION_DSN) {
   pool = getPool(INTEGRATION_DSN);
 }
 
+beforeAll(() => {
+  // The gate's audit-emit encrypts before/after via the audit field-encryption codec — install a
+  // deterministic dev key so the encryption path has a key (fail-closed without one).
+  const reg = new KeyRegistry();
+  reg.set(makeKeySet({ currentVersion: "1", keys: new Map([["1", new Uint8Array(32).fill(0x42)]]) }));
+  setAuditKeyRegistry(reg);
+});
+
 afterAll(async () => {
+  resetAuditKeyRegistryForTesting();
   if (INTEGRATION_DSN) await disposePool(INTEGRATION_DSN);
 });
 
@@ -109,8 +125,11 @@ async function seedTenant(enabled: boolean): Promise<Seed> {
   return { installationId, repositoryId, ghOwner, ghRepoName };
 }
 
-/** Drop every mutex row + the FK parents for a tenant. */
+/** Drop every audit + mutex row + the FK parents for a tenant. */
 async function cleanupTenant(seed: Seed): Promise<void> {
+  await pool.query(`DELETE FROM audit.audit_events WHERE installation_id = $1`, [
+    seed.installationId,
+  ]);
   await pool.query(`DELETE FROM core.pr_review_mutex WHERE installation_id = $1`, [
     seed.installationId,
   ]);

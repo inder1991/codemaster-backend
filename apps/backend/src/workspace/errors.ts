@@ -97,3 +97,25 @@ export class CrossInstallationViolation extends Error {
     this.actualInstallationId = args.actualInstallationId;
   }
 }
+
+/**
+ * A workflow primitive could not resolve `core.repositories.installation_id` for a known `review_id`
+ * (1:1 with the Python `codemaster.workflow._errors.RepositoriesResolveFailed`, BF-3 Phase B Wave 10 R2).
+ *
+ * Indicates a data-integrity break: the `core.repositories` row is missing for the review's `repo_id`,
+ * OR `core.repositories.installation_id` is NULL. Pre-Phase-B this silently allowed the audit row to be
+ * written with a NULL `installation_id`; post-Phase-B the spine fails closed — tenancy integrity wins
+ * over availability for this rare administrative-error case. The typed exception at the resolution site
+ * upgrades the operator diagnostic from "audit row would have been NULL" to "repositories integrity
+ * break, here is the offending review_id." Extends nothing special (the Python subclasses `RuntimeError`,
+ * which has no distinct JS analogue beyond `Error`); `.name` matches the class name for structured-log /
+ * `instanceof` discrimination parity. Colocated here with {@link CrossInstallationViolation} until a
+ * shared `domain/cross_installation.ts` exists (the only consumers today are the spine transition
+ * primitives).
+ */
+export class RepositoriesResolveFailed extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "RepositoriesResolveFailed";
+  }
+}

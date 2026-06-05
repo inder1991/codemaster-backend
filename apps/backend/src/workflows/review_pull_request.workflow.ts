@@ -35,17 +35,20 @@
  * at each of the three boundaries; the wall-clock throttle is not ported (it would be unreachable code AND
  * would trip the clock/random gate, which bans `Date.now()` in the workflow sandbox).
  *
- * ── DELIBERATELY DEFERRED (Stage 3 — NOT this story) ──
- *   * The lifecycle-bookkeeping activities (`record_review_lifecycle_event_activity` ANALYSIS_STARTED,
- *     `record_run_failed_activity` / `record_run_cancelled_activity` on the failure/cancel paths) — the
- *     review_runs RUNNING→FAILED/CANCELLED transitions. Those write the DB lifecycle row; they are a
- *     Stage-3 surface (the encrypted audit/lifecycle subsystem). The mutex + workspace release — the
- *     core-loop-protecting cleanup — IS wired here; the lifecycle-row writes are not. On cancellation the
- *     Python ALSO records CANCELLED before re-raising; the TS port runs the non-cancellable cleanup and
- *     re-raises, deferring the lifecycle-row write to Stage 3 (FOLLOW-UP-stage3-run-lifecycle-transitions).
- *   * The Stage-3 post-review CAPTURE bookkeeping — `state.postedReview` stays at its makePostReviewCapture()
- *     defaults (reviewId=null, publicationOutcome=null), so review_id / publication_outcome are null here
- *     (the Python "no publication captured" branch, review_pull_request.py:4160,4170).
+ * ── STAGE-3 RUN-LIFECYCLE + DELIVERY BOOKKEEPING (wired here) ──
+ *   * ANALYSIS_STARTED is emitted after the gate/placeholder/allocate (before the BF-5 try opens).
+ *   * The BF-5/BF-13 outer try/catch flips the run RUNNING → FAILED (any uncaught exception) or RUNNING →
+ *     CANCELLED (a Temporal cancellation), AFTER the inner non-cancellable cleanup released the mutex +
+ *     workspace. Both run-transition records are best-effort (logged + swallowed so the original exception
+ *     re-propagates).
+ *   * After orchestrate returns, `runLifecycleBookkeeping` flips the persisted findings to their delivery
+ *     outcome (finalized / skipped / degraded) from `state.postedReview` (the capture the orchestrator's
+ *     posting.ts populates) + the pipeline result's ordered rfids. Bookkeeping-only: a setter failure NEVER
+ *     fails the workflow.
+ *   * ANALYZED is then emitted (with the buildAnalyzedPayload publication/degradation provenance) and the
+ *     run advances RUNNING → COMPLETED via finalize_review_run.
+ *   * The orchestrator's post stage (posting.ts) populates `state.postedReview` from the PostedReviewV1, so
+ *     review_id / publication_outcome flow into the result envelope (no longer the deferred null/null).
  *
  * ── SANDBOX SAFETY (ADR-0065 / ADR-0066 / check_workflow_bundle + check_clock_random) ──
  * This module is bundled into the Temporal V8-isolate workflow sandbox, which BANS `node:crypto` and raw
@@ -60,6 +63,7 @@
 import {
   CancellationScope,
   proxyActivities,
+  isCancellation,
   log as workflowLog,
 } from "@temporalio/workflow";
 import { ApplicationFailure } from "@temporalio/common";
@@ -68,7 +72,9 @@ import { orchestrate, type ReviewPipelineContext } from "#backend/review/pipelin
 import { ReviewWorkflowState } from "#backend/review/pipeline/state.js";
 import { CHUNK_CONCURRENCY_DEFAULT } from "#backend/review/pipeline/parallelism.js";
 import { stageOutcome, type StageLogger } from "#backend/review/pipeline/degradation.js";
-import { makeActivityPorts } from "./activity_proxy.js";
+import { resolveDegradedPayload, buildAnalyzedPayload } from "#backend/review/pipeline/helpers.js";
+import { RETRY_POLICIES } from "#backend/review/pipeline/activity_ports.js";
+import { makeActivityPorts, toActivityOptions } from "./activity_proxy.js";
 
 import { ReviewPullRequestPayloadV1 } from "#contracts/review_pull_request.v1.js";
 
@@ -80,6 +86,17 @@ import type { AllocateWorkspaceInput } from "#contracts/allocate_workspace_input
 import type { ReleaseWorkspaceInput } from "#contracts/release_workspace_input.v1.js";
 import type { PostReviewPlaceholderInput } from "#contracts/post_review_placeholder_input.v1.js";
 import type { DeleteReviewPlaceholderInput } from "#contracts/delete_review_placeholder_input.v1.js";
+import type {
+  RecordReviewLifecycleEventInput,
+  FinalizeReviewRunInput,
+  RecordRunFailedInput,
+  RecordRunCancelledInput,
+} from "#contracts/record_review_lifecycle_inputs.v1.js";
+import type {
+  FinalizedInputV1,
+  SkippedInputV1,
+  DegradedInputV1,
+} from "#contracts/finding_lifecycle_inputs.v1.js";
 
 // ─── lifecycle activity proxies (the Stage-2 mutex/workspace/placeholder surface) ────────────────────
 //
@@ -167,6 +184,57 @@ const { deleteReviewPlaceholder } = proxyActivities<{
     nonRetryableErrorTypes: ["RuntimeError"],
   },
 });
+
+// ─── Stage-3 run-lifecycle activity proxies (dispatched DIRECTLY by the workflow body) ──────────────
+//
+// These write the `core.review_runs` lifecycle row + the `audit.workflow_events` milestone stream. They are
+// dispatched by the body (NOT the orchestrator's activity_proxy bridge — that proxies the 18 pipeline
+// activities). Each carries the RETRY_POLICIES the Python execute_activity sites used, transcribed 1:1.
+// Registered names are the camelCase worker-registry names the composition root registers.
+
+/** ANALYSIS_STARTED + ANALYZED granular milestone emit — record_review_lifecycle_event_activity. 30s, 3
+ *  attempts, ValueError non-retryable (the event_type allow-list reject is a permanent caller bug). */
+const { recordReviewLifecycleEvent } = proxyActivities<{
+  recordReviewLifecycleEvent(input: RecordReviewLifecycleEventInput): Promise<void>;
+}>(toActivityOptions(RETRY_POLICIES.recordReviewLifecycleEvent));
+
+/** RUNNING → COMPLETED — finalize_review_run_activity. 30s, 3 attempts, StateDrift+ValueError
+ *  non-retryable (a drifted run is a permanent terminal state). */
+const { finalizeReviewRun } = proxyActivities<{
+  finalizeReviewRun(input: FinalizeReviewRunInput): Promise<void>;
+}>(toActivityOptions(RETRY_POLICIES.finalizeReviewRun));
+
+/** BF-5 RUNNING → FAILED — record_run_failed_activity. 30s, 3 attempts, StateDrift+ValueError
+ *  non-retryable. */
+const { recordRunFailed } = proxyActivities<{
+  recordRunFailed(input: RecordRunFailedInput): Promise<void>;
+}>(toActivityOptions(RETRY_POLICIES.recordRunTerminal));
+
+/** BF-13 RUNNING → CANCELLED — record_run_cancelled_activity. Same curve as record_run_failed. */
+const { recordRunCancelled } = proxyActivities<{
+  recordRunCancelled(input: RecordRunCancelledInput): Promise<void>;
+}>(toActivityOptions(RETRY_POLICIES.recordRunTerminal));
+
+// ─── Stage-3 finding-delivery lifecycle setter proxies (the bookkeeping block's 3 conditional dispatches) ──
+//
+// Each flips rows in core.review_findings to their delivery outcome. Bookkeeping-ONLY: a failure here NEVER
+// fails the workflow (the review is already posted) — the body's try/catch around each dispatch logs +
+// counts + continues. The retry curves match the Python lifecycle-bookkeeping execute_activity sites.
+
+/** record_delivery_finalized_activity — inline-delivered finalization. 30s, initial 1s, backoff 2.0, 3 attempts. */
+const { recordDeliveryFinalized } = proxyActivities<{
+  recordDeliveryFinalized(input: FinalizedInputV1): Promise<number>;
+}>(toActivityOptions(RETRY_POLICIES.recordDeliveryFinalized));
+
+/** record_delivery_skipped_activity — per-row skipped flips. Same curve as finalized. */
+const { recordDeliverySkipped } = proxyActivities<{
+  recordDeliverySkipped(input: SkippedInputV1): Promise<number>;
+}>(toActivityOptions(RETRY_POLICIES.recordDeliverySkipped));
+
+/** record_delivery_degraded_activity — body-only / failed degraded flips. Same curve as finalized. */
+const { recordDeliveryDegraded } = proxyActivities<{
+  recordDeliveryDegraded(input: DegradedInputV1): Promise<number>;
+}>(toActivityOptions(RETRY_POLICIES.recordDeliveryDegraded));
 
 /**
  * The SPINE workflow. GATE → placeholder → allocate-workspace → orchestrate (with the lease claim-check +
@@ -269,6 +337,27 @@ export async function reviewPullRequest(
     workflow_id: payload.run_id,
   });
 
+  // ─── Step 2.5: emit ANALYSIS_STARTED (review_pull_request.py:651-684) ──────────────────────────────
+  // The granular analysis-stage milestone, emitted AFTER the gate accepted + the placeholder/allocate ran
+  // and BEFORE the orchestrator invokes any analysis-stage activity. Idempotent under Temporal at-least-once
+  // retry (the activity checks for an existing event of this type before INSERT). A FAILURE here propagates
+  // — but it is dispatched OUTSIDE the BF-5 try (the run is not yet "in flight" until ANALYSIS_STARTED has
+  // landed), so the mutex/workspace finally below still releases on that failure path (it brackets this
+  // dispatch too). This is the boundary marker that proves the run is in flight for BF-5's FAILED transition.
+  await recordReviewLifecycleEvent({
+    schema_version: 2,
+    installation_id: payload.installation_id,
+    run_id: payload.run_id,
+    review_id: payload.review_id,
+    provider: "github",
+    event_type: "ANALYSIS_STARTED",
+    payload: {
+      pr_id: payload.pr_id,
+      head_sha: payload.head_sha,
+      policy_revision: payload.policy_revision,
+    },
+  });
+
   // ─── build the ReviewPipelineContext with the Stage-2 lifecycle callbacks ─────────────────────────
   const state = new ReviewWorkflowState();
   const ctx: ReviewPipelineContext = {
@@ -320,49 +409,137 @@ export async function reviewPullRequest(
     },
   };
 
-  // ─── Step 5: orchestrate with a NON-CANCELLABLE cleanup finally ───────────────────────────────────
-  // The mutex release AND the workspace release run on EVERY exit path (success, error, cancellation). They
-  // are dispatched inside CancellationScope.nonCancellable so a Temporal cancellation (CancelledFailure)
-  // still executes them BEFORE the cancellation re-propagates out of this try/finally — the Python try/
-  // finally analogue (the finally runs even when asyncio.CancelledError is in flight). releaseMutex runs
-  // even if releaseWorkspace fails (and vice-versa): leaking the mutex blocks future reviews, so both
-  // dispatch independently inside the scope.
+  // ─── Step 5: orchestrate, wrapped in (outer) BF-5/BF-13 run-transition + (inner) NON-CANCELLABLE cleanup ──
+  //
+  // Nesting matches the frozen Python ordering (review_pull_request.py:685-4153):
+  //   * The INNER try/finally owns the mutex + workspace release: they run on EVERY exit path (success,
+  //     error, cancellation), dispatched inside CancellationScope.nonCancellable so a Temporal cancellation
+  //     still executes them BEFORE the cancellation re-propagates. releaseMutex runs even if releaseWorkspace
+  //     fails (and vice-versa) — leaking the mutex blocks every future review of this PR.
+  //   * The OUTER try/catch is BF-5/BF-13: on ANY uncaught exception the run row flips RUNNING → FAILED
+  //     (BF-5) — UNLESS the exception is a Temporal cancellation, which flips RUNNING → CANCELLED (BF-13).
+  //     The cleanup inner-finally has ALREADY run by the time the catch fires (the Python "mutex release is
+  //     the more critical action; the run-transition is best-effort" ordering). recordRunFailed /
+  //     recordRunCancelled are best-effort: a failure to record the transition is logged + swallowed so the
+  //     ORIGINAL exception still propagates (Temporal still marks the workflow failed; the retention janitor
+  //     sweeps any orphan run). The lifecycle bookkeeping + ANALYZED + finalize all run INSIDE this scope so
+  //     a failure in any of them also reaches the FAILED transition.
   let result: ReviewPipelineResult;
   try {
-    result = await orchestrate(ctx);
-  } finally {
+    try {
+      result = await orchestrate(ctx);
+
+      // ─── Step 5.4: finding-delivery lifecycle bookkeeping (review_pull_request.py:3554-4027) ─────────
+      // After orchestrate returns cleanly, flip the persisted findings to their delivery outcome based on
+      // the post-review capture (state.postedReview) + the pipeline result. Bookkeeping-ONLY: every setter
+      // dispatch is individually try/caught so a failure NEVER fails the workflow (the review is already
+      // posted). Runs BEFORE the ANALYZED emit (the Python ordering).
+      await runLifecycleBookkeeping(payload, state, result);
+
+      // ─── Step 5.5: ANALYZED + finalize COMPLETED (review_pull_request.py:3960-4027) ──────────────────
+      // Reaching here means the orchestrator + bookkeeping completed. Emit the ANALYZED milestone carrying
+      // the final findings_count + publication/degradation provenance (buildAnalyzedPayload), then advance
+      // the run RUNNING → COMPLETED. Both idempotent under Temporal at-least-once retry.
+      await recordReviewLifecycleEvent({
+        schema_version: 2,
+        installation_id: payload.installation_id,
+        run_id: payload.run_id,
+        review_id: payload.review_id,
+        provider: "github",
+        event_type: "ANALYZED",
+        payload: buildAnalyzedPayload({
+          findingsCount: result.findingsCount,
+          headSha: payload.head_sha,
+          postedReviewCapture: state.postedReview,
+          pipelineResult: result,
+        }),
+      });
+      await finalizeReviewRun({
+        run_id: payload.run_id,
+        review_id: payload.review_id,
+        attempt: 1,
+        duration_ms: null,
+        worker_id: null,
+      });
+    } finally {
+      await CancellationScope.nonCancellable(async () => {
+        // Release the mutex (B-A1 — critical: 5 attempts). Independent of the workspace release: a workspace-
+        // release failure must NOT skip the mutex release. stageOutcome swallows so a release failure is
+        // logged but never masks the original exit error (success/orig-error/cancellation propagates).
+        await stageOutcome(
+          "cleanup",
+          { logger, headSha: payload.head_sha, runId: payload.run_id },
+          async (handle): Promise<void> => {
+            handle.skipOutcome();
+            await releasePrReviewMutexActivity(mutexId);
+          },
+        );
+        // Release the workspace by its lease key (workspace_id). The orchestrator's own cleanup() already
+        // released the LEASE via the releaseWorkspace activity port on the success path; this body-level
+        // release is the lifecycle backstop the Python workflow body owns (it releases by workspace_id
+        // regardless of how orchestrate exited). Idempotent: a second release of an already-released lease is
+        // a no-op. stageOutcome swallows so a failure never masks the exit path.
+        await stageOutcome(
+          "cleanup",
+          { logger, headSha: payload.head_sha, runId: payload.run_id },
+          async (handle): Promise<void> => {
+            handle.skipOutcome();
+            await releaseWorkspace({ schema_version: 1, workspace_id: workspaceHandle.workspace_id });
+          },
+        );
+      });
+    }
+  } catch (exc) {
+    // BF-13: a Temporal cancellation flips RUNNING → CANCELLED (so AD-7 `cancelled_at NOT NULL ⇒
+    // state='CANCELLED'` holds + AD-5 telemetry routes the row into _runs_cancelled, not _runs_failed).
+    // BF-5: every OTHER uncaught exception flips RUNNING → FAILED. Both run inside a non-cancellable scope so
+    // the transition is recorded even while a CancelledFailure is in flight. Best-effort: a failure to record
+    // the transition is logged + swallowed so the ORIGINAL exception re-propagates (the bare `throw exc`).
     await CancellationScope.nonCancellable(async () => {
-      // Release the mutex (B-A1 — critical: 5 attempts). Independent of the workspace release: a workspace-
-      // release failure must NOT skip the mutex release. stageOutcome swallows so a release failure is
-      // logged but never masks the original exit error (success/orig-error/cancellation propagates).
-      await stageOutcome(
-        "cleanup",
-        { logger, headSha: payload.head_sha, runId: payload.run_id },
-        async (handle): Promise<void> => {
-          handle.skipOutcome();
-          await releasePrReviewMutexActivity(mutexId);
-        },
-      );
-      // Release the workspace by its lease key (workspace_id). The orchestrator's own cleanup() already
-      // released the LEASE via the releaseWorkspace activity port on the success path; this body-level
-      // release is the lifecycle backstop the Python workflow body owns (it releases by workspace_id
-      // regardless of how orchestrate exited). Idempotent: a second release of an already-released lease is
-      // a no-op. stageOutcome swallows so a failure never masks the exit path.
-      await stageOutcome(
-        "cleanup",
-        { logger, headSha: payload.head_sha, runId: payload.run_id },
-        async (handle): Promise<void> => {
-          handle.skipOutcome();
-          await releaseWorkspace({ schema_version: 1, workspace_id: workspaceHandle.workspace_id });
-        },
-      );
+      if (isCancellation(exc)) {
+        try {
+          await recordRunCancelled({
+            run_id: payload.run_id,
+            review_id: payload.review_id,
+            reason: "temporal_cancellation",
+            attempt: 1,
+          });
+        } catch (cancelExc) {
+          // Defensive: record_run_cancelled itself failed (e.g. DB wedged). Log; the original cancellation
+          // propagates so Temporal still observes the cancellation + the janitor sweeps the orphan run.
+          workflowLog.warn(
+            `record_run_cancelled_activity itself failed; original cancellation propagates: ${String(cancelExc)}`,
+          );
+        }
+      } else {
+        // Sanitise the message: one line, capped at 200 chars (the lifecycle_transition event carries it).
+        const firstLine = String(exc instanceof Error ? exc.message : exc).split("\n")[0] ?? "";
+        const failureReason = `${exc instanceof Error ? exc.constructor.name : typeof exc}: ${firstLine.slice(0, 200)}`;
+        try {
+          await recordRunFailed({
+            run_id: payload.run_id,
+            review_id: payload.review_id,
+            reason: failureReason === "" ? "unknown failure" : failureReason,
+            attempt: 1,
+          });
+        } catch (failedExc) {
+          // Defensive: record_run_failed itself failed. Log; the original exception propagates (Temporal
+          // marks the workflow failed; the retention janitor's followup scan catches the orphan run).
+          workflowLog.warn(
+            `record_run_failed_activity itself failed; original exception propagates: ${String(failedExc)}`,
+          );
+        }
+      }
     });
+    throw exc;
   }
 
   // ─── Step 6: map ReviewPipelineResult → ReviewPullRequestResultV1 (review_pull_request.py:4157-4171) ──
-  // review_id / publication_outcome are read from state.postedReview, which stays at its
-  // makePostReviewCapture() defaults in this body (the Stage-3 post-review CAPTURE wiring is deferred) →
-  // both null here, matching the Python "no publication captured" branch.
+  // review_id / publication_outcome are read from state.postedReview, which the orchestrator's posting.ts
+  // populates from the PostedReviewV1 on the post-success path (the Stage-3 capture wiring). When no
+  // publication happened (orchestrator raised before post, but the workflow still reached this success
+  // return — not possible on the happy path), the capture stays at its makePostReviewCapture() defaults
+  // (reviewId=null / publicationOutcome=null), matching the Python "no publication captured" branch.
   const postedReviewId = state.postedReview.reviewId;
   return {
     schema_version: 1,
@@ -376,6 +553,141 @@ export async function reviewPullRequest(
     pr_id: payload.pr_id,
     publication_outcome: state.postedReview.publicationOutcome,
   };
+}
+
+/**
+ * Run the finding-delivery lifecycle bookkeeping (review_pull_request.py:3554-4027). After orchestrate
+ * returns, flip the persisted findings to their delivery outcome based on the post-review capture
+ * (`state.postedReview`) + the pipeline result's ordered rfids. Three conditional dispatches:
+ *
+ *   * record_delivery_finalized — kept (inline-delivered) rfids, ONLY when the publication outcome was
+ *     INLINE_POSTED. Skipped (with a WARN) on a kept-rfid / comment-id length mismatch (a data-quality
+ *     invariant, not a transient failure).
+ *   * record_delivery_skipped   — the classifier-dropped rfids (per-row eligibility reasons).
+ *   * record_delivery_degraded  — kept rfids flipped to body_only_fallback / failed on the degraded
+ *     publication outcomes (resolveDegradedPayload).
+ *
+ * BOOKKEEPING-ONLY: every dispatch is individually try/caught — a setter failure NEVER fails the workflow
+ * (the review is already posted to GitHub). Each failure is logged on the replay-safe workflow logger; the
+ * chain continues. SANDBOX-SAFE: pure index mapping + activity-port dispatches (no clock / random / uuid /
+ * I/O); the `posted_review_pr_id` gate is the structural guard the three dispatches share.
+ *
+ * The `_lifecycle_posted_review_pr_id is not None` gate (the Python C-2 binding) is the structural guard:
+ * when the capture's postedReviewPrId is null, the post step never ran (no published review to back-fill
+ * against), so all three dispatches are inert.
+ */
+async function runLifecycleBookkeeping(
+  payload: ReviewPullRequestPayloadV1,
+  state: ReviewWorkflowState,
+  pipelineResult: ReviewPipelineResult,
+): Promise<void> {
+  const capture = state.postedReview;
+  const postedReviewPrId = capture.postedReviewPrId;
+  const reviewFindingIds = pipelineResult.reviewFindingIds;
+  const rfidsCount = reviewFindingIds.length;
+
+  // Build the kept (inline-delivered) rfid mapping. Guard: every kept index must be in-bounds of the
+  // persisted-rfid tuple (the Python `max(kept_indices) < len(review_finding_ids)` guard).
+  let keptRfids: ReadonlyArray<string> = [];
+  if (
+    rfidsCount > 0 &&
+    capture.keptFindingIndices.length > 0 &&
+    Math.max(...capture.keptFindingIndices) < rfidsCount
+  ) {
+    // eslint-disable-next-line security/detect-object-injection -- `i` is bounds-checked (max < rfidsCount) against a workflow-local string array
+    keptRfids = capture.keptFindingIndices.map((i) => reviewFindingIds[i]!);
+  }
+
+  // Build the skipped (dropped) rfid + reason mapping. Same in-bounds guard over the dropped indices.
+  let skippedRfids: ReadonlyArray<string> = [];
+  let skippedReasons: ReadonlyArray<string> = [];
+  if (
+    rfidsCount > 0 &&
+    capture.droppedClassifications.length > 0 &&
+    Math.max(...capture.droppedClassifications.map((dc) => dc.index)) < rfidsCount
+  ) {
+    skippedRfids = capture.droppedClassifications.map((dc) => reviewFindingIds[dc.index]!);
+    skippedReasons = capture.droppedClassifications.map((dc) => dc.eligibility_reason);
+  }
+
+  // ── Phase: inline-delivered finalization (only on INLINE_POSTED; degraded branches own the others) ──
+  if (
+    keptRfids.length > 0 &&
+    postedReviewPrId !== null &&
+    capture.publicationOutcome === "inline_posted"
+  ) {
+    if (keptRfids.length !== capture.commentIds.length) {
+      // F9 — len-mismatch is a permanent data-quality invariant violation, NOT a transient condition. Emit
+      // observability (WARN) instead of silently skipping; do NOT dispatch (a mismatched finalize would
+      // pair rfids with the wrong comment_ids).
+      workflowLog.warn(
+        `lifecycle finalize skipped (rfid/comment_id length mismatch): ` +
+          `kept=${keptRfids.length} comments=${capture.commentIds.length} ` +
+          `pr_id=${payload.pr_id} run_id=${payload.run_id}`,
+      );
+    } else {
+      try {
+        await recordDeliveryFinalized({
+          schema_version: 1,
+          installation_id: payload.installation_id,
+          run_id: payload.run_id,
+          review_id: payload.review_id,
+          rfids: [...keptRfids],
+          comment_ids: [...capture.commentIds],
+          posted_review_pr_id: postedReviewPrId,
+        });
+      } catch (e) {
+        workflowLog.warn(
+          `lifecycle setter failed (bookkeeping-only; review already posted): ` +
+            `setter=record_delivery_finalized error=${String(e)} ` +
+            `pr_id=${payload.pr_id} run_id=${payload.run_id}`,
+        );
+      }
+    }
+  }
+
+  // ── Phase: skipped findings (per-row eligibility reasons) ──
+  if (skippedRfids.length > 0 && postedReviewPrId !== null) {
+    try {
+      await recordDeliverySkipped({
+        schema_version: 1,
+        installation_id: payload.installation_id,
+        run_id: payload.run_id,
+        review_id: payload.review_id,
+        rfids: [...skippedRfids],
+        reasons: [...skippedReasons],
+        posted_review_pr_id: postedReviewPrId,
+      });
+    } catch (e) {
+      workflowLog.warn(
+        `lifecycle setter failed (bookkeeping-only; review already posted): ` +
+          `setter=record_delivery_skipped error=${String(e)} ` +
+          `pr_id=${payload.pr_id} run_id=${payload.run_id}`,
+      );
+    }
+  }
+
+  // ── Phase: degraded outcomes (body-only fallback / failed) ──
+  const degraded = resolveDegradedPayload(capture.publicationOutcome, keptRfids);
+  if (degraded.rfidsToFlip.length > 0 && degraded.outcomeValue !== null && postedReviewPrId !== null) {
+    try {
+      await recordDeliveryDegraded({
+        schema_version: 1,
+        installation_id: payload.installation_id,
+        run_id: payload.run_id,
+        review_id: payload.review_id,
+        rfids: [...degraded.rfidsToFlip],
+        outcome: degraded.outcomeValue,
+        posted_review_pr_id: postedReviewPrId,
+      });
+    } catch (e) {
+      workflowLog.warn(
+        `lifecycle setter failed (bookkeeping-only; review already posted): ` +
+          `setter=record_delivery_degraded error=${String(e)} ` +
+          `pr_id=${payload.pr_id} run_id=${payload.run_id}`,
+      );
+    }
+  }
 }
 
 /**

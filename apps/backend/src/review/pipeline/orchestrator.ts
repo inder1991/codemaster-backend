@@ -59,8 +59,13 @@ import {
   makeReviewPipelineResult,
 } from "./pipeline_result.js";
 import { fanOutReview, type ChunkThreadingV1, type InvokeChunkFn } from "./parallelism.js";
-import { inferPrTopologyKind, pathFiltersExcludedAllFinding } from "./helpers.js";
+import {
+  inferPrTopologyKind,
+  pathFiltersExcludedAllFinding,
+  buildPolicyCitationContext,
+} from "./helpers.js";
 import { stageOutcome, type StageLogger } from "./degradation.js";
+import { postReviewResults, type PostingLifecycleDeps } from "./posting.js";
 
 import type { PrMetaV1 } from "#contracts/walkthrough.v1.js";
 import type { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
@@ -73,8 +78,6 @@ import type { ReviewChunkResponseV1 } from "#contracts/review_chunk_response.v1.
 import type { PRTopologyEntryV1 } from "#contracts/pr_topology.v1.js";
 import type { KnowledgeChunkV1 } from "#contracts/knowledge_chunks.v1.js";
 import type { WorkspaceHandle } from "#contracts/workspace_handle.v1.js";
-import type { WalkthroughV1 } from "#contracts/walkthrough.v1.js";
-import type { ChangedLineRange } from "#contracts/chunk_and_redact.v1.js";
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // ReviewPipelineContext (finding 2) — the single typed orchestrate() argument.
@@ -313,8 +316,18 @@ export async function orchestrate(ctx: ReviewPipelineContext): Promise<ReviewPip
         suggested_reviewers: [],
       });
 
+      // The advisory post also runs through posting.ts::postReviewResults so it populates state.postedReview
+      // (the Python advisory post goes through `_post_review` too). The advisory path has no persisted
+      // findings (chunk/persist were skipped), so the dropped-state skip dispatch is inert.
+      const advisoryPostingDeps: PostingLifecycleDeps =
+        ports.recordDeliverySkipped !== undefined
+          ? {
+              recordDeliverySkipped: ports.recordDeliverySkipped,
+              persistedFindingIds: state.persistedFindingIds,
+            }
+          : { persistedFindingIds: state.persistedFindingIds };
       await Promise.all([
-        postReview(ports, walkthroughEmpty, aggregatedEmpty, pr),
+        postReviewResults(ports, state, walkthroughEmpty, aggregatedEmpty, pr, advisoryPostingDeps),
         postCheckRun(ports, pr, headSha, walkthroughEmpty.tldr),
       ]);
 
@@ -410,6 +423,14 @@ export async function orchestrate(ctx: ReviewPipelineContext): Promise<ReviewPip
       if (result === undefined) {
         throw new Error("review_chunk: unexpected empty result after stageOutcome re-raise contract");
       }
+      // output-safety-emit-chunk (collapse-on): when the chunk activity returned a sanitization_event,
+      // dispatch the emit_output_safety_audit activity as a SEPARATE idempotent activity. Its retry budget
+      // is independent of bedrock_review_chunk's — a failed emit does NOT re-run the LLM call (which would
+      // double the LLM cost). audit_event_id is derived deterministically from the event, so a Temporal
+      // retry of THIS dispatch is a no-op. SKIPPED when ctx.activities.emitOutputSafetyAudit is omitted.
+      if (ports.emitOutputSafetyAudit !== undefined && result.sanitization_event !== null) {
+        await ports.emitOutputSafetyAudit({ schema_version: 1, event: result.sanitization_event });
+      }
       return result;
     };
 
@@ -443,16 +464,51 @@ export async function orchestrate(ctx: ReviewPipelineContext): Promise<ReviewPip
       await ctx.claimCheck();
     }
 
-    // Step 7 — aggregate. (const: Stage 1 does NOT mutate `aggregated` post-aggregate — the apply_policy_
-    // post_filter / citation_validate reassignments are DEFERRED to Stage 3/5, where this becomes a `let`.)
-    const aggregated: AggregatedFindingsV1 = await ports.aggregate({
+    // Step 7 — aggregate. (`let`: Step 7.5's citation_validate reassigns `aggregated` to the surviving
+    // partition; the DEFERRED apply_policy_post_filter / apply_arbitration reassignments land in Stage 5.)
+    let aggregated: AggregatedFindingsV1 = await ports.aggregate({
       findings: deduped.findings,
       policyRevision: pr.policyRevision,
     });
 
-    // DEFERRED Step 7.2 — apply_policy_post_filter (Stage 5). DEFERRED Step 7.5 — citation_validate
-    // (Stage 3). DEFERRED Step 7.7 — apply_arbitration / record_tool_runs (Stage 5). All three are skipped
-    // at Stage 1; aggregated flows downstream unchanged. See the module header DEFERRED list.
+    // DEFERRED Step 7.2 — apply_policy_post_filter (Stage 5). DEFERRED Step 7.7 — apply_arbitration /
+    // record_tool_runs (Stage 5). Skipped at this stage; aggregated flows downstream unchanged.
+
+    // Step 7.5 — citation validation (Stage 3). Drops findings whose `sources[]` cite a repo_path that
+    // does NOT exist in the cloned workspace (GitHub silently 422s inline comments on phantom paths, so the
+    // filter runs producer-side). The validator's Path.resolve/.exists/.is_file syscalls trip the workflow
+    // sandbox, so the actual work is wrapped in the citationValidate ACTIVITY; the orchestrator dispatches
+    // it here between aggregate (Step 7) and persist (Step 7.6). knowledge_chunk citations run in skip mode
+    // (knowledge_chunk_ids=null) — production retrieval-tracking is a separate concern (S17.X-citation-
+    // wiring). The policy_citation context is built from state.policyBundles (policy-engine-wiring collapse-
+    // on; default enforcement="observe" — log mismatches, keep findings; operators flip to "enforce"). On
+    // dropped findings, append a degradation note + reassign aggregated to the surviving partition so
+    // walkthrough + post + persist all see the SAME filtered set. SKIPPED when ctx.activities.citation
+    // Validate is omitted (unit tests; the Python `if citation_validate is not None` branch).
+    if (ports.citationValidate !== undefined) {
+      const citationResult = await ports.citationValidate({
+        schema_version: 1,
+        workspace_path: workspaceRoot,
+        findings: [...aggregated.findings],
+        knowledge_chunk_ids: null, // skip mode — see citation_validator docstring
+        policy_citation: buildPolicyCitationContext(state.policyBundles, "observe"),
+      });
+      if (citationResult.dropped.length > 0) {
+        (ctx.logger ?? NULL_LOGGER).warning(
+          `review-pipeline: dropped ${citationResult.dropped.length} finding(s) with unresolvable sources`,
+        );
+        state.degradation.add(
+          `citation-validator dropped ${citationResult.dropped.length} ` +
+            `finding(s) with unresolvable sources`,
+        );
+        aggregated = {
+          schema_version: aggregated.schema_version,
+          findings: [...citationResult.surviving],
+          dedupe_stats: aggregated.dedupe_stats,
+          policy_revision: aggregated.policy_revision,
+        };
+      }
+    }
 
     // Step 7.6 — persist findings to core.review_findings (fail-open). Populates state.persistedFindingIds
     // (the ordered rfids the persist activity wrote, for the lifecycle index → rfid dispatch). On persist
@@ -488,6 +544,11 @@ export async function orchestrate(ctx: ReviewPipelineContext): Promise<ReviewPip
       linked_issues: [],
       suggested_reviewers: [],
     });
+    // output-safety-emit-walkthrough (collapse-on): same idempotent-emit / independent-retry rationale as
+    // the chunk-side dispatch. SKIPPED when ctx.activities.emitOutputSafetyAudit is omitted.
+    if (ports.emitOutputSafetyAudit !== undefined && walkthrough.sanitization_event !== null) {
+      await ports.emitOutputSafetyAudit({ schema_version: 1, event: walkthrough.sanitization_event });
+    }
 
     // Step 8a — persist the walkthrough to core.review_walkthroughs (persist-review-walkthrough collapse-on;
     // fail-open). stageOutcome swallows on failure + appends `persist_walkthrough_failed`; the chain
@@ -509,9 +570,16 @@ export async function orchestrate(ctx: ReviewPipelineContext): Promise<ReviewPip
         }),
     );
 
-    // Step 9 — post (review + check-run, in parallel).
+    // Step 9 — post (review + check-run, in parallel). postReviewResults (posting.ts) renders the
+    // walkthrough markdown, dispatches the post activity, populates state.postedReview from the result (the
+    // capture the workflow body's lifecycle bookkeeping reads after orchestrate returns), and on the H-2
+    // dropped-state failure dispatches record_delivery_skipped inline before re-raising.
+    const postingDeps: PostingLifecycleDeps =
+      ports.recordDeliverySkipped !== undefined
+        ? { recordDeliverySkipped: ports.recordDeliverySkipped, persistedFindingIds: state.persistedFindingIds }
+        : { persistedFindingIds: state.persistedFindingIds };
     await Promise.all([
-      postReview(ports, walkthrough, aggregated, pr),
+      postReviewResults(ports, state, walkthrough, aggregated, pr, postingDeps),
       postCheckRun(ports, pr, headSha, walkthrough.tldr),
     ]);
 
@@ -829,41 +897,6 @@ async function selectCarryForwardWithFallback(
 // path share one call shape. postReview maps the orchestrator state onto the PostReviewInputV1 contract;
 // postCheckRun maps onto PostCheckRunInputV1. (The Python `_post_review` / `_post_check` closures.)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-async function postReview(
-  ports: ReviewActivityPorts,
-  walkthrough: WalkthroughV1,
-  aggregated: AggregatedFindingsV1,
-  pr: ReviewPipelinePrCtx,
-): Promise<void> {
-  await ports.postReview({
-    schema_version: 1,
-    pr_meta: pr.prMeta,
-    aggregated,
-    walkthrough,
-    head_sha: pr.headSha,
-    walkthrough_md: walkthrough.tldr,
-    owner: ownerOf(pr.prMeta.repo),
-    repo_name: repoNameOf(pr.prMeta.repo),
-    pr_number: pr.prNumber,
-    run_id: pr.runId,
-    review_id: pr.reviewId,
-    changed_line_ranges: toMutableRanges(pr.changedLineRanges),
-  });
-}
-
-/** Convert the readonly ChangedLineRanges (Readonly<Record<string, ReadonlyArray<[lo, hi]>>>) into the
- *  mutable Record<string, Array<[number, number]>> the PostReviewInputV1 contract expects. Pure copy. */
-function toMutableRanges(
-  ranges: ChangedLineRanges,
-): Record<string, Array<[number, number]>> {
-  const out: Record<string, Array<[number, number]>> = {};
-  for (const [path, pairs] of Object.entries(ranges)) {
-    // eslint-disable-next-line security/detect-object-injection -- `path` is a key from Object.entries over the input record, not external input
-    out[path] = pairs.map((p: ChangedLineRange): [number, number] => [p[0], p[1]]);
-  }
-  return out;
-}
-
 async function postCheckRun(
   ports: ReviewActivityPorts,
   pr: ReviewPipelinePrCtx,

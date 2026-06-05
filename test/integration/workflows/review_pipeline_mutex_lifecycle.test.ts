@@ -52,6 +52,7 @@ import { WalkthroughV1 } from "#contracts/walkthrough.v1.js";
 import { PostedReviewV1, PublicationOutcome } from "#contracts/posted_review.v1.js";
 import { PostedCheckRunV1 } from "#contracts/posted_check_run.v1.js";
 import { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
+import { CitationValidationResultV1 } from "#contracts/citation_validation.v1.js";
 import { CodemasterConfigV1 } from "#contracts/codemaster_config.v1.js";
 import { ComputedPolicyRulesV1 } from "#contracts/policy_compute.v1.js";
 import { WorkspaceHandle } from "#contracts/workspace_handle.v1.js";
@@ -176,6 +177,43 @@ function makeStubActivities(
         derived_path: "/ws/abc",
         state: "ALLOCATED",
       });
+    },
+    // ── Stage-3 run-lifecycle (milestones + terminal transitions) ──
+    recordReviewLifecycleEvent: async (input: { event_type?: string }): Promise<void> => {
+      calls.push(input.event_type === "ANALYZED" ? "analyzed" : "analysisStarted");
+    },
+    finalizeReviewRun: async (): Promise<void> => {
+      calls.push("finalizeReviewRun");
+    },
+    // BF-5: the workflow body dispatches recordRunFailed on any non-cancellation exception (e.g. the
+    // PrMutexLostClaim abort at the before-aggregate boundary).
+    recordRunFailed: async (): Promise<void> => {
+      calls.push("recordRunFailed");
+    },
+    // BF-13: the workflow body dispatches recordRunCancelled on a Temporal cancellation.
+    recordRunCancelled: async (): Promise<void> => {
+      calls.push("recordRunCancelled");
+    },
+    // ── Stage-3 finding-delivery setters (registered so the body's bookkeeping dispatches resolve) ──
+    recordDeliveryFinalized: async (): Promise<number> => {
+      calls.push("recordDeliveryFinalized");
+      return 0;
+    },
+    recordDeliverySkipped: async (): Promise<number> => {
+      calls.push("recordDeliverySkipped");
+      return 0;
+    },
+    recordDeliveryDegraded: async (): Promise<number> => {
+      calls.push("recordDeliveryDegraded");
+      return 0;
+    },
+    // ── Stage-3 citation validation (Step 7.5) + audit emit (registered; happy-path no-drops/no-events) ──
+    citationValidate: async (input: { findings?: ReadonlyArray<unknown> }): Promise<unknown> => {
+      calls.push("citationValidate");
+      return CitationValidationResultV1.parse({ surviving: [...(input.findings ?? [])], dropped: [] });
+    },
+    emitOutputSafetyAuditEvent: async (): Promise<void> => {
+      calls.push("emitAudit");
     },
     // ── Stage-2 lifecycle: lease renewal — fired by the claim-check at clone/classify/aggregate. Returns
     //    the SCRIPTED value for this boundary (default true past the end of the script). ──
@@ -400,6 +438,15 @@ describeTemporal("review-pipeline mutex + workspace lifecycle (in-process TestWo
     // release the workspace. Both MUST appear despite the abort.
     expect(calls).toContain("releasePrReviewMutexActivity");
     expect(calls).toContain("releaseWorkspace");
+
+    // ── (d) BF-5: the run was flipped RUNNING → FAILED (the lost-claim abort is a non-cancellation
+    // exception), NOT RUNNING → CANCELLED. The cleanup finally already ran (assertion (c)) before the
+    // recordRunFailed dispatch — the body's outer try/catch order. ANALYZED + finalize never fired (the
+    // pipeline aborted before they could run). ──
+    expect(calls).toContain("recordRunFailed");
+    expect(calls).not.toContain("recordRunCancelled");
+    expect(calls).not.toContain("finalizeReviewRun");
+    expect(calls).not.toContain("analyzed");
   }, 120_000);
 
   // ── PROPERTY 2 ────────────────────────────────────────────────────────────────────────────────────
@@ -470,5 +517,12 @@ describeTemporal("review-pipeline mutex + workspace lifecycle (in-process TestWo
     expect(calls).toContain("clone");
     expect(calls).not.toContain("aggregate");
     expect(calls).not.toContain("postCheckRun");
+
+    // ── (d) BF-13: the run was flipped RUNNING → CANCELLED (the cancellation path), NOT FAILED. The
+    // cleanup finally already ran (assertion (b)) before the recordRunCancelled dispatch. ANALYZED +
+    // finalize never fired (the cancel landed mid-clone). ──
+    expect(calls).toContain("recordRunCancelled");
+    expect(calls).not.toContain("recordRunFailed");
+    expect(calls).not.toContain("finalizeReviewRun");
   }, 120_000);
 });

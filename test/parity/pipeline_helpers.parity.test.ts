@@ -10,7 +10,13 @@ import {
   pathFiltersExcludedAllFinding,
   inferPrTopologyKind,
   composeOrchestratorDegradationNote,
+  buildAnalyzedPayload,
 } from "#backend/review/pipeline/helpers.js";
+import { makePostReviewCapture, type PostReviewCapture } from "#backend/review/pipeline/state.js";
+import {
+  makeReviewPipelineResult,
+  type ReviewPipelineResult,
+} from "#backend/review/pipeline/pipeline_result.js";
 import { PublicationOutcome } from "#contracts/posted_review.v1.js";
 
 afterAll(() => {
@@ -183,6 +189,98 @@ describe("_infer_pr_topology_kind parity (Python ↔ TS) — ORDER is load-beari
       async () => {
         const py = await pyHelper("infer_pr_topology_kind", { path });
         const ts = inferPrTopologyKind(path);
+        expect(canonicalize(ts)).toBe(canonicalize(py));
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe("_build_analyzed_payload parity (Python ↔ TS; patched/collapse-on branch)", () => {
+  // The gate-collapsed TS port reproduces ONLY the patched branch (the new workflow type has zero
+  // histories), so every case drives the Python ref with patched=True. The payload is the untyped
+  // observability dict: {findings_count, head_sha, publication_outcome, publication_degradation_notes,
+  // pipeline_degradation_notes}. Provenance separation (the two degradation lists never merge) is the
+  // load-bearing property — these cases keep them distinct to prove the keys + ordering match byte-for-byte.
+  type Case = {
+    label: string;
+    findingsCount: number;
+    headSha: string;
+    publicationOutcome: PublicationOutcome | null;
+    captureDegradationNotes: ReadonlyArray<string>;
+    pipelineDegradationNotes: ReadonlyArray<string> | null;
+  };
+  const cases: Array<Case> = [
+    {
+      label: "inline_posted, no degradation, null pipeline_result",
+      findingsCount: 3,
+      headSha: "a".repeat(40),
+      publicationOutcome: PublicationOutcome.enum.inline_posted,
+      captureDegradationNotes: [],
+      pipelineDegradationNotes: null,
+    },
+    {
+      label: "body_only_posted, both degradation lists distinct + non-empty",
+      findingsCount: 7,
+      headSha: "b".repeat(40),
+      publicationOutcome: PublicationOutcome.enum.body_only_posted,
+      captureDegradationNotes: ["github_422_on_inline_post"],
+      pipelineDegradationNotes: ["retrieval_degraded", "persist_findings_failed"],
+    },
+    {
+      label: "degraded_unposted, publication notes only",
+      findingsCount: 0,
+      headSha: "c".repeat(40),
+      publicationOutcome: PublicationOutcome.enum.degraded_unposted,
+      captureDegradationNotes: ["all_inline_failed", "parent_body_failed"],
+      pipelineDegradationNotes: [],
+    },
+    {
+      label: "null publication_outcome (no publication happened), pipeline notes present",
+      findingsCount: 2,
+      headSha: "d".repeat(40),
+      publicationOutcome: null,
+      captureDegradationNotes: [],
+      pipelineDegradationNotes: ["dedup_semantic_skipped"],
+    },
+  ];
+  for (const c of cases) {
+    it(
+      c.label,
+      async () => {
+        const py = await pyHelper("build_analyzed_payload", {
+          findings_count: c.findingsCount,
+          head_sha: c.headSha,
+          publication_outcome: c.publicationOutcome,
+          capture_degradation_notes: c.captureDegradationNotes,
+          pipeline_degradation_notes: c.pipelineDegradationNotes,
+        });
+        const capture: PostReviewCapture = {
+          ...makePostReviewCapture(),
+          publicationOutcome: c.publicationOutcome,
+          degradationNotes: c.captureDegradationNotes,
+        };
+        const pipelineResult: ReviewPipelineResult | null =
+          c.pipelineDegradationNotes === null
+            ? null
+            : makeReviewPipelineResult({
+                status: "accepted",
+                headSha: c.headSha,
+                findingsCount: c.findingsCount,
+                walkthrough: null,
+                aggregated: null,
+                fileRouting: null,
+                staticAnalysis: null,
+                carryForward: null,
+                classifierFailureRatio: 0,
+                degradationNotes: c.pipelineDegradationNotes,
+              });
+        const ts = buildAnalyzedPayload({
+          findingsCount: c.findingsCount,
+          headSha: c.headSha,
+          postedReviewCapture: capture,
+          pipelineResult,
+        });
         expect(canonicalize(ts)).toBe(canonicalize(py));
       },
       TIMEOUT,

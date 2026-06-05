@@ -90,6 +90,26 @@ import { releasePrReviewMutexActivity } from "#backend/activities/release_pr_rev
 import { postReviewPlaceholder } from "#backend/activities/post_review_placeholder.activity.js";
 import { deleteReviewPlaceholder } from "#backend/activities/delete_review_placeholder.activity.js";
 
+// ── Stage-3 run-lifecycle + finding-delivery + citation + audit activities ──
+// The workflow body (ANALYSIS_STARTED / ANALYZED / finalize / run-failed / run-cancelled + the three
+// delivery setters) and the orchestrator (citation_validate Step 7.5 + the output-safety audit emit)
+// dispatch these by their registered names. The four run-lifecycle + three delivery activities are 1-arg
+// (their `deps` 2nd arg defaults → fn.length === 1); citationValidate / emitOutputSafetyAuditEvent are
+// strictly 1-arg.
+import {
+  recordReviewLifecycleEvent,
+  finalizeReviewRun,
+  recordRunFailed,
+  recordRunCancelled,
+} from "#backend/activities/record_review_lifecycle.activity.js";
+import {
+  recordDeliveryFinalized,
+  recordDeliverySkipped,
+  recordDeliveryDegraded,
+} from "#backend/activities/record_delivery_lifecycle.activity.js";
+import { citationValidate } from "#backend/activities/citation_validate.activity.js";
+import { emitOutputSafetyAuditEvent } from "#backend/activities/emit_output_safety_audit.activity.js";
+
 import { resolveEmbeddingsConsumer } from "#backend/adapters/resolve_embeddings.js";
 import { VaultHttpPort } from "#backend/adapters/vault_http.js";
 
@@ -340,6 +360,21 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
     releasePrReviewMutexActivity,
     postReviewPlaceholder,
     deleteReviewPlaceholder,
+    // ── Stage-3 run-lifecycle (RUNNING→COMPLETED/FAILED/CANCELLED + ANALYSIS_STARTED/ANALYZED milestones) ──
+    // Self-defaulting (optional 2nd `deps` arg → fn.length === 1); registered bare. Dispatched by the body.
+    recordReviewLifecycleEvent,
+    finalizeReviewRun,
+    recordRunFailed,
+    recordRunCancelled,
+    // ── Stage-3 finding-delivery setters (the body's lifecycle-bookkeeping block + the orchestrator's H-2
+    // inline skip). 1-arg typed inputs; registered bare. ──
+    recordDeliveryFinalized,
+    recordDeliverySkipped,
+    recordDeliveryDegraded,
+    // ── Stage-3 citation validation (orchestrator Step 7.5) + output-safety audit emit (chunk/walkthrough
+    // sanitization_event). 1-arg typed inputs; registered bare. ──
+    citationValidate,
+    emitOutputSafetyAuditEvent,
     // ── bound-method activities (real embedder) ──
     aggregateFindings: aggregateActivity.aggregateFindings,
     // dedup_findings — bound arrow property holding the shared real embedder (semantic dedup stage).

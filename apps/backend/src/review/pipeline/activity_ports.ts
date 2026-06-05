@@ -52,6 +52,10 @@ import type {
 } from "#contracts/policy_compute.v1.js";
 import type { PersistReviewFindingsInputV1 } from "#contracts/persist_review_findings.v1.js";
 import type { PersistReviewWalkthroughInputV1 } from "#contracts/persist_review_walkthrough.v1.js";
+import type { CitationValidateInputV1 } from "#contracts/citation_validate_input.v1.js";
+import type { CitationValidationResultV1 } from "#contracts/citation_validation.v1.js";
+import type { EmitOutputSafetyAuditEventInput } from "#contracts/emit_output_safety_audit.v1.js";
+import type { SkippedInputV1 } from "#contracts/finding_lifecycle_inputs.v1.js";
 
 /** changed_line_ranges wire shape: dict[str, tuple[tuple[int,int], ...]] → keyed by relative path,
  *  ChangedLineRange is the [start, end] tuple ported in chunk_and_redact.v1.ts. Matches the existing TS
@@ -127,6 +131,14 @@ export type ReviewActivityPorts = {
   postReview(input: PostReviewInputV1): Promise<PostedReviewV1>;
   postCheckRun(input: PostCheckRunInputV1): Promise<PostedCheckRunV1>;
   cleanup(input: ReleaseWorkspaceInput): Promise<void>;
+  // ── Stage-3 ports (citation validation, output-safety audit emit, finding-delivery skip) ──
+  // OPTIONAL: when omitted, the orchestrator SKIPS the corresponding step (the Python `is None` branch).
+  //   * citationValidate     — Step 7.5 (drops findings citing missing repo_paths; fs syscalls → activity).
+  //   * emitOutputSafetyAudit — dispatched when a chunk/walkthrough envelope carries a sanitization_event.
+  //   * recordDeliverySkipped — the H-2 inline skip dispatch on the post-review dropped-state failure path.
+  citationValidate?(input: CitationValidateInputV1): Promise<CitationValidationResultV1>;
+  emitOutputSafetyAudit?(input: EmitOutputSafetyAuditEventInput): Promise<void>;
+  recordDeliverySkipped?(input: SkippedInputV1): Promise<number>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -344,5 +356,69 @@ export const RETRY_POLICIES = {
   emitOutputSafetyAudit: {
     scheduleToCloseTimeout: "2 minutes",
     retry: { initialInterval: "1s", maximumInterval: "30s", maximumAttempts: 5 },
+  },
+
+  // citation_validate_activity (review_pull_request.py:2055-2059): start_to_close 30s,
+  // retry initial_interval=2s, max_attempts=3. The validator's fs syscalls run in the activity (sandbox
+  // forbids them in the workflow body); Step 7.5 of the orchestrator dispatches it between aggregate +
+  // persist.
+  citationValidate: {
+    startToCloseTimeout: "30s",
+    retry: { initialInterval: "2s", maximumAttempts: 3 },
+  },
+
+  // record_delivery_skipped_activity (review_pull_request.py:3768-3774 lifecycle bookkeeping + the H-2
+  // inline post-failure dispatch at ~2561): start_to_close 30s, retry initial_interval=1s,
+  // backoff_coefficient=2.0, max_attempts=3. Shared by the orchestrator's H-2 dropped-state path AND the
+  // workflow body's lifecycle-bookkeeping block (both dispatch the same registered activity).
+  recordDeliverySkipped: {
+    startToCloseTimeout: "30s",
+    retry: { initialInterval: "1s", backoffCoefficient: 2.0, maximumAttempts: 3 },
+  },
+
+  // record_delivery_finalized_activity (review_pull_request.py:3686-3693): start_to_close 30s,
+  // retry initial_interval=1s, backoff_coefficient=2.0, max_attempts=3. (Lifecycle bookkeeping setter.)
+  recordDeliveryFinalized: {
+    startToCloseTimeout: "30s",
+    retry: { initialInterval: "1s", backoffCoefficient: 2.0, maximumAttempts: 3 },
+  },
+
+  // record_delivery_degraded_activity (review_pull_request.py:3811-3818): start_to_close 30s,
+  // retry initial_interval=1s, backoff_coefficient=2.0, max_attempts=3. (Lifecycle bookkeeping setter.)
+  recordDeliveryDegraded: {
+    startToCloseTimeout: "30s",
+    retry: { initialInterval: "1s", backoffCoefficient: 2.0, maximumAttempts: 3 },
+  },
+
+  // record_review_lifecycle_event_activity (review_pull_request.py:678-682 ANALYSIS_STARTED; :3987-3994
+  // ANALYZED): start_to_close 30s, retry initial_interval=2s, max_attempts=3, non_retryable=[ValueError]
+  // (the allow-list reject is a permanent caller bug, never retried).
+  recordReviewLifecycleEvent: {
+    startToCloseTimeout: "30s",
+    retry: { initialInterval: "2s", maximumAttempts: 3, nonRetryableErrorTypes: ["ValueError"] },
+  },
+
+  // finalize_review_run_activity (review_pull_request.py:4009-4017): start_to_close 30s,
+  // retry initial_interval=2s, max_attempts=3, non_retryable=[StateDrift, ValueError] (a drifted run is a
+  // permanent terminal state, not a transient failure).
+  finalizeReviewRun: {
+    startToCloseTimeout: "30s",
+    retry: {
+      initialInterval: "2s",
+      maximumAttempts: 3,
+      nonRetryableErrorTypes: ["StateDrift", "ValueError"],
+    },
+  },
+
+  // record_run_failed_activity (review_pull_request.py:4131-4140) + record_run_cancelled_activity
+  // (review_pull_request.py:4067-4076): start_to_close 30s, retry initial_interval=2s, max_attempts=3,
+  // non_retryable=[StateDrift, ValueError]. Both BF-5/BF-13 terminal-transition setters share the curve.
+  recordRunTerminal: {
+    startToCloseTimeout: "30s",
+    retry: {
+      initialInterval: "2s",
+      maximumAttempts: 3,
+      nonRetryableErrorTypes: ["StateDrift", "ValueError"],
+    },
   },
 } as const satisfies Record<string, RetryActivityOptions>;

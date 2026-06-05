@@ -65,10 +65,13 @@ from typing import Any
 from contracts.posted_review.v1 import PublicationOutcome
 
 from codemaster.workflows.review_pipeline_orchestrator import (
+    ReviewPipelineResult,
     _infer_pr_topology_kind,
     _path_filters_excluded_all_finding,
 )
 from codemaster.workflows.review_pull_request import (
+    _PostReviewCapture,
+    _build_analyzed_payload,
     _compose_orchestrator_degradation_note,
     _config_change_notice_finding,
     _fix_prompt_stage_outcome,
@@ -111,6 +114,40 @@ def _handle(req: dict[str, Any]) -> dict[str, Any]:
             req,
             _compose_orchestrator_degradation_note(
                 notes=tuple(req.get("notes", [])), prior_note=req.get("prior_note")
+            ),
+        )
+    if op == "build_analyzed_payload":
+        # The patched branch is the only one the gate-collapsed TS port reproduces, so the ref always
+        # passes patched=True (the unpatched v7-A baseline shape is dead code in the new workflow type).
+        capture = _PostReviewCapture(
+            publication_outcome=_outcome_or_none(req.get("publication_outcome")),
+            degradation_notes=tuple(req.get("capture_degradation_notes", [])),
+        )
+        pipeline_notes = req.get("pipeline_degradation_notes")
+        pipeline_result = (
+            None
+            if pipeline_notes is None
+            else ReviewPipelineResult(
+                status="accepted",
+                head_sha=req["head_sha"],
+                findings_count=req["findings_count"],
+                walkthrough=None,
+                aggregated=None,
+                file_routing=None,
+                static_analysis=None,
+                carry_forward=None,
+                classifier_failure_ratio=0.0,
+                degradation_notes=tuple(pipeline_notes),
+            )
+        )
+        return _ok(
+            req,
+            _build_analyzed_payload(
+                findings_count=req["findings_count"],
+                head_sha=req["head_sha"],
+                posted_review_capture=capture,
+                pipeline_result=pipeline_result,
+                patched=True,
             ),
         )
     raise ValueError(f"unknown op: {op!r}")

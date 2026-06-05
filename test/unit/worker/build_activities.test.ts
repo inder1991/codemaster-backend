@@ -58,6 +58,18 @@ const EXPECTED_ACTIVITY_NAMES = [
   "releasePrReviewMutexActivity",
   "postReviewPlaceholder",
   "deleteReviewPlaceholder",
+  // Stage-3 run-lifecycle + finding-delivery + citation + audit (the body's ANALYSIS_STARTED/ANALYZED/
+  // finalize/run-failed/run-cancelled + the lifecycle-bookkeeping setters; the orchestrator's Step 7.5
+  // citation_validate + the output-safety audit emit).
+  "recordReviewLifecycleEvent",
+  "finalizeReviewRun",
+  "recordRunFailed",
+  "recordRunCancelled",
+  "recordDeliveryFinalized",
+  "recordDeliverySkipped",
+  "recordDeliveryDegraded",
+  "citationValidate",
+  "emitOutputSafetyAuditEvent",
 ] as const;
 
 describe("buildActivities() composition root", () => {
