@@ -74,12 +74,19 @@ Conditions on this dependency (all required):
 4. **Golden parity fixtures.** Same source file in Python and TS must produce identical chunk
    boundaries. Tests record boundary metadata — file path, language, **start/end byte offsets** (the
    **primary** proof), start/end lines, and chunk kind.
-5. **UTF-16 → UTF-8 byte-offset mapping (correctness-critical).** `web-tree-sitter` reports **UTF-16
-   code-unit** offsets (`startIndex`/`endIndex`); the Python chunker works in **UTF-8 byte** offsets.
-   These coincide for ASCII but diverge for non-ASCII source (verified: a 17-UTF-16-char comment is 20
-   UTF-8 bytes). The TS chunker MUST translate web-tree-sitter offsets to UTF-8 byte offsets (e.g.
-   `Buffer.byteLength(src.slice(0, idx), "utf8")` via a prefix-sum index) so the persisted/compared
-   boundaries are byte-identical to Python.
+5. **Encoding: the chunker is LINE-based, so no UTF-16→UTF-8 mapping is needed (verified).** Note for
+   future maintainers: `web-tree-sitter` reports **UTF-16 code-unit** offsets (`startIndex`/`endIndex`
+   and point *columns*), whereas the Python `tree-sitter` reports **UTF-8 byte** offsets — these diverge
+   for non-ASCII source (verified: a 17-UTF-16-char comment is 20 UTF-8 bytes). HOWEVER, the frozen
+   `treesitter_python` / `treesitter_tsjs` chunkers do **not** use node byte offsets at all: they use
+   the point **row** (`node.start_point[0]` / `end_point[0]`, 1-based line numbers) plus a single
+   `end_point[1] == 0` (column-at-line-start) check, then slice the body **by lines**. `DiffChunkV1`
+   identity is `(path, start_line, end_line, body)` — entirely line-based. Rows and the col-0 test are
+   **encoding-agnostic** (a newline is a newline; column 0 is column 0), and this was verified to match
+   byte-for-byte on a non-ASCII fixture (Python rows 0–2/5–7 == web-tree-sitter rows 0–2/5–7; col-0
+   check identical). So a UTF-16→UTF-8 mapping is **not required for the chunker**. It would only become
+   necessary if a future consumer reads node byte offsets / columns directly — at which point map via
+   `Buffer.byteLength(src.slice(0, idx), "utf8")`.
 6. **Fallback is explicitly NON-parity.** The diff-hunk fallback for languages without a tree-sitter
    grammar is marked non-parity in code + tests (it is a best-effort path, not a byte-parity guarantee).
 7. **Dep-health note.** `web-tree-sitter` is pure WASM/JS (no `node-gyp`, no native ABI). The grammar
