@@ -64,6 +64,10 @@ import {
   PostgresLlmCallsTelemetryWriter,
 } from "#backend/integrations/llm/client.js";
 import { type LlmCredentialsProvider } from "#backend/integrations/llm/credentials_provider.js";
+import {
+  type LangfuseExporterPort,
+  LangfuseExporter,
+} from "#backend/observability/langfuse_exporter.js";
 import { LlmRoleNotConfiguredError } from "#backend/integrations/llm/errors.js";
 import {
   type LlmProviderRole,
@@ -124,13 +128,15 @@ export const defaultSdkFactory: SdkFactory = (args: {
 
 /**
  * The REAL, ALWAYS-ON production collaborators an {@link LlmClient} needs beyond its SDK — the
- * Postgres-backed cost-cap, blob store, and `llm_calls` telemetry writer, plus the shared clock. These
- * are the objects that REPLACE the (now-removed) in-client faking stubs on the production path.
+ * Postgres-backed cost-cap, blob store, and `llm_calls` telemetry writer, the Langfuse trace exporter
+ * (env-gated OFF until LANGFUSE_HOST / LANGFUSE_API_KEY are set), plus the shared clock. These are the
+ * objects that REPLACE the (now-removed) in-client faking stubs on the production path.
  */
 export type ClientCollaborators = {
   readonly costCap: CostCapEnforcer;
   readonly blobStore: BlobStore;
   readonly telemetry: LlmCallsTelemetryWriter;
+  readonly langfuse: LangfuseExporterPort;
   readonly clock: Clock;
 };
 
@@ -175,6 +181,11 @@ export function sharedClientCollaborators(dsn: string): ClientCollaborators {
     costCap: PostgresCostCapEnforcer.fromDsn({ dsn, clock, readCapsFromDb: true }),
     blobStore: BlobStorePostgresAdapter.fromDsn({ dsn, clock }),
     telemetry: PostgresLlmCallsTelemetryWriter.fromDsn({ dsn }),
+    // Langfuse exporter from env — env-gated OFF (no POST) until LANGFUSE_HOST / LANGFUSE_API_KEY are
+    // set. Shared per-process like the other collaborators (the Python `_client_factory` captures the
+    // spine's shared exporter). NOT keyed on the DSN — the env config is process-global — but lives in
+    // the per-DSN memo so every role's client shares the same exporter instance.
+    langfuse: LangfuseExporter.fromEnv(),
     clock,
   };
   SHARED_COLLABORATORS.set(dsn, collaborators);
@@ -190,8 +201,10 @@ export function sharedClientCollaborators(dsn: string): ClientCollaborators {
  * tests construct their own `LlmClient` with the in-memory test doubles and NEVER call this factory.
  */
 export const defaultClientFactory: ClientFactory = (args: { sdk: LlmSdk }): LlmClient => {
-  const { costCap, blobStore, telemetry, clock } = sharedClientCollaborators(requireCoreDsn());
-  return new LlmClient({ sdk: args.sdk, costCap, blobStore, telemetry, clock });
+  const { costCap, blobStore, telemetry, langfuse, clock } = sharedClientCollaborators(
+    requireCoreDsn(),
+  );
+  return new LlmClient({ sdk: args.sdk, costCap, blobStore, telemetry, langfuse, clock });
 };
 
 // ─── Cache envelope ────────────────────────────────────────────────────────────────────────────

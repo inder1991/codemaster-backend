@@ -34,10 +34,19 @@
 //                      no DB and asserts nothing on the row — faithful to the Python cassette test,
 //                      which wires an in-memory enforcer and never reads the llm_calls row); the
 //                      production `LlmClientCache` injects the real writer (the always-on path).
-//   - Langfuse/OTel  — the Python's fire-and-forget Langfuse trace + the wrapping OTel span are
-//                      env-gated in Python (`self._langfuse is None` → no-op; OTel exporter off unless
-//                      configured) and are INTENTIONALLY not wired here — faithfully OFF, NOT a stub.
-//                      Wiring them is a separate observability workflow.
+//   - Langfuse     — the Python's fire-and-forget Langfuse trace. NOW WIRED (de-stub part 4) as an
+//                      INJECTED collaborator ({@link LangfuseExporterPort}) defaulting to the
+//                      {@link DISABLED_LANGFUSE_EXPORTER} no-op — the structural analogue of the Python
+//                      `self._langfuse is None` early-return. The production `LlmClientCache` injects
+//                      `LangfuseExporter.fromEnv()`, which is ITSELF env-gated OFF (no POST) until
+//                      LANGFUSE_HOST / LANGFUSE_API_KEY are set — faithfully OFF when unconfigured, NOT
+//                      a stub. The export is fire-and-forget: it builds a {@link BedrockTraceV1} from the
+//                      call params + redacted snippets and calls `exporter.export(...)`, on BOTH the
+//                      success (status ok/failed from output-safety) and the SDK-error (failed/timeout)
+//                      paths, exactly where the Python `_maybe_export_langfuse_trace` is called. It NEVER
+//                      affects the return / raise (the exporter swallows its own errors).
+//   - OTel         — the wrapping OTel span is env-gated off unless configured in Python and is
+//                      INTENTIONALLY not wired here — faithfully OFF, NOT a stub. A separate workflow.
 //
 // Output-safety IS on the observable path (it can BLOCK), so the REAL ported OutputSafetyValidator is
 // wired (injected, defaulting to a fresh real validator) and a block raises the REAL ported
@@ -54,6 +63,11 @@ import { tenantKysely } from "#platform/db/database.js";
 import { SystemRandom } from "#platform/randomness.js";
 
 import { BedrockBudgetExceededError, type CostCapEnforcer } from "#backend/cost/enforcer.js";
+import {
+  type LangfuseExporterPort,
+  DISABLED_LANGFUSE_EXPORTER,
+  redactSnippet,
+} from "#backend/observability/langfuse_exporter.js";
 import { redactPii } from "#backend/redact/pii_redactor.js";
 import { OutputSafetyValidator } from "#backend/security/output_safety.js";
 
@@ -61,6 +75,7 @@ import { LlmInvocationError, LlmOutputUnsafeError, LlmTimeoutError } from "./err
 
 import type { BlobRef } from "#contracts/blob_ref.v1.js";
 import { LlmInvokeResultV1 } from "#contracts/llm_invoke_result.v1.js";
+import { BedrockTraceV1 } from "#contracts/llm_trace.v1.js";
 import type { LlmMessage } from "#contracts/llm_message.v1.js";
 
 // ─── documented model set (BEDROCK_MODELS) ─────────────────────────────────────────────────────────
@@ -274,6 +289,7 @@ export class LlmClient {
   private readonly archiveRedactor: ArchiveRedactor;
   private readonly telemetry: LlmCallsTelemetryWriter;
   private readonly outputSafety: OutputSafetyValidator;
+  private readonly langfuse: LangfuseExporterPort;
   private readonly clock: Clock;
   private readonly random: SystemRandom;
 
@@ -286,6 +302,10 @@ export class LlmClient {
     archiveRedactor?: ArchiveRedactor;
     telemetry?: LlmCallsTelemetryWriter;
     outputSafety?: OutputSafetyValidator;
+    // Langfuse trace exporter — defaults to the disabled no-op (the Python `self._langfuse is None`).
+    // Production injects `LangfuseExporter.fromEnv()` (itself env-gated OFF until LANGFUSE_HOST/API_KEY
+    // are set). Fire-and-forget; never affects the return / raise.
+    langfuse?: LangfuseExporterPort;
     clock?: Clock;
   }) {
     this.clock = args.clock ?? new WallClock();
@@ -295,6 +315,7 @@ export class LlmClient {
     this.archiveRedactor = args.archiveRedactor ?? REAL_ARCHIVE_REDACTOR;
     this.telemetry = args.telemetry ?? NOOP_TELEMETRY_WRITER;
     this.outputSafety = args.outputSafety ?? new OutputSafetyValidator();
+    this.langfuse = args.langfuse ?? DISABLED_LANGFUSE_EXPORTER;
     this.random = new SystemRandom();
   }
 
@@ -387,10 +408,11 @@ export class LlmClient {
       });
     } catch (e) {
       // The Python distinguishes TimeoutError (status='timeout') from any other exception
-      // (status='failed') for the telemetry status label; BOTH map to LlmInvocationError on the
-      // observable path. The failure-row write (so cost telemetry stays accurate even on failure) and
-      // the cost-cap reservation release ARE on the always-on production path and are reproduced here.
-      // The Langfuse export stays intentionally OFF (env-gated in Python). Mirrors client.py:421-476.
+      // (status='failed') for the telemetry / Langfuse status label; BOTH map to LlmInvocationError on
+      // the observable path. The failure-row write (so cost telemetry stays accurate even on failure),
+      // the cost-cap reservation release, AND the fire-and-forget Langfuse export ARE on the always-on
+      // production path and are reproduced here. Mirrors client.py:421-476 (the two except arms, unified
+      // here because the status label is the only thing that differs between them).
       const failedLatencyMs = Math.trunc((this.clock.monotonic() - started) * 1000);
       const failureStatus: "failed" | "timeout" = isTimeoutError(e) ? "timeout" : "failed";
       await this.recordFailure({
@@ -401,6 +423,20 @@ export class LlmClient {
         status: failureStatus,
       });
       await this.releaseCostCapReservation({ installationId: telemetryIid, estimated });
+      await this.maybeExportLangfuseTrace({
+        requestId,
+        installationId: telemetryIid,
+        model,
+        promptTokens: 0,
+        completionTokens: 0,
+        latencyMs: failedLatencyMs,
+        costUsdCents: 0,
+        status: failureStatus,
+        promptText: firstMessageContent(args.messages),
+        completionText: "",
+        routingReason: ROUTING_REASON,
+        policyRevision: POLICY_REVISION,
+      });
       throw new LlmInvocationError(`bedrock invocation failed: ${formatErr(e)}`);
     }
     const latencyMs = Math.trunc((this.clock.monotonic() - started) * 1000);
@@ -470,6 +506,24 @@ export class LlmClient {
       costCents: computedFinalCents,
       today: isoDate(this.clock.now()),
       estimatedCents: estimated,
+    });
+
+    // Langfuse trace export (fire-and-forget). Carries the validator-aware status so blocked completions
+    // surface in observability without leaking the unsafe text (completion_text is "" when blocked).
+    // Ordered after record_call_cost + before the block raise — mirrors client.py:548-561.
+    await this.maybeExportLangfuseTrace({
+      requestId,
+      installationId: telemetryIid,
+      model,
+      promptTokens,
+      completionTokens,
+      latencyMs,
+      costUsdCents: computedFinalCents,
+      status: callStatus,
+      promptText: firstMessageContent(args.messages),
+      completionText: callStatus === "ok" ? contentText : "",
+      routingReason: ROUTING_REASON,
+      policyRevision: POLICY_REVISION,
     });
 
     if (blocked) {
@@ -572,6 +626,53 @@ export class LlmClient {
     }
   }
 
+  /**
+   * Build a {@link BedrockTraceV1} from the call params + redacted snippets and hand it to the injected
+   * Langfuse exporter. 1:1 with the Python `_maybe_export_langfuse_trace`.
+   *
+   * No-op when the disabled default is wired (the Python `if self._langfuse is None: return`; here the
+   * {@link DISABLED_LANGFUSE_EXPORTER}'s `export` is itself a no-op). Fire-and-forget: the exporter
+   * swallows its own transport errors, and this method additionally guards the trace BUILD (a validation
+   * failure must never mask the caller's return / raise — the Python `except Exception as e:
+   * _LOG.warning(...)` defense-in-depth). The snippets are redacted + truncated to 200 via
+   * {@link redactSnippet}.
+   */
+  private async maybeExportLangfuseTrace(args: {
+    requestId: string;
+    installationId: string;
+    model: string;
+    promptTokens: number;
+    completionTokens: number;
+    latencyMs: number;
+    costUsdCents: number;
+    status: "ok" | "failed" | "timeout";
+    promptText: string;
+    completionText: string;
+    routingReason: string;
+    policyRevision: number;
+  }): Promise<void> {
+    try {
+      const trace = BedrockTraceV1.parse({
+        request_id: args.requestId,
+        installation_id: args.installationId,
+        model: args.model,
+        prompt_tokens: args.promptTokens,
+        completion_tokens: args.completionTokens,
+        latency_ms: args.latencyMs,
+        cost_usd_cents: args.costUsdCents,
+        status: args.status,
+        prompt_redacted_snippet: redactSnippet(args.promptText),
+        completion_redacted_snippet: redactSnippet(args.completionText),
+        routing_reason: args.routingReason,
+        policy_revision: args.policyRevision,
+      });
+      await this.langfuse.export(trace);
+    } catch {
+      // Defense in depth — a trace build / export failure must never mask the caller's return or raise.
+      // Mirrors the Python `_maybe_export_langfuse_trace` outer `except Exception` warn-and-continue.
+    }
+  }
+
   /** Mint a random RFC4122 v4 UUID via the platform randomness seam (the Python `uuid.uuid4()`). */
   private uuid4(): string {
     const b = Buffer.from(this.random.tokenBytes(16));
@@ -580,6 +681,27 @@ export class LlmClient {
     const h = b.toString("hex");
     return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
   }
+}
+
+// ADR-0060 A: the ModelRouter was retired — model selection is resolved upstream and passed explicitly,
+// so `routing_reason` / `policy_revision` are fixed call-frame locals on every invocation (the Python
+// `routing_reason = "explicit"; policy_revision = 0`). Threaded into the trace; NOT instance state (two
+// concurrent invocations would race on instance attributes — the Sprint-15 S15.E fix).
+const ROUTING_REASON = "explicit";
+const POLICY_REVISION = 0;
+
+/**
+ * Return the content of the first user / system message for tracing — the Python
+ * `_first_message_content`. Falls back to the first message's content, then to "" when there are no
+ * messages at all.
+ */
+function firstMessageContent(messages: Array<LlmMessage>): string {
+  for (const m of messages) {
+    if (m.role === "user" || m.role === "system") {
+      return m.content;
+    }
+  }
+  return messages.length > 0 ? messages[0]!.content : "";
 }
 
 /**
