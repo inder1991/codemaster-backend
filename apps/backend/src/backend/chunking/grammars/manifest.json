@@ -19,8 +19,15 @@
       "wasm": "tree-sitter-typescript.wasm",
       "source_npm": "tree-sitter-typescript@0.23.2",
       "matches_python_pkg": "tree-sitter-typescript==0.23.2",
-      "note": "language_typescript() variant (NOT tsx). The tarball also ships tree-sitter-tsx.wasm; vendor it too if/when .tsx chunking is added.",
+      "note": "language_typescript() variant. Routes .ts files. The tsx variant is the sibling 'tsx' entry below.",
       "sha256": "778025db5a8be0e70f8ccc3671e486dfeddd048c25d9e8a70c26de2e1bf6f97d"
+    },
+    "tsx": {
+      "wasm": "tree-sitter-tsx.wasm",
+      "source_npm": "tree-sitter-typescript@0.23.2",
+      "matches_python_pkg": "tree-sitter-typescript==0.23.2 (language_tsx())",
+      "note": "language_tsx() variant — parses JSX. Routes .tsx files. Ships in the same tree-sitter-typescript tarball as a second .wasm. Parity verified: byte-identical parse to Python language_tsx() on jsx_body.tsx.",
+      "sha256": "79e5da75ea62855a0cd67177685f0164eac87d5f630b3cbe1e0a099751ad30f8"
     }
   },
   "reproduce": "For each grammar at the pinned version: `npm pack <source_npm>` → `tar xzf <pkg>-<ver>.tgz` → `cp package/<wasm> apps/backend/src/backend/chunking/grammars/` → verify `shasum -a 256` matches the sha256 above. The .wasm ships prebuilt inside the npm tarball; no emscripten build is required."
