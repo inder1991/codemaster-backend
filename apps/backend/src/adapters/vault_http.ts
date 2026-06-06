@@ -334,6 +334,32 @@ export class VaultHttpPort implements VaultPort {
     return out;
   }
 
+  /**
+   * Read a KV secret WITHOUT coercing values to strings — preserves nested objects (unlike {@link kvRead},
+   * which `String()`s every value, turning a nested object into "[object Object]"). Required for payloads
+   * like the field-encryption keyset (`{current_version, keys: {vN: base64}}`). Mirrors the Python
+   * `VaultPort.kv_read`'s `dict[str, Any]` return.
+   */
+  public async kvReadRaw(args: {
+    path: string;
+    version?: number;
+  }): Promise<Record<string, unknown>> {
+    const suffix = args.version ? `?version=${args.version}` : "";
+    const resp = await this.request("GET", `/v1/${this.kvMount}/data/${args.path}${suffix}`);
+    if (resp.status === HTTP_NOT_FOUND) {
+      throw new VaultPathNotFound(args.path);
+    }
+    if (resp.status >= HTTP_CLIENT_ERROR_FLOOR) {
+      throw new VaultConnectivityError(`kv_read ${args.path} returned ${resp.status}`);
+    }
+    const data = dataObject(parseJson(resp.bodyText));
+    const inner = data?.["data"];
+    if (typeof inner !== "object" || inner === null) {
+      throw new VaultConnectivityError(`kv_read ${args.path}: unexpected response shape`);
+    }
+    return inner as Record<string, unknown>;
+  }
+
   public async kvWrite(args: {
     path: string;
     data: Record<string, string>;
