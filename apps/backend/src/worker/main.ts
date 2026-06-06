@@ -17,6 +17,10 @@
  *
  * A dedicated namespace + dedicated task queue means a real worker never polls this queue and this worker
  * never polls a real queue — the spine worker cannot pick up (or be picked up by) live cluster traffic.
+ * These defaults apply ONLY on a loopback address; against a real cluster (a non-loopback `TEMPORAL_ADDRESS`
+ * or `NODE_ENV=production`) {@link resolveWorkerTemporalConfig} REQUIRES `TEMPORAL_NAMESPACE` +
+ * `TEMPORAL_TASK_QUEUE` and fails boot otherwise (finding H) — a misconfigured prod deploy can't silently
+ * poll the dualrun queue and process zero reviews.
  *
  * ## ESM ↔ CJS interop for `require.resolve`
  *
@@ -37,6 +41,7 @@ import { NativeConnection, Worker } from "@temporalio/worker";
 
 import { startupSelfCheck } from "../chunking/treesitter_loader.js";
 import { buildActivities } from "./registry.js";
+import { resolveWorkerTemporalConfig } from "./temporal_config.js";
 
 /** ESM→CJS bridge: a `require` bound to THIS module's URL, so `require.resolve` works under ESM. */
 const require_ = createRequire(import.meta.url);
@@ -57,9 +62,12 @@ export async function runWorker(): Promise<void> {
   // chunker falling back to hunk-mode) instead of a clear startup failure.
   await startupSelfCheck();
 
-  const address = process.env.TEMPORAL_ADDRESS ?? "localhost:7233";
+  // Production-misconfiguration guard (finding H): a real-cluster TEMPORAL_ADDRESS (or NODE_ENV=production)
+  // without TEMPORAL_NAMESPACE + TEMPORAL_TASK_QUEUE fails boot LOUDLY here, rather than silently falling
+  // back to the dualrun-isolated defaults and polling the wrong queue (processing zero reviews).
+  const temporal = resolveWorkerTemporalConfig(process.env);
   const connection = await NativeConnection.connect(
-    process.env.TEMPORAL_TLS === "1" ? { address, tls: {} } : { address },
+    temporal.tls ? { address: temporal.address, tls: {} } : { address: temporal.address },
   );
 
   // Build the full review-pipeline activity surface via the composition root (real collaborators, every
@@ -70,8 +78,8 @@ export async function runWorker(): Promise<void> {
 
   const worker = await Worker.create({
     connection,
-    namespace: process.env.TEMPORAL_NAMESPACE ?? "dualrun",
-    taskQueue: process.env.TEMPORAL_TASK_QUEUE ?? "review-pull-request-dualrun",
+    namespace: temporal.namespace,
+    taskQueue: temporal.taskQueue,
     // Stage 1 — the spine worker now serves the THIN review-pipeline workflow
     // (review_pull_request.workflow), which REPLACES the Phase-2.0 walking skeleton as the spine. The
     // skeleton workflow file stays importable for any test that still references it, but the worker no
