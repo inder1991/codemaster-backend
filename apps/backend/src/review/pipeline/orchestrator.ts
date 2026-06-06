@@ -35,18 +35,20 @@
 //   decides legacy-vs-hybrid per chunk (it needs a non-null query_vector_override too). The hybrid retriever
 //   (BM25+ANN+Confluence+floors+rerank) is wired in build_activities → wiring/retrievers.ts.
 //
-// ── DEFERRED (tracked; pass empty/None per the task) ──
-//   * citation_validate (Stage 3 — its own activity boundary; Path.resolve syscalls). Step 7.5 skipped.
-//   * apply_policy_post_filter (Stage 5 — policy post-filter relocation). Step 7.2 skipped.
-//   * apply_arbitration / record_tool_runs (Stage 5 — arbitration layer). Step 7.7 skipped.
-//   * match_path_instructions (NOT YET PORTED — codemaster/config/path_match.py). matched_path_instructions
-//     passed as [] until the path-match helper lands; the activity reads it declaratively, so [] is a clean
-//     no-op (the legacy "no per-glob instructions" shape).
+// ── WIRED (port complete; some are unit-test-OPTIONAL ports that production always supplies) ──
+//   * citation_validate (Stage 3 — its own activity boundary; Path.resolve syscalls). Dispatched at
+//     Step 7.5 when ports.citationValidate is wired (build_activities wires it); omitted only in unit tests.
+//   * apply_policy_post_filter — relocated INLINE (Step 7.2: applyPolicyPostFilter, pure + sync).
+//   * apply_arbitration / record_tool_runs (Stage 5) — dispatched at Step 7.7 when the ports are wired
+//     (build_activities wires both); skipped only in unit tests / when no static analysis ran.
+//   * match_path_instructions — PORTED (apps/backend/src/config/path_match.ts); matchPathInstructions
+//     populates ReviewContextV1.matched_path_instructions per chunk.
+//
+// ── PARTIAL (wiring in place; value lands when an upstream stage populates it) ──
 //   * tier1_findings / tool_statuses threading (static-analysis-orchestrator-v2 + tier2-linter-aware-prompt
-//     collapse-on, Stage 5). Stage 1's staticAnalysis returns an empty-valid StaticAnalysisResultV1, so the
-//     threaded tuples are empty regardless; the WIRING is in place (the orchestrator threads
-//     sa.tier1_findings / sa.tool_statuses straight-line — collapse-on), and turns real once Stage 4 wires
-//     a populating staticAnalysis. No conditional gate remains.
+//     collapse-on). Stage 1's staticAnalysis returns an empty-valid StaticAnalysisResultV1, so the threaded
+//     tuples are empty regardless; the orchestrator threads sa.tier1_findings / sa.tool_statuses straight-
+//     line, turning real once a populating staticAnalysis lands. No conditional gate remains.
 //
 // ── SANDBOX SAFETY (ADR-0065 / ADR-0066 / check_clock_random + check_workflow_bundle) ──
 // This module runs INSIDE the Temporal V8 workflow sandbox. It is DETERMINISTIC + crypto/clock/network/DB
