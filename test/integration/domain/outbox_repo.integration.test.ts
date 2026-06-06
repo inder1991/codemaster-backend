@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresOutboxRepo } from "#backend/domain/repos/outbox_repo.js";
 
 import { getPool, disposePool, tenantKysely } from "#platform/db/database.js";
+import { FakeClock } from "#platform/clock.js";
 
 import { describeDb, INTEGRATION_DSN } from "../_db.js";
 
@@ -113,6 +114,72 @@ describeDb("PostgresOutboxRepo (integration, disposable PG)", () => {
       expect(row!["run_id"]).toBe(runId);
       expect(row!["installation_id"]).toBe(installationId);
       expect(row!["schema_version"]).toBe(2);
+    });
+  });
+
+  describe("the consumer methods (claim lease + mark transitions)", () => {
+    const fakeClock = new FakeClock({ now: new Date("2026-06-06T12:00:00.000Z") });
+    const cRepo = new PostgresOutboxRepo({ clock: fakeClock });
+
+    async function seedPending(tag: string): Promise<string> {
+      const db = tenantKysely(INTEGRATION_DSN!);
+      await cRepo.appendNonReviewDispatch({
+        db,
+        workflowType: "syncCodeOwners",
+        payload: {},
+        schemaVersion: 2,
+        installationId,
+        deliveryId: `${RUN_TAG}-${tag}`,
+      });
+      const res = await pool.query<{ id: string }>(`SELECT id FROM core.outbox WHERE delivery_id = $1`, [
+        `${RUN_TAG}-${tag}`,
+      ]);
+      return res.rows[0]!.id;
+    }
+    async function stateOf(id: string): Promise<{ state: string; attempts: number; leased: boolean }> {
+      const res = await pool.query<{ state: string; attempts: number; leased_until: Date | null }>(
+        `SELECT state, attempts, leased_until FROM core.outbox WHERE id = $1`,
+        [id],
+      );
+      const r = res.rows[0]!;
+      return { state: r.state, attempts: Number(r.attempts), leased: r.leased_until !== null };
+    }
+
+    it("claimPending claims a pending row, holds the lease, then re-claims after expiry", async () => {
+      fakeClock.set({ now: new Date("2026-06-06T12:00:00.000Z") });
+      const db = tenantKysely(INTEGRATION_DSN!);
+      const id = await seedPending("claim");
+
+      const claim1 = await cRepo.claimPending({ db, leaseSeconds: 60 });
+      expect(claim1.some((r) => r.id === id)).toBe(true);
+
+      const claim2 = await cRepo.claimPending({ db, leaseSeconds: 60 });
+      expect(claim2.some((r) => r.id === id)).toBe(false); // leased — not re-claimed within the window
+
+      fakeClock.advance({ seconds: 61 });
+      const claim3 = await cRepo.claimPending({ db, leaseSeconds: 60 });
+      expect(claim3.some((r) => r.id === id)).toBe(true); // lease expired → re-claimable
+
+      await cRepo.markDispatched({ db, id });
+    });
+
+    it("markAttemptFailed bumps attempts + releases the lease; markDead is terminal; markDispatched succeeds", async () => {
+      const db = tenantKysely(INTEGRATION_DSN!);
+      const id = await seedPending("marks");
+      await cRepo.claimPending({ db, leaseSeconds: 60 }); // lease it
+
+      await cRepo.markAttemptFailed({ db, id, error: "boom" });
+      const s = await stateOf(id);
+      expect(s.attempts).toBe(1);
+      expect(s.leased).toBe(false); // lease released → immediate retry
+      expect(s.state).toBe("pending");
+
+      await cRepo.markDead({ db, id, error: "give up" });
+      expect((await stateOf(id)).state).toBe("dead");
+
+      const id2 = await seedPending("dispatched");
+      await cRepo.markDispatched({ db, id: id2 });
+      expect((await stateOf(id2)).state).toBe("dispatched");
     });
   });
 });

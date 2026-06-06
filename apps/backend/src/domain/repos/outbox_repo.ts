@@ -14,6 +14,7 @@
 
 import { type Kysely, sql } from "kysely";
 
+import { WallClock, type Clock } from "#platform/clock.js";
 import { SystemRandom } from "#platform/randomness.js";
 
 // ─── uuid4 minter (via the platform randomness seam — the clock/random gate bans raw crypto.randomUUID
@@ -40,10 +41,33 @@ export const RECONCILE_PAYLOAD_SCHEMA_VERSION = 1;
  *  is producer drift. The TS review workflow type is `reviewPullRequest` (the registered Temporal type). */
 export const REVIEW_WORKFLOW_TYPES: ReadonlySet<string> = new Set(["reviewPullRequest"]);
 
-/** A Kysely instance or an open Transaction — the executor the raw `sql` INSERT runs on. */
+/** A Kysely instance or an open Transaction — the executor the raw `sql` runs on. */
 type Executor = Kysely<unknown>;
 
+/** A claimed outbox row (Python `OutboxRow`) — projected by {@link PostgresOutboxRepo.claimPending} for the
+ *  dispatcher (run_id/review_id/provider feed the stale-write guard + the INGESTED emit). */
+export type OutboxRow = {
+  id: string;
+  sink: string;
+  payload: Record<string, unknown>;
+  schemaVersion: number;
+  attempts: number;
+  traceContext: Record<string, unknown>;
+  runId: string | null;
+  reviewId: string | null;
+  provider: string | null;
+  installationId: string | null;
+};
+
 export class PostgresOutboxRepo {
+  readonly #clock: Clock;
+
+  /** The {@link Clock} is used ONLY by the consumer methods (leased_until / dispatched_at /
+   *  last_attempted_at). The producer appends rely on the schema's `created_at DEFAULT now()`. */
+  public constructor(args: { clock?: Clock } = {}) {
+    this.#clock = args.clock ?? new WallClock();
+  }
+
   /** Append a review-workflow dispatch row. `runId` is required by signature. */
   public async appendReviewDispatch(args: {
     db: Executor;
@@ -136,6 +160,102 @@ export class PostgresOutboxRepo {
         ${args.schemaVersion}, ${args.runId},
         CAST(${traceJson} AS JSONB), ${args.deliveryId}, ${args.installationId}
       )
+    `.execute(args.db);
+  }
+
+  // ─── Consumer side (the dispatcher) ──────────────────────────────────────────────────────────────
+
+  /**
+   * Claim up to `batchSize` pending rows for `leaseSeconds` (Python `claim_pending_rows`). `FOR UPDATE OF o
+   * SKIP LOCKED` so concurrent dispatcher pods see disjoint sets; sets `leased_until` so a crashed pod's
+   * rows become eligible again after the lease. LEFT JOINs review_runs + pull_request_reviews to project
+   * review_id + provider for the dispatcher's stale-write guard + INGESTED emit. The lease window is
+   * computed in SQL from the injected clock's `now` (no `new Date()` — the clock/random gate).
+   */
+  public async claimPending(args: {
+    db: Executor;
+    batchSize?: number;
+    leaseSeconds?: number;
+  }): Promise<Array<OutboxRow>> {
+    const batchSize = args.batchSize ?? 100;
+    const leaseSeconds = args.leaseSeconds ?? 60;
+    const now = this.#clock.now();
+    return args.db.transaction().execute(async (tx) => {
+      const claimed = await sql<{
+        id: string;
+        sink: string;
+        payload: Record<string, unknown>;
+        schema_version: number;
+        attempts: number;
+        trace_context: Record<string, unknown> | null;
+        run_id: string | null;
+        review_id: string | null;
+        provider: string | null;
+        installation_id: string | null;
+      }>`
+        SELECT o.id, o.sink, o.payload, o.schema_version, o.attempts, o.trace_context,
+               o.run_id, rr.review_id, pr.provider, o.installation_id
+          FROM core.outbox AS o
+          LEFT JOIN core.review_runs AS rr ON rr.run_id = o.run_id
+          LEFT JOIN core.pull_request_reviews AS pr ON pr.review_id = rr.review_id
+         WHERE o.state = 'pending'
+           AND (o.leased_until IS NULL OR o.leased_until < ${now})
+         ORDER BY o.created_at
+         LIMIT ${batchSize}
+         FOR UPDATE OF o SKIP LOCKED
+      `.execute(tx);
+      const rows = claimed.rows;
+      if (rows.length === 0) {
+        return [];
+      }
+      const ids = rows.map((r) => r.id);
+      await sql`
+        UPDATE core.outbox
+           SET leased_until = ${now}::timestamptz + ${leaseSeconds} * interval '1 second'
+         WHERE id IN (${sql.join(ids)})
+      `.execute(tx);
+      return rows.map((r) => ({
+        id: r.id,
+        sink: r.sink,
+        payload: r.payload,
+        schemaVersion: r.schema_version,
+        attempts: r.attempts,
+        traceContext: r.trace_context ?? {},
+        runId: r.run_id,
+        reviewId: r.review_id,
+        provider: r.provider,
+        installationId: r.installation_id,
+      }));
+    });
+  }
+
+  /** Success: state='dispatched', dispatched_at=now, release lease (Python `mark_dispatched`). */
+  public async markDispatched(args: { db: Executor; id: string }): Promise<void> {
+    await sql`
+      UPDATE core.outbox
+         SET state = 'dispatched', dispatched_at = ${this.#clock.now()}, leased_until = NULL
+       WHERE id = ${args.id}
+    `.execute(args.db);
+  }
+
+  /** Transient failure: attempts+1, last_error, last_attempted_at=now, release lease so retry is immediate
+   *  (Python `mark_attempt_failed`). The dispatcher decides when attempts exhaust → {@link markDead}. */
+  public async markAttemptFailed(args: { db: Executor; id: string; error: string }): Promise<void> {
+    await sql`
+      UPDATE core.outbox
+         SET attempts = attempts + 1, last_error = ${args.error.slice(0, 2000)},
+             last_attempted_at = ${this.#clock.now()}, leased_until = NULL
+       WHERE id = ${args.id}
+    `.execute(args.db);
+  }
+
+  /** Terminal dead-letter: state='dead', last_error, last_attempted_at=now, release lease. */
+  public async markDead(args: { db: Executor; id: string; error: string }): Promise<void> {
+    await sql`
+      UPDATE core.outbox
+         SET state = 'dead', last_error = ${args.error.slice(0, 2000)},
+             last_attempted_at = ${this.#clock.now()}, leased_until = NULL
+       WHERE id = ${args.id}
     `.execute(args.db);
   }
 }
