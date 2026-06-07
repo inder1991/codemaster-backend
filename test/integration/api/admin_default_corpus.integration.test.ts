@@ -51,7 +51,9 @@ beforeAll(async () => {
   await seedChunk("universal", "active");
   await seedChunk("security_only", "stale");
   // a retrieval trace from the last 24h that retrieved 2 'universal' default chunks
-  const trace = { stage3: { track_a_default: { selected_chunks_detail: [{ default_scope: "universal" }, { default_scope: "universal" }] } } };
+  // schema_version present so this row stays valid in v_retrieval_traces_recent (the matview's
+  // trace_schema_version extract is NOT NULL) when a parallel retrieval-traces suite REFRESHes it.
+  const trace = { schema_version: 2, stage3: { track_a_default: { selected_chunks_detail: [{ default_scope: "universal" }, { default_scope: "universal" }] } } };
   await sql`INSERT INTO core.retrieval_traces (trace_id, review_id, pr_id, captured_at, taxonomy_version, pipeline_version, trace)
             VALUES (${TRACE}, gen_random_uuid(), gen_random_uuid(), now(), 1, 1, CAST(${JSON.stringify(trace)} AS jsonb))`.execute(db);
 });

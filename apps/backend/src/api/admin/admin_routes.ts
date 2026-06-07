@@ -35,6 +35,7 @@ import {
   NotificationRuleV1,
   OrgsListV1,
   PullRequestListResponseV1,
+  RetrievalTraceListPageV1,
   ReviewsListPageV1,
   TaxonomyGapListV1,
 } from "#contracts/admin.v1.js";
@@ -48,6 +49,10 @@ import {
   getGeneration,
 } from "#backend/api/admin/embedder_read.js";
 import { buildMembersPage } from "#backend/api/admin/members_read.js";
+import {
+  getRetrievalTrace,
+  listRetrievalTraces,
+} from "#backend/api/admin/retrieval_traces_read.js";
 import {
   getLearningWithRevisions,
   getLlmProviderConfig,
@@ -206,6 +211,45 @@ export async function registerAdminRoutes(
           });
         }
         return reply.code(200).send(EmbeddingGenerationV1.parse(gen));
+      },
+    );
+
+    scope.get(
+      "/api/admin/retrieval-traces",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const q = request.query as AdminQuery;
+        const cursor = optStr(q.cursor);
+        // cursor is a stringified non-negative integer OFFSET (max 512 chars). Python's int(cursor) would
+        // 500 on a non-int; the port returns 422 instead (documented divergence; never a latent crash).
+        if (cursor !== null && (cursor.length > 512 || !/^\d+$/.test(cursor))) {
+          return reply.code(422).send({ detail: "cursor must be a non-negative integer" });
+        }
+        const offset = cursor === null ? 0 : Number(cursor);
+        const pageSize = clampLimit(q.page_size, 50, 200);
+        const starvationOnly = q.starvation_only === "true" || q.starvation_only === "1";
+        const { rows, nextCursor } = await listRetrievalTraces(opts.db, {
+          offset,
+          pageSize,
+          starvationOnly,
+        });
+        return reply.code(200).send(RetrievalTraceListPageV1.parse({ rows, next_cursor: nextCursor }));
+      },
+    );
+
+    scope.get(
+      "/api/admin/retrieval-traces/:trace_id",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const traceId = (request.params as { trace_id: string }).trace_id;
+        if (!UUID_RE.test(traceId)) {
+          return reply.code(422).send({ detail: "trace_id must be a UUID" });
+        }
+        const trace = await getRetrievalTrace(opts.db, traceId);
+        if (trace === null) {
+          return reply.code(404).send({ detail: { code: "trace_not_found", trace_id: traceId } });
+        }
+        return reply.code(200).send(trace);
       },
     );
 

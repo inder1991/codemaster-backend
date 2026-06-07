@@ -630,3 +630,40 @@ export const EmbedderCoverageV1 = z
   })
   .strict();
 export type EmbedderCoverageV1 = z.infer<typeof EmbedderCoverageV1>;
+
+// ─── Retrieval-trace inspector list (GET /api/admin/retrieval-traces) ────────────────────────────────
+// 1:1 with contracts/admin/retrieval_traces/v1.py. One flattened row of the v_retrieval_traces_recent
+// materialized view (all columns derived from the trace JSONB). The detail endpoint reuses the full
+// RetrievalTraceV2 from #contracts/persist_retrieval_trace.v1.
+
+/** One row of v_retrieval_traces_recent — compact, all-non-nullable. */
+export const RetrievalTraceListEntryV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    trace_id: z.string().uuid(),
+    review_id: z.string().uuid(),
+    pr_id: z.string().uuid(),
+    captured_at: z.string().datetime({ offset: true }),
+    taxonomy_version: z.number().int().min(0),
+    pipeline_version: z.number().int().min(1),
+    trace_schema_version: z.number().int().min(1),
+    effective_labels_count: z.number().int().min(0),
+    repo_include_attempts_filtered_count: z.number().int().min(0),
+    starvation_observed: z.boolean(),
+    selected_chunks_count: z.number().int().min(0),
+    dropped_chunks_count: z.number().int().min(0),
+    budget_total: z.number().int().min(0),
+    budget_remaining: z.number().int().min(0),
+  })
+  .strict();
+export type RetrievalTraceListEntryV1 = z.infer<typeof RetrievalTraceListEntryV1>;
+
+/** GET /api/admin/retrieval-traces — offset-paginated list (next_cursor is a stringified offset). */
+export const RetrievalTraceListPageV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    rows: z.array(RetrievalTraceListEntryV1),
+    next_cursor: z.string().nullable().default(null),
+  })
+  .strict();
+export type RetrievalTraceListPageV1 = z.infer<typeof RetrievalTraceListPageV1>;
