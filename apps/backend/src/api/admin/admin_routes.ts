@@ -18,6 +18,7 @@ import {
   FindingListResponseV1,
   OrgsListV1,
   PullRequestListResponseV1,
+  ReviewsListPageV1,
   TaxonomyGapListV1,
 } from "#contracts/admin.v1.js";
 
@@ -26,6 +27,7 @@ import {
   listOrgs,
   listPullRequests,
   listTaxonomyGaps,
+  searchReviews,
 } from "#backend/api/admin/admin_read_repo.js";
 import { makeRequireRole } from "#backend/api/admin/_authz.js";
 
@@ -35,6 +37,8 @@ const FINDINGS_DEFAULT_LIMIT = 50;
 const FINDINGS_MAX_LIMIT = 200;
 const PR_DEFAULT_LIMIT = 50;
 const PR_MAX_LIMIT = 200;
+const REVIEWS_DEFAULT_SIZE = 50;
+const REVIEWS_MAX_SIZE = 100;
 
 type AdminQuery = Record<string, unknown>;
 
@@ -105,6 +109,26 @@ export async function registerAdminRoutes(
         );
         const rows = await listTaxonomyGaps(opts.db, limit);
         return reply.code(200).send(TaxonomyGapListV1.parse({ rows }));
+      },
+    );
+
+    scope.get(
+      "/api/admin/reviews",
+      { preHandler: requireRole(["platform_operator", "platform_owner", "super_admin"]) },
+      async (request, reply) => {
+        const q = request.query as AdminQuery;
+        const page = Math.max(1, Math.floor(Number(q.page ?? 1)) || 1);
+        const size = clampLimit(q.size, REVIEWS_DEFAULT_SIZE, REVIEWS_MAX_SIZE);
+        const { items, total } = await searchReviews(opts.db, {
+          installationId: request.authPrincipal!.installationId,
+          repo: optStr(q.repo),
+          q: optStr(q.q),
+          state: optStr(q.state),
+          org: optStr(q.org),
+          page,
+          size,
+        });
+        return reply.code(200).send(ReviewsListPageV1.parse({ items, total, page, size }));
       },
     );
 

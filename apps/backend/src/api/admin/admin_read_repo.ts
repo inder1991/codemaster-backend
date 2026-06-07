@@ -7,6 +7,7 @@ import { type Kysely, sql } from "kysely";
 import type {
   FindingRowV1,
   PullRequestRowV1,
+  ReviewListItemV1,
   TaxonomyGapEntryV1,
 } from "#contracts/admin.v1.js";
 
@@ -27,6 +28,129 @@ export async function listOrgs(db: Kysely<unknown>, installationId: string): Pro
     ORDER BY org
   `.execute(db);
   return r.rows.map((row) => row.org);
+}
+
+// UI review state → the SQL lifecycle_state vocabulary it maps onto (1:1 with _UI_STATE_TO_SQL).
+const UI_STATE_TO_SQL = new Map<string, Array<string>>([
+  ["queued", ["PENDING"]],
+  ["in_progress", ["RUNNING", "WAITING_RETRY"]],
+  ["complete", ["COMPLETED", "PARTIAL"]],
+  ["failed", ["FAILED", "CANCELLED"]],
+]);
+
+export type SearchReviewsArgs = {
+  installationId: string;
+  repo?: string | null;
+  q?: string | null;
+  state?: string | null; // a UI state (queued/in_progress/complete/failed)
+  org?: string | null;
+  page: number;
+  size: number;
+};
+
+type ReviewSearchRow = {
+  review_id: string;
+  repo: string;
+  pr_number: number;
+  pr_title: string;
+  state: "queued" | "in_progress" | "complete" | "failed";
+  severity_max: "nit" | "suggestion" | "issue" | "blocker" | null;
+  finding_count: string | number;
+  started_at: Date;
+  completed_at: Date | null;
+  total_count: string | number;
+};
+
+/**
+ * Page/size-paginated reviews list — 1:1 with postgres_reviews_repo.search. A CTE aggregates per-PR
+ * finding_count + max-severity (non-suppressed), the main query maps lifecycle_state → the UI state
+ * vocabulary, COALESCEs the title + started_at, and COUNT(*) OVER () yields the total. Honors the
+ * platform-view bypass + repo/q/state/org filters. An unknown UI state short-circuits to an empty page.
+ */
+export async function searchReviews(
+  db: Kysely<unknown>,
+  args: SearchReviewsArgs,
+): Promise<{ items: Array<ReviewListItemV1>; total: number }> {
+  let stateIn: Array<string> | null = null;
+  if (args.state != null) {
+    const mapped = UI_STATE_TO_SQL.get(args.state);
+    if (mapped === undefined) {
+      return { items: [], total: 0 };
+    }
+    stateIn = mapped;
+  }
+  const offset = (args.page - 1) * args.size;
+  const repoFilter = args.repo ?? null;
+  const qFilter = args.q ?? null;
+  const orgFilter = args.org ?? null;
+  // Explicit IN-list (binding a JS array to `= ANY(::text[])` doesn't match reliably via the driver).
+  const stateClause =
+    stateIn === null
+      ? sql`TRUE`
+      : sql`rr.lifecycle_state IN (${sql.join(
+          stateIn.map((s) => sql`${s}`),
+          sql`, `,
+        )})`;
+
+  const r = await sql<ReviewSearchRow>`
+    WITH counted AS (
+      SELECT rf.pr_id, COUNT(*) AS finding_count,
+             MAX(CASE rf.severity WHEN 'blocker' THEN 4 WHEN 'issue' THEN 3
+                                  WHEN 'suggestion' THEN 2 WHEN 'nit' THEN 1 ELSE 0 END) AS severity_rank
+      FROM core.review_findings rf
+      WHERE (${args.installationId} = CAST(${SUPER_ADMIN_PLATFORM_VIEW_UUID} AS uuid)
+             OR rf.installation_id = ${args.installationId})
+        AND rf.suppression_state = 'NONE'
+      GROUP BY rf.pr_id
+    )
+    SELECT
+      pr.review_id,
+      repo.full_name AS repo,
+      pr.pr_number,
+      COALESCE(prr.title, 'PR #' || pr.pr_number::text) AS pr_title,
+      CASE
+        WHEN rr.lifecycle_state IS NULL                        THEN 'queued'
+        WHEN rr.lifecycle_state = 'PENDING'                    THEN 'queued'
+        WHEN rr.lifecycle_state IN ('RUNNING','WAITING_RETRY') THEN 'in_progress'
+        WHEN rr.lifecycle_state IN ('COMPLETED','PARTIAL')     THEN 'complete'
+        WHEN rr.lifecycle_state IN ('FAILED','CANCELLED')      THEN 'failed'
+        ELSE 'queued'
+      END AS state,
+      CASE counted.severity_rank WHEN 4 THEN 'blocker' WHEN 3 THEN 'issue'
+                                 WHEN 2 THEN 'suggestion' WHEN 1 THEN 'nit' ELSE NULL END AS severity_max,
+      COALESCE(counted.finding_count, 0) AS finding_count,
+      COALESCE(rr.started_at, pr.created_at) AS started_at,
+      rr.completed_at,
+      COUNT(*) OVER () AS total_count
+    FROM core.pull_request_reviews pr
+    JOIN core.repositories repo ON repo.github_repo_id = pr.repo_id
+    LEFT JOIN core.installations inst ON inst.installation_id = repo.installation_id
+    LEFT JOIN core.pull_requests prr ON prr.repository_id = repo.repository_id AND prr.pr_number = pr.pr_number
+    LEFT JOIN core.review_runs rr ON rr.run_id = pr.current_run_id
+    LEFT JOIN counted ON counted.pr_id = prr.pr_id
+    WHERE (${args.installationId} = CAST(${SUPER_ADMIN_PLATFORM_VIEW_UUID} AS uuid)
+           OR repo.installation_id = ${args.installationId})
+      AND (CAST(${repoFilter} AS text) IS NULL OR repo.full_name ILIKE '%' || CAST(${repoFilter} AS text) || '%')
+      AND (${stateClause})
+      AND (CAST(${qFilter} AS text) IS NULL OR prr.title ILIKE '%' || CAST(${qFilter} AS text) || '%')
+      AND (CAST(${orgFilter} AS text) IS NULL OR inst.account_login = ${orgFilter})
+    ORDER BY pr.created_at DESC, pr.review_id DESC
+    LIMIT ${args.size} OFFSET ${offset}
+  `.execute(db);
+
+  const items = r.rows.map((row) => ({
+    review_id: row.review_id,
+    repo: row.repo,
+    pr_number: row.pr_number,
+    pr_title: row.pr_title,
+    state: row.state,
+    severity_max: row.severity_max,
+    finding_count: Number(row.finding_count),
+    started_at: new Date(row.started_at).toISOString(),
+    completed_at: row.completed_at === null ? null : new Date(row.completed_at).toISOString(),
+  }));
+  const total = r.rows.length > 0 ? Number(r.rows[0]!.total_count) : 0;
+  return { items, total };
 }
 
 type TaxonomyGapRow = {

@@ -22,6 +22,34 @@ export const OrgsListV1 = z
   .strict();
 export type OrgsListV1 = z.infer<typeof OrgsListV1>;
 
+/** One item in the GET /api/admin/reviews page (Pydantic __contract_internal__). */
+export const ReviewListItemV1 = z
+  .object({
+    review_id: z.string().uuid(),
+    repo: z.string().min(1),
+    pr_number: z.number().int().min(1),
+    pr_title: z.string(),
+    state: z.enum(["queued", "in_progress", "complete", "failed"]),
+    severity_max: z.enum(["nit", "suggestion", "issue", "blocker"]).nullable().default(null),
+    finding_count: z.number().int().min(0),
+    started_at: z.string().datetime({ offset: true }),
+    completed_at: z.string().datetime({ offset: true }).nullable().default(null),
+  })
+  .strict();
+export type ReviewListItemV1 = z.infer<typeof ReviewListItemV1>;
+
+/** GET /api/admin/reviews — page/size-paginated reviews list. */
+export const ReviewsListPageV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    items: z.array(ReviewListItemV1),
+    total: z.number().int().min(0),
+    page: z.number().int().min(1),
+    size: z.number().int().min(1).max(100),
+  })
+  .strict();
+export type ReviewsListPageV1 = z.infer<typeof ReviewsListPageV1>;
+
 /** One row from GET /api/admin/pull-requests (a core.pull_requests row + resolved author_login). */
 export const PullRequestRowV1 = z
   .object({
