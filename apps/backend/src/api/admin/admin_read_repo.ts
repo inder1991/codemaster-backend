@@ -8,6 +8,9 @@ import type {
   FindingRowV1,
   FlagDetailV1,
   IntegrationListItemV1,
+  LearningDetailV1,
+  LearningListItemV1,
+  LearningRevisionItemV1,
   LlmModelV1,
   LlmProviderConfigV1,
   LlmPurposeModelV1,
@@ -157,6 +160,114 @@ export async function searchReviews(
   }));
   const total = r.rows.length > 0 ? Number(r.rows[0]!.total_count) : 0;
   return { items, total };
+}
+
+// ─── Knowledge (learnings; tenant-scoped; in-memory keyset by (last_fired_at, learning_id)) ───────
+
+type LearningDbRow = {
+  learning_id: string;
+  title: string;
+  body_markdown: string;
+  version: number;
+  repo: string | null;
+  state: "active" | "deprecated";
+  fired_count: string | number;
+  accepted_count: string | number;
+  feedback_count: string | number;
+  last_fired_at: Date | null;
+};
+
+const LEARNING_SELECT = sql`l.learning_id, l.title, l.body_markdown, l.version, r.full_name AS repo, l.state,
+                            l.fired_count, l.accepted_count, l.feedback_count, l.last_fired_at`;
+
+/** accept_rate = round(accepted/feedback, 4), or 0 when no feedback (app-computed, 1:1 with the router). */
+function acceptRate(accepted: number, feedback: number): number {
+  return feedback > 0 ? Math.round((accepted / feedback) * 10000) / 10000 : 0;
+}
+
+function mapLearningListItem(row: LearningDbRow): LearningListItemV1 {
+  return {
+    learning_id: row.learning_id,
+    title: row.title,
+    state: row.state,
+    repo: row.repo,
+    version: Number(row.version),
+    fired_count: Number(row.fired_count),
+    accept_rate: acceptRate(Number(row.accepted_count), Number(row.feedback_count)),
+    last_fired_at: row.last_fired_at === null ? null : new Date(row.last_fired_at).toISOString(),
+  };
+}
+
+/** GET /api/admin/knowledge — learnings for the session's installation, keyset-paginated DESC by
+ *  (last_fired_at, learning_id); NULL last_fired_at sorts last. size clamped [1,200]. */
+export async function listLearningsPage(
+  db: Kysely<unknown>,
+  installationId: string,
+  cursor: string | null,
+  size: number,
+): Promise<{ rows: Array<LearningListItemV1>; nextCursor: string | null }> {
+  const clamped = Math.min(Math.max(size, 1), 200);
+  const r = await sql<LearningDbRow>`
+    SELECT ${LEARNING_SELECT}
+    FROM core.learnings l LEFT JOIN core.repositories r ON r.repository_id = l.repo_id
+    WHERE l.installation_id = ${installationId}
+    ORDER BY l.updated_at DESC
+  `.execute(db);
+  const all = r.rows.map(mapLearningListItem);
+  const { page, nextCursor } = keysetSlice(
+    all,
+    (row) => ({ ts: row.last_fired_at ?? "", id: row.learning_id }),
+    cursor,
+    clamped,
+  );
+  return { rows: page, nextCursor };
+}
+
+/** GET /api/admin/knowledge/{learning_id} — the learning + its 10 most-recent revisions; null when the
+ *  learning isn't in this tenant (route → 404). */
+export async function getLearningWithRevisions(
+  db: Kysely<unknown>,
+  learningId: string,
+  installationId: string,
+): Promise<LearningDetailV1 | null> {
+  const head = await sql<LearningDbRow>`
+    SELECT ${LEARNING_SELECT}
+    FROM core.learnings l LEFT JOIN core.repositories r ON r.repository_id = l.repo_id
+    WHERE l.learning_id = ${learningId} AND l.installation_id = ${installationId} LIMIT 1
+  `.execute(db);
+  const row = head.rows[0];
+  if (row === undefined) {
+    return null;
+  }
+  const rev = await sql<{
+    revision_id: string;
+    body_markdown: string;
+    version: number;
+    edited_by_user_id: string;
+    edited_at: Date;
+  }>`
+    SELECT revision_id, body_markdown, version, edited_by_user_id, edited_at
+    FROM core.learnings_revisions WHERE learning_id = ${learningId} ORDER BY edited_at DESC LIMIT 10
+  `.execute(db);
+  const revisions: Array<LearningRevisionItemV1> = rev.rows.map((rr) => ({
+    revision_id: rr.revision_id,
+    body_markdown: rr.body_markdown,
+    version: Number(rr.version),
+    edited_by_user_id: rr.edited_by_user_id,
+    edited_at: new Date(rr.edited_at).toISOString(),
+  }));
+  return {
+    learning_id: row.learning_id,
+    title: row.title,
+    body_markdown: row.body_markdown,
+    state: row.state,
+    repo: row.repo,
+    version: Number(row.version),
+    fired_count: Number(row.fired_count),
+    accept_rate: acceptRate(Number(row.accepted_count), Number(row.feedback_count)),
+    last_fired_at: row.last_fired_at === null ? null : new Date(row.last_fired_at).toISOString(),
+    revisions,
+  };
 }
 
 // ─── Integrations (platform-scope; in-memory keyset over all rows) ────────────────────────────────

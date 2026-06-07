@@ -22,6 +22,56 @@ export const OrgsListV1 = z
   .strict();
 export type OrgsListV1 = z.infer<typeof OrgsListV1>;
 
+// ─── Knowledge (learnings; tenant-scoped; in-memory keyset) ──────────────────────────────────────
+
+/** One learning in GET /api/admin/knowledge. accept_rate is app-computed (accepted/feedback). */
+export const LearningListItemV1 = z
+  .object({
+    learning_id: z.string().uuid(),
+    title: z.string(),
+    state: z.enum(["active", "deprecated"]),
+    repo: z.string().nullable().default(null),
+    version: z.number().int(),
+    fired_count: z.number().int(),
+    accept_rate: z.number(),
+    last_fired_at: z.string().datetime({ offset: true }).nullable().default(null),
+  })
+  .strict();
+export type LearningListItemV1 = z.infer<typeof LearningListItemV1>;
+
+export const LearningListPageV1 = z
+  .object({ rows: z.array(LearningListItemV1), next_cursor: z.string().nullable().default(null) })
+  .strict();
+export type LearningListPageV1 = z.infer<typeof LearningListPageV1>;
+
+export const LearningRevisionItemV1 = z
+  .object({
+    revision_id: z.string().uuid(),
+    body_markdown: z.string(),
+    version: z.number().int(),
+    edited_by_user_id: z.string().uuid(),
+    edited_at: z.string().datetime({ offset: true }),
+  })
+  .strict();
+export type LearningRevisionItemV1 = z.infer<typeof LearningRevisionItemV1>;
+
+/** GET /api/admin/knowledge/{learning_id} — the learning + its recent revisions. */
+export const LearningDetailV1 = z
+  .object({
+    learning_id: z.string().uuid(),
+    title: z.string(),
+    body_markdown: z.string(),
+    state: z.enum(["active", "deprecated"]),
+    repo: z.string().nullable().default(null),
+    version: z.number().int(),
+    fired_count: z.number().int(),
+    accept_rate: z.number(),
+    last_fired_at: z.string().datetime({ offset: true }).nullable().default(null),
+    revisions: z.array(LearningRevisionItemV1),
+  })
+  .strict();
+export type LearningDetailV1 = z.infer<typeof LearningDetailV1>;
+
 // ─── Integrations (platform-scope; in-memory keyset pagination) ──────────────────────────────────
 
 /** One integration in GET /api/admin/integrations (config_json kept as an opaque raw JSON string). */

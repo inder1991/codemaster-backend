@@ -19,6 +19,8 @@ import {
   FindingListResponseV1,
   FlagListV1,
   IntegrationListPageV1,
+  LearningDetailV1,
+  LearningListPageV1,
   LlmModelListV1,
   LlmProviderConfigV1,
   LlmPurposeModelListV1,
@@ -32,11 +34,13 @@ import {
 
 import { CursorInvalidError } from "#backend/api/admin/_keyset_cursor.js";
 import {
+  getLearningWithRevisions,
   getLlmProviderConfig,
   getNotificationRule,
   listFindings,
   listFlags,
   listIntegrationsPage,
+  listLearningsPage,
   listLlmModels,
   listLlmPurposeModels,
   listNotificationRules,
@@ -124,6 +128,49 @@ export async function registerAdminRoutes(
       async (request, reply) => {
         const orgs = await listOrgs(opts.db, request.authPrincipal!.installationId);
         return reply.code(200).send(OrgsListV1.parse({ orgs }));
+      },
+    );
+
+    scope.get(
+      "/api/admin/knowledge",
+      { preHandler: requireRole([...READER_ROLES]) },
+      async (request, reply) => {
+        const q = request.query as AdminQuery;
+        const size = clampLimit(q.size, 50, 200);
+        try {
+          const { rows, nextCursor } = await listLearningsPage(
+            opts.db,
+            request.authPrincipal!.installationId,
+            optStr(q.cursor),
+            size,
+          );
+          return reply.code(200).send(LearningListPageV1.parse({ rows, next_cursor: nextCursor }));
+        } catch (e) {
+          if (e instanceof CursorInvalidError) {
+            return reply.code(400).send({ detail: "invalid cursor" });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.get(
+      "/api/admin/knowledge/:learning_id",
+      { preHandler: requireRole([...READER_ROLES]) },
+      async (request, reply) => {
+        const learningId = (request.params as { learning_id: string }).learning_id;
+        if (!UUID_RE.test(learningId)) {
+          return reply.code(422).send({ detail: "learning_id must be a UUID" });
+        }
+        const detail = await getLearningWithRevisions(
+          opts.db,
+          learningId,
+          request.authPrincipal!.installationId,
+        );
+        if (detail === null) {
+          return reply.code(404).send({ detail: "learning not found" });
+        }
+        return reply.code(200).send(LearningDetailV1.parse(detail));
       },
     );
 
