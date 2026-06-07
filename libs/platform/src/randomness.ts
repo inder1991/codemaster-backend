@@ -182,3 +182,37 @@ export function uuid7({ clock }: { clock?: Clock } = {}): string {
   // Format as canonical 8-4-4-4-12 (hyphenated, already lowercase).
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
+
+/**
+ * Return a UUIDv4 (RFC-4122) as a canonical lowercase hyphenated string. The 122 random bits come from the
+ * injected {@link Random} seam (default {@link SystemRandom}) so callers stay off raw `node:crypto` /
+ * `Math.random` per the clock/random gate. This is the canonical home for v4 minting (the inlined copies in
+ * outbox_repo.ts / _workflow_events_repository.ts predate it; consolidate opportunistically).
+ */
+export function uuid4(rng: Pick<Random, "tokenBytes"> = new SystemRandom()): string {
+  const b = Buffer.from(rng.tokenBytes(16));
+  b[6] = (b[6]! & 0x0f) | 0x40; // version 4
+  b[8] = (b[8]! & 0x3f) | 0x80; // RFC-4122 variant (10xx)
+  const h = b.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * Return a UUIDv5 (RFC-4122 — SHA-1 of namespace-bytes ++ name-bytes) as a canonical lowercase hyphenated
+ * string. DETERMINISTIC (no randomness — `node:crypto` hashing only), so the same `(namespace, name)`
+ * always maps to the same UUID across replays and across the TS/Python impls (byte-for-byte parity). 1:1
+ * with Python's `uuid.uuid5`.
+ */
+export function uuid5(namespaceHex: string, name: string): string {
+  const nsBytes = Buffer.from(namespaceHex.replace(/-/g, ""), "hex"); // 16 namespace bytes
+  const digest = crypto
+    .createHash("sha1")
+    .update(nsBytes)
+    .update(Buffer.from(name, "utf-8"))
+    .digest();
+  const b = Buffer.from(digest.subarray(0, 16));
+  b.writeUInt8((b.readUInt8(6) & 0x0f) | 0x50, 6); // version 5
+  b.writeUInt8((b.readUInt8(8) & 0x3f) | 0x80, 8); // RFC-4122 variant (10xx)
+  const h = b.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}

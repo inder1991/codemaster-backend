@@ -33,10 +33,22 @@
  * if none handles the value — exactly the `PayloadConverter` contract. We construct it with the single
  * `JsonPayloadConverter` so the ONLY encoding the skeleton emits/accepts is `json/plain`.
  *
- * We deliberately do NOT re-export `defaultPayloadConverter`: that composite also handles `undefined` /
- * `Uint8Array`, and the skeleton's wire shapes are always non-undefined JSON objects. Pinning the
- * explicit single-encoding composite documents the intent and keeps the round-trip assertion in the unit
- * test exact (`json/plain` only).
+ * ## Stage 1 — `undefined` MUST marshal (void activity results)
+ *
+ * The Phase-2.0 skeleton's single activity returned `Array<string>`, so the composite wrapped ONLY the
+ * `JsonPayloadConverter` (`json/plain`). The Stage-1 review SPINE adds activities that return `void` —
+ * `persistReviewWalkthrough` and `releaseWorkspace` (`Promise<void>`), whose result is `undefined`. A
+ * `json/plain`-only converter CANNOT marshal `undefined` (its `toPayload` returns `undefined` for an
+ * `undefined` value), so the composite throws `ValueError` when an activity completes with no value — which
+ * Temporal surfaces as an activity-result-encoding failure and RETRIES the activity (the composition proof
+ * surfaced exactly this: `persistReviewWalkthrough` + `cleanup` ran 3× / 2× under their retry budgets
+ * before failing). The fix is to prepend the SDK's stock {@link UndefinedPayloadConverter} (encoding
+ * `binary/null`) to the composite — the SAME ordering the SDK's own {@link DefaultPayloadConverter} uses —
+ * so a void result marshals as `binary/null` and round-trips losslessly back to `undefined`. JSON object
+ * shapes still take the `json/plain` branch (the JSON converter is tried second). This is the minimal
+ * correct extension; we still do NOT re-export `defaultPayloadConverter` (it additionally handles
+ * `Uint8Array` / protobufs the spine never emits) — pinning the explicit two-encoding composite documents
+ * the spine's wire surface precisely (`binary/null` for void; `json/plain` for every contract object).
  *
  * ## 2.5 deferral (OUT OF SCOPE for the skeleton)
  *
@@ -53,15 +65,19 @@ import {
   CompositePayloadConverter,
   JsonPayloadConverter,
   type PayloadConverter,
+  UndefinedPayloadConverter,
 } from "@temporalio/common";
 
 /**
- * The named export Temporal requires (`payloadConverter`). A {@link CompositePayloadConverter} wrapping
- * the single stock {@link JsonPayloadConverter} (`json/plain`) — sufficient because every skeleton wire
- * shape is plain-JSON (wire-clean Zod contracts; see module header). The composite satisfies the
- * {@link PayloadConverter} interface (non-optional `toPayload`, throws if it cannot convert); a future
- * swap to a bespoke per-encoding converter is a drop-in change at this one symbol.
+ * The named export Temporal requires (`payloadConverter`). A {@link CompositePayloadConverter} wrapping the
+ * stock {@link UndefinedPayloadConverter} (`binary/null`) THEN the {@link JsonPayloadConverter}
+ * (`json/plain`). Order matters: a void activity result (`undefined`) takes the `binary/null` branch; every
+ * contract OBJECT is wire-clean plain-JSON (wire-clean Zod contracts; see module header) and takes the
+ * `json/plain` branch. This is the SAME `undefined`-then-JSON ordering the SDK's {@link DefaultPayloadConverter}
+ * uses. The composite satisfies the {@link PayloadConverter} interface (non-optional `toPayload`, throws if
+ * it cannot convert); a future swap to a bespoke per-encoding converter is a drop-in change at this symbol.
  */
 export const payloadConverter: PayloadConverter = new CompositePayloadConverter(
+  new UndefinedPayloadConverter(),
   new JsonPayloadConverter(),
 );

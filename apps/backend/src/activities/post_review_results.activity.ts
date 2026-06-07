@@ -58,6 +58,8 @@
 
 import { sql, type Transaction } from "kysely";
 
+import { ApplicationFailure } from "@temporalio/common";
+
 import { tenantKysely } from "#platform/db/database.js";
 import { type Clock, WallClock } from "#platform/clock.js";
 import { getMeter, type Counter } from "#platform/observability/metrics.js";
@@ -77,6 +79,7 @@ import { GitHubAppTokenProvider } from "#backend/integrations/github/token_provi
 import { VaultHttpPort } from "#backend/adapters/vault_http.js";
 import { assertCurrentRun } from "#backend/domain/stale_write_guard.js";
 import { PendingEmits } from "#backend/infra/post_commit_emit.js";
+import { POST_REVIEW_FAILED_WITH_DROPPED_STATE } from "#backend/review/pipeline/posting.js";
 
 import { type CitationV1, type ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { type PrMetaV1 } from "#contracts/walkthrough.v1.js";
@@ -792,6 +795,32 @@ function emitDropMetrics(args: {
 
 // ─── doPost — the 2-phase atomic-claim state machine ─────────────────────────────────────────────
 
+/**
+ * The JSON-safe dropped-state details packed into the {@link ApplicationFailure}.details[0] the publication
+ * ladder raises when GitHub fails AFTER the classifier partitioned findings into kept/dropped (H-2). 1:1
+ * with the frozen Python `_build_dropped_state_details` return shape: `dropped_classifications` as a list of
+ * `{schema_version, index, eligibility_reason}` dicts, `kept_finding_indices` as int[], and
+ * `posted_review_pr_id` as a string. The workflow-body handler ({@link extractDroppedStateFromPostFailure}
+ * in posting.ts) reads exactly this shape to dispatch `record_delivery_skipped` for the dropped rows.
+ */
+function buildDroppedStateDetails(args: {
+  droppedClassifications: ReadonlyArray<DroppedClassificationV1>;
+  keptIndices: ReadonlyArray<number>;
+  postedReviewPrId: string;
+}): {
+  dropped_classifications: Array<DroppedClassificationV1>;
+  kept_finding_indices: Array<number>;
+  posted_review_pr_id: string;
+} {
+  return {
+    // The DroppedClassificationV1 entries are already JSON-safe Zod objects (= the Python model_dump shape);
+    // spread to a fresh array so the details payload is an own-property array Temporal's converter serializes.
+    dropped_classifications: [...args.droppedClassifications],
+    kept_finding_indices: [...args.keptIndices],
+    posted_review_pr_id: args.postedReviewPrId,
+  };
+}
+
 /** Dependencies injected into {@link doPost} (the production wrapper resolves these; the test stubs them). */
 export type DoPostDeps = {
   /** The GitHub Reviews-API client (production: {@link GitHubApiReviewClient}; test: a scripted stub). */
@@ -948,22 +977,46 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
 
   if (wonClaim) {
     // ── WON the claim: run the publication ladder (HTTP, no DB tx held). ──
-    // H-2: a non-422 failure from the ladder propagates here. The Python wraps it in a typed
-    // ApplicationError carrying classifier state for the workflow body's skip-dispatch. The TS workflow
-    // body is not yet ported, so we re-throw the underlying error unchanged (preserving its type for the
-    // outer Temporal RetryPolicy) — the classifier-state-preservation ApplicationError envelope is a
-    // workflow-body concern to be wired when that body lands. Faithful to the OBSERVABLE contract: the
-    // ladder's failure surfaces as a raise; only the DEGRADED double-422 returns without raising.
-    const attempt = await attemptCreateWithBodyOnlyFallback({
-      ghClient,
-      owner,
-      repoName,
-      prNumber,
-      body,
-      headSha,
-      inlinePayload,
-      prMeta,
-    });
+    // H-2 (1:1 with the Python `_do_post` won-claim try/except): wrap ONLY the publication ladder so a
+    // non-422 failure (5xx after retries, network error, auth error, etc.) converts into a typed
+    // ApplicationFailure carrying the classifier output. The workflow body's `postReviewResults` closure
+    // reads `appErr.details[0]` (via extractDroppedStateFromPostFailure) to dispatch
+    // record_delivery_skipped for the dropped findings — without this payload-preservation the
+    // classifier-dropped findings stay stuck at PERSISTED with delivery_outcome IS NULL forever.
+    // The narrow win is the STRUCTURAL guarantee that any ladder failure carries classifier state — NOT
+    // an exception-type whitelist. `droppedClassifications`, `keptIndices`, and `prMeta.pr_id` were all
+    // computed BEFORE the atomic claim INSERT above, so they're in scope on every code path here.
+    // Boundary: the double-422 DEGRADED case is a RETURN value (`attempt.created === null`), NOT a throw,
+    // so it falls OUTSIDE this try — only a thrown non-422 ladder error is wrapped (matching Python).
+    let attempt: PublicationAttempt;
+    try {
+      attempt = await attemptCreateWithBodyOnlyFallback({
+        ghClient,
+        owner,
+        repoName,
+        prNumber,
+        body,
+        headSha,
+        inlinePayload,
+        prMeta,
+      });
+    } catch (e) {
+      throw ApplicationFailure.create({
+        message: "post-review failed; classifier state preserved for skip-dispatch",
+        type: POST_REVIEW_FAILED_WITH_DROPPED_STATE,
+        // nonRetryable LEFT DEFAULT (false): the contract we OWN is the payload-preservation, NOT the
+        // retry semantics; the workflow's retry policy controls the retry decision (1:1 with Python).
+        nonRetryable: false,
+        details: [
+          buildDroppedStateDetails({
+            droppedClassifications,
+            keptIndices,
+            postedReviewPrId: prMeta.pr_id,
+          }),
+        ],
+        ...(e instanceof Error ? { cause: e } : {}),
+      });
+    }
 
     if (attempt.created === null) {
       // Double 422 — return DEGRADED_UNPOSTED WITHOUT raising. The row keeps github_review_id NULL (the
@@ -1113,17 +1166,36 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
     });
   }
 
-  // A prior winner published. Dispatch the idempotent body-refresh update. H-2: a GitHub-side failure
-  // here would, in the Python, be wrapped in the classifier-state ApplicationError; as above, the TS
-  // workflow body is not yet ported, so we re-throw the underlying error unchanged (faithful OBSERVABLE
-  // contract — the update failure surfaces as a raise).
-  await ghClient.updateReview({
-    owner,
-    repo: repoName,
-    prNumber,
-    reviewId: githubReviewId,
-    body,
-  });
+  // A prior winner published. Dispatch the idempotent body-refresh update. H-2 (1:1 with the Python
+  // lost-claim try/except): wrap ONLY the update_review call so a GitHub-side failure on the update path
+  // ALSO preserves classifier state via ApplicationFailure.details — same shape + same payload as the
+  // won-claim wrap above. The classifier output is IDENTICAL here: this branch uses the SAME
+  // `keptIndices` + `droppedClassifications` computed at the top of doPost (BEFORE the atomic claim), so
+  // the state survives both publication paths. The message carries the "(update path)" variant per Python.
+  try {
+    await ghClient.updateReview({
+      owner,
+      repo: repoName,
+      prNumber,
+      reviewId: githubReviewId,
+      body,
+    });
+  } catch (e) {
+    throw ApplicationFailure.create({
+      message: "post-review failed (update path); classifier state preserved for skip-dispatch",
+      type: POST_REVIEW_FAILED_WITH_DROPPED_STATE,
+      // nonRetryable LEFT DEFAULT (false) — same rationale as the won-claim wrap (1:1 with Python).
+      nonRetryable: false,
+      details: [
+        buildDroppedStateDetails({
+          droppedClassifications,
+          keptIndices,
+          postedReviewPrId: prMeta.pr_id,
+        }),
+      ],
+      ...(e instanceof Error ? { cause: e } : {}),
+    });
+  }
 
   // v7-rem R-10: emit the INHERITED outcome the prior workflow persisted on the row (NOT a hardcoded
   // INLINE_POSTED — a body-only fallback that succeeded earlier persists 'body_only_posted'). Defensive

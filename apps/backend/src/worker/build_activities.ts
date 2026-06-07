@@ -68,12 +68,88 @@ import {
   type CloneRepoIntoWorkspaceDeps,
 } from "#backend/activities/clone_repo_into_workspace.activity.js";
 import { computePolicyRules } from "#backend/activities/compute_policy_rules.activity.js";
+import { DedupFindingsActivity } from "#backend/activities/dedup_findings.activity.js";
 import { EmbedQueryActivity } from "#backend/activities/embed_query.activity.js";
 import { loadRepoConfigActivity } from "#backend/activities/load_repo_config.activity.js";
 import { persistReviewFindings } from "#backend/activities/persist_review_findings.activity.js";
+import { persistReviewWalkthrough } from "#backend/activities/persist_review_walkthrough.activity.js";
 import { postCheckRun } from "#backend/activities/post_check_run.activity.js";
 import { postReviewResults } from "#backend/activities/post_review_results.activity.js";
 import { releaseWorkspace } from "#backend/activities/release_workspace.activity.js";
+import { selectCarryForward } from "#backend/activities/select_carry_forward.activity.js";
+import { buildStaticAnalysisActivity } from "#backend/activities/static_analysis.activity.js";
+import { RuffInWorkerRunner } from "#backend/analysis/ruff_runner.js";
+import { EslintInWorkerRunner } from "#backend/analysis/eslint_runner.js";
+import { GitleaksInWorkerRunner } from "#backend/analysis/gitleaks_runner.js";
+
+// ── Stage-2 lifecycle activities (mutex GATE + lease renew/release + placeholder post/delete) ──
+// The workflow body (review_pull_request.workflow.ts) dispatches these directly by their registered names
+// (NOT through the orchestrator's activity_proxy bridge). Each is a self-defaulting 1-arg activity (the
+// mutex/renew/release take an optional 2nd `deps` arg → fn.length === 1, registered bare; the gate +
+// placeholder take exactly one positional input).
+import { startReviewForWebhook } from "#backend/activities/start_review_for_webhook.activity.js";
+import { renewPrReviewMutexLeaseActivity } from "#backend/activities/renew_pr_review_mutex_lease.activity.js";
+import { releasePrReviewMutexActivity } from "#backend/activities/release_pr_review_mutex.activity.js";
+import { postReviewPlaceholder } from "#backend/activities/post_review_placeholder.activity.js";
+import { deleteReviewPlaceholder } from "#backend/activities/delete_review_placeholder.activity.js";
+
+// ── Stage-3 run-lifecycle + finding-delivery + citation + audit activities ──
+// The workflow body (ANALYSIS_STARTED / ANALYZED / finalize / run-failed / run-cancelled + the three
+// delivery setters) and the orchestrator (citation_validate Step 7.5 + the output-safety audit emit)
+// dispatch these by their registered names. The four run-lifecycle + three delivery activities are 1-arg
+// (their `deps` 2nd arg defaults → fn.length === 1); citationValidate / emitOutputSafetyAuditEvent are
+// strictly 1-arg.
+import {
+  recordReviewLifecycleEvent,
+  finalizeReviewRun,
+  recordRunFailed,
+  recordRunCancelled,
+} from "#backend/activities/record_review_lifecycle.activity.js";
+import {
+  recordDeliveryFinalized,
+  recordDeliverySkipped,
+  recordDeliveryDegraded,
+} from "#backend/activities/record_delivery_lifecycle.activity.js";
+import { citationValidate } from "#backend/activities/citation_validate.activity.js";
+import { emitOutputSafetyAuditEvent } from "#backend/activities/emit_output_safety_audit.activity.js";
+
+// ── Stage-4 enrichment activities (changed-files enrich + linked-issues + suggested-reviewers + PR-desc +
+// evidence manifest) ──
+// The workflow body dispatches enrichPrFilesV2 / fetchLinkedIssues / fetchSuggestedReviewers by their
+// registered names; the orchestrator (via the activity_proxy bridge) dispatches buildRetrievedEvidence
+// (per chunk) + updatePrDescriptionSummary (posting). The two self-wiring activities (enrichPrFilesV2,
+// updatePrDescriptionSummary) read env inside the activity body (the deferred-Vault pattern) → registered
+// bare. buildRetrievedEvidence is stateless → registered bare. The two bound-method holders
+// (FetchLinkedIssuesActivity, FetchSuggestedReviewersActivity) are constructed here with their real repos.
+import { enrichPrFilesV2 } from "#backend/activities/enrich_pr_files.activity.js";
+import { FetchLinkedIssuesActivity } from "#backend/activities/fetch_linked_issues.activity.js";
+import { FetchSuggestedReviewersActivity } from "#backend/activities/fetch_suggested_reviewers.activity.js";
+import { updatePrDescriptionSummary } from "#backend/activities/update_pr_description_summary.activity.js";
+import { buildRetrievedEvidence } from "#backend/activities/build_retrieved_evidence.activity.js";
+
+// ── Stage-5 activities (arbitration apply + tool-run record + fix-prompt) ──
+// applyArbitrationActivity / recordToolRuns self-wire their repos from CODEMASTER_PG_CORE_DSN inside the
+// activity body (1-arg → registered bare). The FixPromptActivities bound-method holder is constructed here
+// with the shared ledger-wired LlmClientCache + the ported FixPromptRepo + a lazy issue-comment client
+// (deferred-Vault) + the shared clock.
+import { applyArbitrationActivity } from "#backend/activities/apply_arbitration.activity.js";
+import { recordToolRuns } from "#backend/activities/record_tool_runs.activity.js";
+import { FixPromptActivities } from "#backend/activities/generate_fix_prompt.activity.js";
+import { FixPromptRepo } from "#backend/domain/repos/fix_prompt_repo.js";
+import { GitHubApiClient } from "#backend/integrations/github/api_client.js";
+import {
+  FetchManifestSnapshotsActivity,
+  type GithubContentsPort,
+} from "#backend/activities/fetch_manifest_snapshots.activity.js";
+import { ParseManifestDependenciesActivity } from "#backend/activities/parse_manifest_dependencies.activity.js";
+import { loadParentReviewFindingsActivity } from "#backend/activities/load_parent_review_findings.activity.js";
+import { GitHubApiReviewClient } from "#backend/integrations/github/review_client.js";
+
+import { GitHubIssueClient } from "#backend/integrations/github/issue_client.js";
+import { PostgresLinkedIssuesRepo } from "#backend/domain/repos/pr_issue_links_repo.js";
+import { PostgresGithubIssuesCacheRepo } from "#backend/domain/repos/github_issues_cache_repo.js";
+import { PostgresPrFilesRepo } from "#backend/domain/repos/pr_files_repo.js";
+import { PostgresCodeOwnersRepo } from "#backend/domain/repos/code_owners_repo.js";
 
 import { resolveEmbeddingsConsumer } from "#backend/adapters/resolve_embeddings.js";
 import { VaultHttpPort } from "#backend/adapters/vault_http.js";
@@ -97,11 +173,22 @@ import {
   bedrockReviewChunk,
 } from "#backend/review/review_activity.js";
 
+import { WalkthroughActivities } from "#backend/review/walkthrough_activity.js";
+
 import { buildRetrieveKnowledgeActivity } from "#backend/wiring/retrievers.js";
 
 import { WallClock } from "#platform/clock.js";
 
 // ─── env reads (the same fail-loud reads the individual activities use) ──────────────────────────
+
+/**
+ * The Tier-1 static-analysis soft-barrier deadline (seconds). 1:1 with the frozen Python default
+ * `review_budgets.yaml::tier1_static_analysis_seconds: 60` — the StaticAnalysisOrchestrator owns this
+ * authoritative deadline (per-tool runner timeouts are only safety guards). The DB/yaml-backed budgets
+ * config loader (`review_budgets.py::load_budgets`) is NOT ported to TS yet; this constant is the
+ * unconfigured default until it lands. FOLLOW-UP-review-budgets-loader.
+ */
+const TIER1_STATIC_ANALYSIS_SECONDS = 60;
 
 /**
  * Read the canonical core-store DSN, fail-loud when unset. Mirrors the private `requireCoreDsn()` in
@@ -188,6 +275,106 @@ function makeClonerDepsResolver(
   };
 }
 
+// ─── lazy GitHubIssueClient (the fetch_linked_issues github seam — deferred-Vault) ────────────────
+
+/** The `getIssue` slice the FetchLinkedIssuesActivity consumes (1:1 with its `GithubIssuePort`). */
+type GithubIssuePortShape = {
+  getIssue(args: {
+    installationId: number;
+    owner: string;
+    repo: string;
+    issueNumber: number;
+    ifNoneMatch?: string | null;
+  }): Promise<readonly [Record<string, unknown> | null, string | null, number]>;
+};
+
+/**
+ * Build the REAL {@link GitHubIssueClient} for `fetchLinkedIssues`'s `github` seam. Reuses the exact
+ * token-provider construction the cloner + the sibling GitHub activities use (one shared GitHub HTTP
+ * transport, a Vault adapter from env, a {@link GitHubAppTokenProvider} bound to `getToken`). Deferred to
+ * the first `getIssue` call (async `fromEnv`-build) so the worker boot stays off `VAULT_ADDR` / GitHub
+ * round-trips — mirroring the deferred-Vault pattern the cloner + post_* activities use.
+ */
+async function buildIssueClient(): Promise<GitHubIssueClient> {
+  const clock = new WallClock();
+  const githubHttp = new FetchGitHubHttpClient({});
+  const vault = VaultHttpPort.fromEnv();
+  const tokenProvider = await GitHubAppTokenProvider.fromEnv({ vault, http: githubHttp, clock });
+  return new GitHubIssueClient({
+    tokenProvider: tokenProvider.getToken.bind(tokenProvider),
+    http: githubHttp,
+  });
+}
+
+/**
+ * A {@link GithubIssuePortShape} that builds the real {@link GitHubIssueClient} on first `getIssue` (the
+ * deferred-Vault pattern) and memoizes it. `fetchLinkedIssues` only ever calls `getIssue`, so this thin
+ * lazy adapter is a faithful, fully-real client seam — construction is deferred to the moment a linked-issue
+ * lookup actually fires (so `buildActivities()` stays cheap + off `VAULT_ADDR`).
+ */
+function makeLazyIssueClient(): GithubIssuePortShape {
+  let memo: Promise<GitHubIssueClient> | undefined;
+  return {
+    getIssue: async (args) => {
+      if (memo === undefined) {
+        memo = buildIssueClient();
+      }
+      const client = await memo;
+      return client.getIssue(args);
+    },
+  };
+}
+
+// ─── lazy GitHubApiReviewClient (the fix-prompt advisory-comment seam — deferred-Vault) ───────────
+
+/** The `createIssueComment` slice the FixPromptActivities consumes (1:1 with its FixPromptIssueCommentClient). */
+type FixPromptIssueCommentClientShape = {
+  createIssueComment(args: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    body: string;
+  }): Promise<number>;
+};
+
+/**
+ * Build the REAL {@link GitHubApiReviewClient} for `generateFixPrompt`'s advisory PR-comment seam — the SAME
+ * wiring `post_review_placeholder` / `post_review_results` use (Vault token provider → GitHubApiClient →
+ * wrapped client). The fix-prompt activity only ever calls `createIssueComment`, so the wrapped client
+ * satisfies its loose {@link FixPromptIssueCommentClientShape}. Deferred to the first comment post (async
+ * `fromEnv`-build) so worker boot stays off `VAULT_ADDR` / GitHub round-trips.
+ */
+async function buildFixPromptReviewClient(githubInstallationId: number): Promise<GitHubApiReviewClient> {
+  const clock = new WallClock();
+  const githubHttp = new FetchGitHubHttpClient({});
+  const vault = VaultHttpPort.fromEnv();
+  const tokenProvider = await GitHubAppTokenProvider.fromEnv({ vault, http: githubHttp, clock });
+  const api = new GitHubApiClient({
+    tokenProvider: tokenProvider.getToken.bind(tokenProvider),
+    http: githubHttp,
+    clock,
+  });
+  return new GitHubApiReviewClient({ api, installationId: githubInstallationId });
+}
+
+/**
+ * A {@link FixPromptIssueCommentClientShape} that builds the real {@link GitHubApiReviewClient} on first
+ * `createIssueComment` (the deferred-Vault pattern) and memoizes it. A faithful, fully-real client seam —
+ * construction is deferred to the moment a fix-prompt advisory comment actually posts.
+ */
+function makeLazyFixPromptIssueClient(githubInstallationId: number): FixPromptIssueCommentClientShape {
+  let memo: Promise<GitHubApiReviewClient> | undefined;
+  return {
+    createIssueComment: async (args) => {
+      if (memo === undefined) {
+        memo = buildFixPromptReviewClient(githubInstallationId);
+      }
+      const client = await memo;
+      return client.createIssueComment(args);
+    },
+  };
+}
+
 // ─── real LlmClientCache (ledger-wired client factory — ADR-0068) ────────────────────────────────
 
 /**
@@ -264,6 +451,39 @@ function makeLazyLlmClientCache(dsn: string): LlmClientCacheLike {
  * collaborators, and the bound-method activities (`aggregateFindings`, `embedQuery`, `retrieveKnowledge`)
  * are registered as arrow-property methods that stay bound when destructured into the map.
  */
+/**
+ * Build a bare {@link GitHubApiClient} (which structurally satisfies {@link GithubContentsPort} via its
+ * getContents/getRecursiveTree methods) through the SAME deferred-Vault wiring the issue/fix-prompt clients
+ * use: Vault token provider → GitHubApiClient. Deferred to the first manifest fetch so worker boot stays off
+ * VAULT_ADDR / GitHub round-trips.
+ */
+async function buildManifestContentsClient(): Promise<GitHubApiClient> {
+  const clock = new WallClock();
+  const githubHttp = new FetchGitHubHttpClient({});
+  const vault = VaultHttpPort.fromEnv();
+  const tokenProvider = await GitHubAppTokenProvider.fromEnv({ vault, http: githubHttp, clock });
+  return new GitHubApiClient({
+    tokenProvider: tokenProvider.getToken.bind(tokenProvider),
+    http: githubHttp,
+    clock,
+  });
+}
+
+/** A {@link GithubContentsPort} that lazily builds + memoizes the real client on first call (deferred-Vault). */
+function makeLazyManifestContentsClient(): GithubContentsPort {
+  let memo: Promise<GitHubApiClient> | undefined;
+  const lazy = (): Promise<GitHubApiClient> => {
+    if (memo === undefined) {
+      memo = buildManifestContentsClient();
+    }
+    return memo;
+  };
+  return {
+    getContents: async (args) => (await lazy()).getContents(args),
+    getRecursiveTree: async (args) => (await lazy()).getRecursiveTree(args),
+  };
+}
+
 export function buildActivities(): Record<string, (input: never) => Promise<unknown>> {
   const dsn = requireCoreDsn();
   const githubInstallationId = readGithubInstallationId();
@@ -277,15 +497,99 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
   // are arrow properties, so they stay bound when destructured into the map (Temporal registers the value).
   const aggregateActivity = new AggregateFindingsActivity({ embedder });
   const embedQueryActivity = new EmbedQueryActivity({ embeddings: embedder, modelName: "qwen3-embed-0.6b" });
-  const retrieveKnowledgeActivity = buildRetrieveKnowledgeActivity({ embedder });
-
-  // The lazy real cloner-deps + LLM cache (deferred-Vault pattern; constructed on first dispatch).
-  const resolveClonerDeps = makeClonerDepsResolver(githubInstallationId);
+  // The lazy real LLM cache (deferred-Vault pattern; built on first forRole). Shared by bedrockReviewChunk,
+  // walkthrough, fix-prompt, AND (E) the retrieve_knowledge per-invocation LLM reranker (default-off behind
+  // CODEMASTER_LLM_RERANK_ENABLED — wired here so an operator can enable it without a code change).
   const llmCache = makeLazyLlmClientCache(dsn);
+  const retrieveKnowledgeActivity = buildRetrieveKnowledgeActivity({ embedder, rerankCache: llmCache });
+  // dedup_findings — the Temporal-activity port of the frozen Python `dedup_linter_with_llm` (the
+  // semantic dedup stage embeds over the network, so it CANNOT run in the workflow sandbox; ADR-0065/0066).
+  // Shares the same real embedder as the aggregate stage. FOLLOW-UP-dedup-findings-orchestrator-wiring:
+  // the Workflow phase dispatches this between fan-out (Step 5) and aggregate (Step 7), replacing the
+  // Python's inline `dedup_linter_with_llm` call. Registered here so the surface is dispatch-ready.
+  const dedupFindingsActivity = new DedupFindingsActivity({ embedder });
+
+  // The lazy real cloner-deps (deferred-Vault pattern; constructed on first dispatch). The shared LLM cache
+  // (llmCache) is built earlier (above the retrieve-knowledge activity, which now also consumes it for E).
+  const resolveClonerDeps = makeClonerDepsResolver(githubInstallationId);
+
+  // generate_walkthrough bound-method holder — 1:1 with the frozen Python `WalkthroughActivities(cache=…)`.
+  // It SHARES the same lazy ledger-wired LlmClientCache the review-chunk activity uses (the cache is
+  // role-keyed; the walkthrough resolves `forRole("primary")` then selects `modelForPurpose("walkthrough")`
+  // — claude-opus, distinct from the review role's sonnet — inside the activity body, exactly like
+  // bedrockReviewChunk). `.generateWalkthrough` is an arrow property so it stays bound when destructured.
+  const walkthroughActivities = new WalkthroughActivities({ cache: llmCache });
+
+  // ── Stage-4 bound-method holders (fetch_linked_issues + fetch_suggested_reviewers) ──
+  // Both read tenancy-scoped tables off the core DSN (lazy pool — no connection at construction). The
+  // linked-issues holder additionally takes the lazy GitHubIssueClient (deferred-Vault). The
+  // suggested-reviewers holder is flag-gated on `code_owners_v1` via `isEnabled`; the `core.flags` reader
+  // is NOT ported to TS yet (it is an ingest-side helper out of this stage's scope), so `isEnabled` is
+  // wired DEFAULT-OFF — 1:1 with the Python `read_code_owners_v1_enabled` production default (off until an
+  // operator flips the rollout; the activity short-circuits to [] and the renderer drops the section).
+  // FOLLOW-UP-code-owners-v1-flag-reader: port the `core.flags` reader so the operator can flip the rollout.
+  const clock = new WallClock();
+  const fetchLinkedIssuesActivity = new FetchLinkedIssuesActivity({
+    linksRepo: PostgresLinkedIssuesRepo.fromDsn(dsn),
+    cacheRepo: PostgresGithubIssuesCacheRepo.fromDsn({ dsn, clock }),
+    github: makeLazyIssueClient(),
+    clock,
+  });
+  const fetchSuggestedReviewersActivity = new FetchSuggestedReviewersActivity({
+    prFilesRepo: PostgresPrFilesRepo.fromDsn({ dsn, clock }),
+    codeOwnersRepo: PostgresCodeOwnersRepo.fromDsn(dsn),
+    isEnabled: async (): Promise<boolean> => false,
+    clock,
+  });
+
+  // ── Stage-5 fix-prompt bound-method holder (generate_fix_prompt) ──
+  // Shares the SAME lazy ledger-wired LlmClientCache the review-chunk + walkthrough activities use (the
+  // fix_prompt purpose resolves to sonnet via the central seed, inside the activity body). The repo is the
+  // ported FixPromptRepo over the shared ADR-0062 pool; the GitHub seam is the lazy deferred-Vault
+  // issue-comment client; the clock is the shared WallClock. `.generateFixPrompt` is an arrow property so it
+  // stays bound when destructured into the map.
+  const fixPromptActivities = new FixPromptActivities({
+    cache: llmCache,
+    repo: FixPromptRepo.fromDsn(dsn),
+    gh: makeLazyFixPromptIssueClient(githubInstallationId),
+    clock,
+  });
+
+  // ── static_analysis bound-method holder (REAL runner orchestration) ──
+  // 1:1 with the frozen Python `_wire_static_analysis_activity`: the three in-worker runners
+  // (Ruff/ESLint/Gitleaks — default binary names on $PATH; the worker-image provides the binaries) +
+  // the soft-barrier StaticAnalysisOrchestrator (Tier-1 deadline + the shared WallClock) + the Haiku
+  // AnalysisCurator (which resolves `forRole("secondary")` off the SAME lazy ledger-wired LlmClientCache
+  // the review-chunk/walkthrough/fix-prompt activities use). The K8s-Job runners (Semgrep/Trivy/Checkov/
+  // Kube-linter) are DEFERRED owner-provided infra — only the in-worker runners are registered today
+  // (FOLLOW-UP-static-analysis-k8s-job-runners). The Tier-1 deadline is the frozen Python default
+  // (review_budgets.yaml `tier1_static_analysis_seconds: 60`); the config-loader port is a separate
+  // follow-up (FOLLOW-UP-review-budgets-loader). `.staticAnalysis` is an arrow property so it stays
+  // bound when destructured into the map.
+  const staticAnalysisActivity = buildStaticAnalysisActivity({
+    runners: {
+      ruff: new RuffInWorkerRunner(),
+      eslint: new EslintInWorkerRunner(),
+      gitleaks: new GitleaksInWorkerRunner(),
+    },
+    curatorCache: llmCache,
+    deadlineSeconds: TIER1_STATIC_ANALYSIS_SECONDS,
+    clock,
+  });
+
+  // ── #4 manifest fetch + parse bound-method holders ──
+  // fetch_manifest_snapshots: the lazy deferred-Vault GitHubApiClient satisfies GithubContentsPort; the
+  // holder defaults a fresh per-pod LRU cache. parse_manifest_dependencies: the shared WallClock drives the
+  // per-manifest time-budget. (#6 load_parent_review_findings is a bare 1-arg function — registered below.)
+  const fetchManifestSnapshotsHolder = new FetchManifestSnapshotsActivity({
+    githubClient: makeLazyManifestContentsClient(),
+  });
+  const parseManifestDependenciesHolder = new ParseManifestDependenciesActivity({ clock });
 
   return {
     // ── 1-arg activities, ready as-is ──
     persistReviewFindings,
+    persistReviewWalkthrough,
     classifyFiles,
     loadRepoConfigActivity,
     computePolicyRules,
@@ -293,13 +597,64 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
     postReviewResults,
     chunkAndRedact,
     redactChunks,
+    // selectCarryForward(input) — pure deterministic 1-arg activity (no collaborators); registered bare.
+    selectCarryForward,
+    // staticAnalysis(input) — REAL runner orchestration. Bound arrow property holding the in-worker
+    // runners + soft-barrier orchestrator + Haiku curator (shared ledger-wired LlmClientCache).
+    staticAnalysis: staticAnalysisActivity.staticAnalysis,
     // ── self-defaulting (optional 2nd `deps` arg → fn.length === 1) — registered bare ──
     allocateWorkspace,
     releaseWorkspace,
+    // ── Stage-2 lifecycle (gate + mutex lease renew/release + placeholder post/delete) ──
+    // The gate (1-arg, raw payload), the renew/release mutex (mutex_id string + optional deps → fn.length
+    // === 1), and the placeholder post/delete (1 typed input each). All registered bare. The workflow body
+    // dispatches them directly by these registered names.
+    startReviewForWebhook,
+    renewPrReviewMutexLeaseActivity,
+    releasePrReviewMutexActivity,
+    postReviewPlaceholder,
+    deleteReviewPlaceholder,
+    // ── Stage-3 run-lifecycle (RUNNING→COMPLETED/FAILED/CANCELLED + ANALYSIS_STARTED/ANALYZED milestones) ──
+    // Self-defaulting (optional 2nd `deps` arg → fn.length === 1); registered bare. Dispatched by the body.
+    recordReviewLifecycleEvent,
+    finalizeReviewRun,
+    recordRunFailed,
+    recordRunCancelled,
+    // ── Stage-3 finding-delivery setters (the body's lifecycle-bookkeeping block + the orchestrator's H-2
+    // inline skip). 1-arg typed inputs; registered bare. ──
+    recordDeliveryFinalized,
+    recordDeliverySkipped,
+    recordDeliveryDegraded,
+    // ── Stage-3 citation validation (orchestrator Step 7.5) + output-safety audit emit (chunk/walkthrough
+    // sanitization_event). 1-arg typed inputs; registered bare. ──
+    citationValidate,
+    emitOutputSafetyAuditEvent,
+    // ── Stage-4 enrichment (changed-files enrich + PR-desc summary + evidence manifest) ──
+    // enrichPrFilesV2 / updatePrDescriptionSummary self-wire env inside the activity body (deferred-Vault)
+    // → 1-arg → registered bare. buildRetrievedEvidence is stateless (pure modulo the node:crypto ev_id
+    // mint, which is fine here in the Node runtime) → 1-arg → registered bare.
+    enrichPrFilesV2,
+    updatePrDescriptionSummary,
+    buildRetrievedEvidence,
+    // ── Stage-4 bound-method activities (linked-issues + suggested-reviewers; bound so they stay wired when
+    // destructured into the map) ──
+    fetchLinkedIssues: fetchLinkedIssuesActivity.fetchLinkedIssues.bind(fetchLinkedIssuesActivity),
+    fetchSuggestedReviewers:
+      fetchSuggestedReviewersActivity.fetchSuggestedReviewers.bind(fetchSuggestedReviewersActivity),
     // ── bound-method activities (real embedder) ──
     aggregateFindings: aggregateActivity.aggregateFindings,
+    // dedup_findings — bound arrow property holding the shared real embedder (semantic dedup stage).
+    dedupFindings: dedupFindingsActivity.dedupFindings,
     embedQuery: embedQueryActivity.embedQuery.bind(embedQueryActivity),
     retrieveKnowledge: retrieveKnowledgeActivity.retrieveKnowledge.bind(retrieveKnowledgeActivity),
+    // generate_walkthrough — bound arrow property holding the shared ledger-wired LlmClientCache.
+    generateWalkthrough: walkthroughActivities.generateWalkthrough,
+    // ── #4 manifest fetch/parse + #6 carry-forward loader (camelCase keys = the workflow-body proxy names) ──
+    fetchManifestSnapshots:
+      fetchManifestSnapshotsHolder.fetchManifestSnapshots.bind(fetchManifestSnapshotsHolder),
+    parseManifestDependencies:
+      parseManifestDependenciesHolder.parseManifestDependencies.bind(parseManifestDependenciesHolder),
+    loadParentReviewFindings: loadParentReviewFindingsActivity,
     // ── curried 2-arg activities (real collaborators threaded as the 2nd arg) ──
     // cloneRepoIntoWorkspace(req, deps) — curry the real GitSubprocessCloner deps so the registered
     // activity is genuinely 1-arg (the latent 2-arg-crash fix). Deps resolve lazily on first dispatch.
@@ -308,5 +663,13 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
     // bedrockReviewChunk(context, { cache }) — curry the real ledger-wired LlmClientCache.
     bedrockReviewChunk: (context: Parameters<typeof bedrockReviewChunk>[0]) =>
       bedrockReviewChunk(context, { cache: llmCache }),
+    // ── Stage-5 (arbitration apply + tool-run record + fix-prompt) ──
+    // applyArbitrationActivity / recordToolRuns self-wire their repos from CODEMASTER_PG_CORE_DSN (1-arg →
+    // registered bare). generateFixPrompt is the FixPromptActivities bound arrow property (shared LLM cache +
+    // repo + lazy GitHub client). The orchestrator dispatches all three under these registered names (Step
+    // 7.7 arbitration + tool-runs; posting.ts fix-prompt).
+    applyArbitrationActivity,
+    recordToolRuns,
+    generateFixPrompt: fixPromptActivities.generateFixPrompt,
   } as Record<string, (input: never) => Promise<unknown>>;
 }

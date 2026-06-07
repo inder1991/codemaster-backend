@@ -64,7 +64,7 @@ const RAW_INPUT = {
   precomputed_metadata: PRECOMPUTED_METADATA,
 } as const;
 
-describe("payloadConverter (skeleton custom data converter)", () => {
+describe("payloadConverter (review-spine custom data converter)", () => {
   it("round-trips a PersistReviewFindingsInputV1 deep-equal (toPayload → fromPayload)", () => {
     const original = PersistReviewFindingsInputV1.parse(RAW_INPUT);
 
@@ -94,5 +94,20 @@ describe("payloadConverter (skeleton custom data converter)", () => {
     >;
     expect(decoded.pr_id).toBe(RAW_INPUT.pr_id);
     expect(decoded.review_id).toBe(RAW_INPUT.review_id);
+  });
+
+  // Stage 1 — void activity results (persistReviewWalkthrough / releaseWorkspace return `Promise<void>`)
+  // marshal as `undefined`. A `json/plain`-only converter cannot encode `undefined`, which caused the
+  // spine's void activities to spuriously RETRY (the composition proof surfaced this). The composite now
+  // prepends the UndefinedPayloadConverter (encoding `binary/null`) so `undefined` round-trips losslessly.
+  it("round-trips a void activity result (undefined) via the binary/null encoding", () => {
+    const payload = payloadConverter.toPayload(undefined);
+
+    // `undefined` is tagged with the SDK's `binary/null` encoding, NOT `json/plain`.
+    const encoding = new TextDecoder().decode(payload.metadata?.encoding ?? new Uint8Array());
+    expect(encoding).toBe("binary/null");
+
+    const restored = payloadConverter.fromPayload<undefined>(payload);
+    expect(restored).toBeUndefined();
   });
 });

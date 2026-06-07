@@ -1,0 +1,56 @@
+schema_version: 1
+service: github
+scenario: "update_pr_description_summary — GET current body then PATCH recomposed body"
+recorded_at: "2026-06-06T00:00:00Z"
+recorded_by: "review-orchestrator-port"
+interactions:
+  # 1) GET the PR — the activity reads the current developer description.
+  - request:
+      method: GET
+      uri: https://api.github.com/repos/acme/widget/pulls/123
+      headers:
+        Accept: application/vnd.github+json
+        Authorization: Bearer <ghs-redacted>
+        X-GitHub-Api-Version: "2022-11-28"
+    response:
+      status_code: 200
+      headers:
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4999"
+        X-RateLimit-Reset: "1799999999"
+        Content-Type: application/json
+      body: |-
+        {
+          "number": 123,
+          "state": "open",
+          "title": "Refactor the widgets",
+          "body": "Developer description.\n",
+          "head": {"sha": "abc123"},
+          "base": {"ref": "main"}
+        }
+  # 2) PATCH the PR body — the recomposed body (original + summary block) is asserted byte-for-byte via
+  #    body_json deep-equal. This is the load-bearing round-trip assertion: the cassette will MISMATCH if
+  #    the composed body drifts from the frozen-Python bytes by a single character.
+  - request:
+      method: PATCH
+      uri: https://api.github.com/repos/acme/widget/pulls/123
+      headers:
+        Accept: application/vnd.github+json
+        Authorization: Bearer <ghs-redacted>
+        X-GitHub-Api-Version: "2022-11-28"
+      body_json:
+        body: "Developer description.\n\n<!-- codemaster-summary-start -->\n\n## \U0001F916 Summary by codemaster\n\n**1 finding(s) detected.** Breakdown:\n\n- **Bug**: 1\n\n<!-- codemaster-summary-end -->\n"
+    response:
+      status_code: 200
+      headers:
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4998"
+        X-RateLimit-Reset: "1799999999"
+        Content-Type: application/json
+      body: |-
+        {
+          "number": 123,
+          "state": "open",
+          "title": "Refactor the widgets",
+          "body": "Developer description.\n\n<!-- codemaster-summary-start -->\n\n## 🤖 Summary by codemaster\n\n**1 finding(s) detected.** Breakdown:\n\n- **Bug**: 1\n\n<!-- codemaster-summary-end -->\n"
+        }

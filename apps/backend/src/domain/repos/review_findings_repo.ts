@@ -68,6 +68,7 @@ import { tenantKysely } from "#platform/db/database.js";
 import type { Clock } from "#platform/clock.js";
 
 import type { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
+import { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { DEGRADED_OUTCOMES } from "#contracts/finding_lifecycle_inputs.v1.js";
 
 import { assertCurrentRun, StaleWriteError } from "../stale_write_guard.js";
@@ -161,6 +162,14 @@ type ReviewFindingsTable = {
   severity: string;
   category: string;
   title: string;
+  // Carry-forward loader (#6) reads these to reconstruct full ReviewFindingV1 rows.
+  body: string;
+  suggestion: string | null;
+  confidence: string; // pg numeric(4,3) → node-pg returns a string (precision-preserving)
+  citations: unknown; // jsonb → parsed CitationV1[] by node-pg
+  scope: string;
+  evidence_refs: unknown; // jsonb → parsed string[] by node-pg
+  delivery_outcome: string | null;
   delivery_eligibility: string | null;
   suppression_state: string;
   eligibility_reason: string | null;
@@ -691,5 +700,62 @@ export class PostgresReviewFindingsRepo {
       // delivery_eligibility='skipped' implies eligibility_reason IS NOT NULL (ck_lifecycle_skipped_has_reason).
       eligibilityReason: r.eligibility_reason ?? "",
     }));
+  }
+
+  /**
+   * Load the findings currently LIVE on a PR — delivered (inline_delivered / body_only_fallback) AND
+   * not suppressed — for carry-forward (#6). Because review_finding_id is content-addressed +
+   * ON CONFLICT DO NOTHING, this is exactly the prior accumulated live set per PR (the current run has
+   * not persisted yet when the loader runs). Reconstructs full {@link ReviewFindingV1} rows.
+   *
+   * Builder path so the {@link TenancyPlugin} verifies the `installation_id = :iid` equality at build
+   * time. Deterministic order (file_path, start_line, review_finding_id) → replay-stable activity output.
+   */
+  public async loadLiveFindingsForPr(args: {
+    installationId: string;
+    prId: string;
+  }): Promise<ReadonlyArray<ReviewFindingV1>> {
+    const rows = await this.db
+      .selectFrom("core.review_findings")
+      .select([
+        "file_path",
+        "start_line",
+        "end_line",
+        "severity",
+        "category",
+        "title",
+        "body",
+        "suggestion",
+        "confidence",
+        "citations",
+        "scope",
+        "evidence_refs",
+      ])
+      .where("installation_id", "=", args.installationId)
+      .where("pr_id", "=", args.prId)
+      .where("suppression_state", "=", sql<string>`CAST('NONE' AS core.suppression_state)`)
+      // Delivered findings only (the user-visible comments) — failed/not_applicable are not "live".
+      .where(sql<boolean>`delivery_outcome IN ('inline_delivered', 'body_only_fallback')`)
+      .orderBy("file_path")
+      .orderBy("start_line")
+      .orderBy("review_finding_id")
+      .execute();
+
+    return rows.map((r) =>
+      ReviewFindingV1.parse({
+        file: r.file_path,
+        start_line: r.start_line,
+        end_line: r.end_line,
+        severity: r.severity,
+        category: r.category,
+        title: r.title,
+        body: r.body,
+        suggestion: r.suggestion,
+        confidence: Number(r.confidence),
+        sources: r.citations ?? [],
+        scope: r.scope,
+        evidence_refs: r.evidence_refs ?? [],
+      }),
+    );
   }
 }

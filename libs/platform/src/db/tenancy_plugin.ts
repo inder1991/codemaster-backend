@@ -45,22 +45,24 @@
  *    bypass the AST walk entirely — that is the PR-time gate `check_tenant_scoped_raw_sql.ts`'s job,
  *    the analogue of the Python `text()` bypass covered by `check_tenant_scoped_raw_sql.py`.
  *
- * KNOWN LIMITATIONS — this is a COARSE BACKSTOP, not a complete isolation guarantee. It walks the
- * top-level query node and one shared WHERE; like the frozen Python heuristic (`get_final_froms` +
- * coarse substring WHERE), it does NOT deeply analyze these shapes, so a scoped table reached only
- * through them passes UN-scoped (verified parity-faithful to tenancy.py — Python accepts them too):
- *   - JOIN: a single `installation_id = :x` predicate "covers" the whole statement; a *joined* scoped
- *     table is not separately required to be filtered.
- *   - Nested query bodies: CTE (`WITH`), FROM-subquery / derived tables, WHERE-`IN` subselects,
- *     `DELETE … USING`, and `UNION`/set-operation branches are not descended into.
- *   - OR-defeated scope: `WHERE installation_id = :x OR other = :y` satisfies the equality check yet
- *     the OR sibling matches rows across tenants.
- * These are reachable via the Kysely builder (NOT raw SQL), so the PR-time raw-SQL gate does not cover
- * them either. Primary tenant isolation is therefore the REPO LAYER passing explicit `installation_id`
- * + code review; this plugin is defense-in-depth catching the common direct-query mistake. Hardening
- * the walker to recurse into nested nodes is a tracked follow-up (FOLLOW-UP-tenancy-deep-ast-walk) —
- * deferred because going stricter than the frozen Python hook would diverge in the Phase-6 dual-run
- * and needs that decision first.
+ * DEEP-AST HARDENING (#8) — this walker is now STRICTER than the frozen Python heuristic (a deliberate
+ * divergence: going beyond the parity baseline for tenant-isolation safety). It descends into nested
+ * query bodies and refuses OR-defeated scopes that the Python `get_final_froms` + coarse substring
+ * matcher accepted:
+ *   - Nested query bodies ARE descended into and enforced INDEPENDENTLY: CTE (`WITH`) bodies,
+ *     FROM-subqueries / derived tables, WHERE-`IN` subselects, `UNION`/set-operation branches, and
+ *     `DELETE … USING` tables. A scoped table reached only through one of these must carry its OWN
+ *     `installation_id` predicate (we prefer refuse-over-leak on a correlated subquery that relies on
+ *     outer scoping — restructure it or wrap it in {@link crossTenantAudit}). See {@link collectQueryNodes}.
+ *   - OR-defeated scope is REFUSED: `WHERE installation_id = :x OR other = :y` no longer satisfies the
+ *     filter — only a top-level AND-conjunct equality counts (see {@link whereHasTenantEquality}).
+ *
+ * REMAINING coarseness (by design): per-table JOIN scoping is still shared — a single
+ * `installation_id = :x` predicate "covers" a multi-table JOIN, because Kysely column references are
+ * frequently unqualified so we cannot reliably attribute a predicate to a SPECIFIC joined table; a JOIN
+ * with NO tenant predicate at all is still refused. Raw `sql\`...\`` tagged templates still bypass the
+ * AST walk (the PR-time `check_tenant_scoped_raw_sql.ts` gate's job). Primary tenant isolation remains
+ * the REPO LAYER passing explicit `installation_id` + code review; this plugin is defense-in-depth.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -267,6 +269,15 @@ function collectTargetTables(node: SelectQueryNode | UpdateQueryNode | DeleteQue
     }
   }
 
+  if (hasKind(node, "DeleteQueryNode")) {
+    // DELETE … USING <table> — the USING tables are additional FROM-like references; a scoped table
+    // joined in via USING (correlated by whereRef) must carry a tenant predicate too (#8).
+    const using = (node as { using?: { tables?: ReadonlyArray<OperationNode> } }).using;
+    for (const t of using?.tables ?? []) {
+      add(t);
+    }
+  }
+
   if (hasKind(node, "UpdateQueryNode")) {
     add((node as { table?: OperationNode }).table);
     const from = (node as { from?: { froms?: ReadonlyArray<OperationNode> } }).from;
@@ -296,13 +307,18 @@ function referencesColumn(node: OperationNode, column: string): boolean {
 }
 
 /**
- * Walk a WHERE subtree looking for a real equality-class predicate (`=`/`==`/`in`) whose left
- * operand references `column`. Recurses through AND/OR/Parens and binary operands. Returns true the
- * moment one is found.
+ * Walk a WHERE subtree looking for a real equality-class predicate (`=`/`==`/`in`) whose left operand
+ * references `column` AND is reachable from the root as a top-level CONJUNCT (through AND/Parens only).
+ * Returns true the moment one is found.
  *
- * Crucially, a `BinaryOperationNode` with the `is`/`is not` operator (i.e. `installation_id IS NULL`)
- * does NOT count — that is the IS-NULL-vs-equality distinction the Python substring matcher could
- * not make.
+ * Two semantics future readers must preserve:
+ *  - A `BinaryOperationNode` with `is`/`is not` (i.e. `installation_id IS NULL`) does NOT count — the
+ *    IS-NULL-vs-equality distinction the Python substring matcher could not make.
+ *  - An equality buried inside an `OR` branch does NOT count (#8). `installation_id = :x OR other = :y`
+ *    looks scoped but the OR sibling matches rows across tenants — so an `OrNode` never contributes a
+ *    real scope. Only AND-connected conjuncts (and Parens around them) scope the whole statement. A
+ *    `BinaryOperationNode` is therefore treated as a LEAF here (we do not descend into its operands —
+ *    a tenant column appearing as a comparison operand is not a top-level conjunct).
  */
 function whereHasTenantEquality(node: OperationNode | undefined, column: string): boolean {
   if (node === undefined) {
@@ -313,33 +329,32 @@ function whereHasTenantEquality(node: OperationNode | undefined, column: string)
     const bin = node as {
       leftOperand?: OperationNode;
       operator?: OperationNode;
-      rightOperand?: OperationNode;
     };
     const operator = bin.operator;
     const operatorName =
       operator !== undefined && hasKind(operator, "OperatorNode")
         ? (operator as { operator?: string }).operator
         : undefined;
-    if (
+    return (
       operatorName !== undefined &&
       TENANT_EQUALITY_OPERATORS.has(operatorName) &&
       bin.leftOperand !== undefined &&
       referencesColumn(bin.leftOperand, column)
-    ) {
-      return true;
-    }
-    // Keep descending: the equality predicate may live deeper in either operand.
-    return (
-      whereHasTenantEquality(bin.leftOperand, column) ||
-      whereHasTenantEquality(bin.rightOperand, column)
     );
   }
 
-  if (hasKind(node, "AndNode") || hasKind(node, "OrNode")) {
+  if (hasKind(node, "AndNode")) {
+    // AND: a tenant equality in EITHER conjunct scopes the whole statement.
     const branch = node as { left?: OperationNode; right?: OperationNode };
     return (
       whereHasTenantEquality(branch.left, column) || whereHasTenantEquality(branch.right, column)
     );
+  }
+
+  if (hasKind(node, "OrNode")) {
+    // OR: a tenant equality in one branch is DEFEATED by the sibling branch (which can match other
+    // tenants), so an OR node never contributes a real tenant scope (#8 — closes the OR-defeat bypass).
+    return false;
   }
 
   if (hasKind(node, "ParensNode")) {
@@ -358,33 +373,55 @@ function whereOf(
 }
 
 /**
- * Enforce tenancy on a single query node. Throws {@link TenancyViolation} on the first tenant-scoped
- * target table whose WHERE clause lacks a real `installation_id` equality filter — unless a
- * cross-tenant-audit frame is active or the table is legacy-exempt.
- *
- * Exported for direct unit testing (no DB / no Kysely executor needed — pass a compiled query's
- * `.query` node, or any `RootOperationNode`).
+ * Collect EVERY SELECT/UPDATE/DELETE query node reachable from `root` — the root itself plus every
+ * nested query body (#8): CTE bodies (`WITH`), FROM-subqueries / derived tables, WHERE-`IN` subselects,
+ * `UNION`/set-operation branches, and `DELETE … USING` subqueries. A generic AST visit (every object
+ * property + array element) so the descent is robust to the exact parent node shape — any node whose
+ * `kind` is a query kind is collected and enforced INDEPENDENTLY (a nested scoped-table query must
+ * carry its OWN tenant predicate; we prefer refuse-over-leak on a correlated subquery that relies on
+ * outer scoping). The `seen` set guards against any accidental cycle in the node graph.
  */
-export function enforceTenancyOnNode(node: RootOperationNode): void {
-  if (isAuditActive()) {
-    return; // explicitly privileged (covers SELECT + UPDATE + DELETE)
-  }
+function collectQueryNodes(root: OperationNode): Array<SelectQueryNode | UpdateQueryNode | DeleteQueryNode> {
+  const acc: Array<SelectQueryNode | UpdateQueryNode | DeleteQueryNode> = [];
+  const seen = new Set<unknown>();
+  const visit = (n: unknown): void => {
+    if (n === null || typeof n !== "object" || seen.has(n)) {
+      return;
+    }
+    seen.add(n);
+    if (Array.isArray(n)) {
+      for (const item of n) {
+        visit(item);
+      }
+      return;
+    }
+    const node = n as OperationNode;
+    if (
+      hasKind(node, "SelectQueryNode") ||
+      hasKind(node, "UpdateQueryNode") ||
+      hasKind(node, "DeleteQueryNode")
+    ) {
+      acc.push(node as SelectQueryNode | UpdateQueryNode | DeleteQueryNode);
+    }
+    for (const key of Object.keys(n as Record<string, unknown>)) {
+      visit((n as Record<string, unknown>)[key]);
+    }
+  };
+  visit(root);
+  return acc;
+}
 
-  const isScopedQuery =
-    hasKind(node, "SelectQueryNode") ||
-    hasKind(node, "UpdateQueryNode") ||
-    hasKind(node, "DeleteQueryNode");
-  if (!isScopedQuery) {
-    return; // INSERT / DDL / raw — out of scope, same as the Python hook
-  }
-
-  const queryNode = node as SelectQueryNode | UpdateQueryNode | DeleteQueryNode;
-  const targets = collectTargetTables(queryNode);
+/**
+ * Enforce tenancy on ONE query node: throw {@link TenancyViolation} on the first tenant-scoped target
+ * table whose WHERE clause lacks a real `installation_id` equality filter (unless the table is
+ * legacy-exempt). The audit-active short-circuit is handled by the caller.
+ */
+function enforceOneQueryNode(node: SelectQueryNode | UpdateQueryNode | DeleteQueryNode): void {
+  const targets = collectTargetTables(node);
   if (targets.length === 0) {
     return;
   }
-
-  const where = whereOf(queryNode);
+  const where = whereOf(node);
   for (const tableName of targets) {
     if (!TENANT_SCOPED_TABLES.has(tableName)) {
       continue;
@@ -401,6 +438,25 @@ export function enforceTenancyOnNode(node: RootOperationNode): void {
         detail: `${node.kind} has no '${TENANT_COLUMN} = :x' (or 'in') predicate`,
       });
     }
+  }
+}
+
+/**
+ * Enforce tenancy on a query AST. Throws {@link TenancyViolation} on the first tenant-scoped target
+ * table — at ANY nesting level (#8) — whose WHERE lacks a real `installation_id` equality filter, unless
+ * a cross-tenant-audit frame is active or the table is legacy-exempt.
+ *
+ * Exported for direct unit testing (no DB / no Kysely executor needed — pass a compiled query's
+ * `.query` node, or any `RootOperationNode`).
+ */
+export function enforceTenancyOnNode(node: RootOperationNode): void {
+  if (isAuditActive()) {
+    return; // explicitly privileged (covers SELECT + UPDATE + DELETE, at every nesting level)
+  }
+  // INSERT / DDL / raw roots have no query node here → collectQueryNodes returns [] → no-op, same as the
+  // Python hook's scope. A SELECT/UPDATE/DELETE root (and every nested query body) is enforced.
+  for (const queryNode of collectQueryNodes(node)) {
+    enforceOneQueryNode(queryNode);
   }
 }
 

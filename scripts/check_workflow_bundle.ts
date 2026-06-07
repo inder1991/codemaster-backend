@@ -28,9 +28,17 @@ import { bundleWorkflowCode } from "@temporalio/worker";
 /** ESM→CJS bridge: a `require` bound to THIS script's URL, so `require.resolve` works under ESM. */
 const require_ = createRequire(import.meta.url);
 
-/** Bundle the skeleton workflow; exit 0 on success, non-zero (printing the error) on any bundler failure. */
+/** Bundle the spine workflow; exit 0 on success, non-zero (printing the error) on any bundler failure. */
 async function main(): Promise<number> {
-  const workflowsPath = require_.resolve("../apps/backend/src/workflows/review_skeleton.workflow");
+  // Stage 1 — bundle the THIN review-pipeline SPINE workflow (review_pull_request.workflow), which
+  // REPLACES the Phase-2.0 walking skeleton as the worker's served workflow. The bundler webpacks the
+  // workflow body + its transitive import graph (the orchestrator, parallelism, state, degradation,
+  // activity_proxy, and the type-only contract shapes) into the V8 sandbox bundle and REFUSES
+  // sandbox-illegal Node builtins (node:crypto among them). A clean exit 0 proves the whole spine
+  // (body + orchestrator + helpers) is sandbox-safe — the ADR-0065 crypto boundary holds.
+  const workflowsPath = require_.resolve(
+    "../apps/backend/src/workflows/review_pull_request.workflow",
+  );
   try {
     const bundle = await bundleWorkflowCode({ workflowsPath });
     process.stdout.write(

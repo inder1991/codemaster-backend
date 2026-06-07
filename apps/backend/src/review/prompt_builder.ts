@@ -19,15 +19,18 @@
 //
 // BUDGET ENFORCEMENT: `_apply_budget` in Python trims policy + knowledge through the
 // `assemble_prompt` budget subsystem ONLY when `context.budget_enforcement` (or the
-// CODEMASTER_PROMPT_BUDGET_ENFORCEMENT env var) is truthy. That budget subsystem is NOT in scope for
-// this port; `applyBudget` below faithfully reproduces the budget-OFF path (the default — returns the
-// context fields unchanged) and THROWS if budget enforcement is requested, so a caller that enables
-// it gets a loud, traceable blocker rather than a silent divergence. The off-path is byte-exact.
+// CODEMASTER_PROMPT_BUDGET_ENFORCEMENT env var) is truthy. That subsystem is now ported
+// (apps/backend/src/review/prompt_assembler.ts — byte-exact, Tier-1 parity-tested), so `applyBudget`
+// below reproduces BOTH paths 1:1: the budget-OFF path (the default — context fields unchanged) AND
+// the budget-ON path (rank-then-wholesale-drop via assemblePrompt, with resolution_explanation
+// projected to the kept rule_ids). The pure builder has NO process-env access (replay determinism), so
+// only the contract flag `context.budget_enforcement` is honored — the env-var fallback in the Python
+// `_apply_budget` is for in-flight pre-R-35 workflow histories the worker resolves, not this builder.
 
 import type { ManifestSnapshot } from "#contracts/pr_context.v1.js";
 import { ManifestFetchStatus } from "#contracts/pr_context.v1.js";
 import type { DiffChunkV1 } from "#contracts/diff_chunking.v1.js";
-import type { KnowledgeChunkV1 } from "#contracts/knowledge_chunks.v1.js";
+import type { KnowledgeChunkV1, ScoredKnowledgeChunkV1 } from "#contracts/knowledge_chunks.v1.js";
 import type { PathInstructionV1 } from "#contracts/codemaster_config.v1.js";
 import type { PRTopologyEntryV1 } from "#contracts/pr_topology.v1.js";
 import type { ResolvedGuidanceBundleV1, DedupedRuleV1 } from "#contracts/resolved_guidance.v1.js";
@@ -39,6 +42,12 @@ import type { AnalysisFindingV1 } from "#contracts/analysis_findings.v1.js";
 import type { ToolStatusV1 } from "#contracts/tool_status.v1.js";
 import type { ConsumerHitV1, RemovedOrChangedSymbolV1 } from "#contracts/symbol_graph.v1.js";
 import { wrapUntrusted, wrapUntrustedManifest } from "#backend/security/trust_tier_wrapping.js";
+import { priorityTier, deriveAuthority, deriveDocType } from "#backend/retrieval/precedence.js";
+import { specificityBucket } from "#backend/retrieval/match_specificity.js";
+import {
+  assemblePrompt,
+  emitAssembledPromptCounters,
+} from "#backend/review/prompt_assembler.js";
 
 // ── token-budget heuristic ─────────────────────────────────────────────────────────────────────
 // Port of codemaster/chunking/token_budget.py::estimate_tokens (4-chars-per-token proxy with a 2.5x
@@ -131,14 +140,47 @@ function renderPathInstructions(rules: ReadonlyArray<PathInstructionV1>): Array<
   return out;
 }
 
-// ── retrieved-knowledge block (repo_knowledge path) ───────────────────────────────────────────────
-// Port of `_render_retrieved_knowledge` for the repo_knowledge branch + degraded handling.
-//
-// NOTE — Confluence branch (source="confluence") is NOT ported here: it depends on the Confluence
-// precedence machinery (priority_tier / derive_authority / derive_doc_type / specificity_bucket) +
-// the inner-<doc>-wrapper strip, none of which are in this task's scope. The frozen Python renders
-// confluence chunks with the full r3 attribute set; the parity fixtures here exercise repo_knowledge
-// chunks only. A `source="confluence"` chunk reaching this builder throws a loud blocker.
+// ── retrieved-knowledge block ─────────────────────────────────────────────────────────────────────
+// Port of `_render_retrieved_knowledge` (review/activities.py). Repo_knowledge chunks render in the legacy
+// `### chunk_id=… — <path> — § <heading>` shape; confluence chunks (source="confluence") render with the
+// Sub-spec B T16 full r3 attribute set (`<knowledge trust="semi" …>` + `confluence:<space>/<page>` locator)
+// and their inner `<doc trust="untrusted">` wrapper stripped (P1-7 audit fix — the outer wrapper carries the
+// trust signal; nesting produced contradictory trust attributes the LLM resolved unpredictably).
+
+/** Round-half-to-even to an integer (Python `round(float)` — used for `freshness_days`). */
+function roundHalfEvenInt(x: number): number {
+  const f = Math.floor(x);
+  const diff = x - f;
+  if (diff < 0.5) return f;
+  if (diff > 0.5) return f + 1;
+  return f % 2 === 0 ? f : f + 1; // exactly .5 → nearest even
+}
+
+/** Strip the redactor's `<doc trust="untrusted">…</doc>` wrapper before re-wrapping (`_strip_inner_doc_wrapper`).
+ *  The DB row still contains the wrapper (dedup strips it separately per ADR-0057); only rendering strips here. */
+function stripInnerDocWrapper(body: string): string {
+  return body.replace(/<doc\s+trust="untrusted"\s*>/gi, "").replace(/<\/doc>/gi, "");
+}
+
+/** The per-chunk attribute string for a confluence chunk (`_confluence_attrs`, Sub-spec B T16 / F-23).
+ *  trust+curation_level hardcoded "semi" (ADR-0057 baseline); authority/doc_type/match_specificity derived. */
+function confluenceAttrs(c: KnowledgeChunkV1): string {
+  const tier = priorityTier({ labels: c.labels, source: c.source, doc_kind: c.doc_kind });
+  const authority = deriveAuthority(tier);
+  const docType = deriveDocType(c.labels, c.source, c.doc_kind);
+  const specificity = specificityBucket(c.match_specificity_score);
+  const freshnessDays = roundHalfEvenInt(c.age_days);
+  return (
+    `trust="semi" ` +
+    `curation_level="semi" ` +
+    `authority="${authority}" ` +
+    `status="active" ` +
+    `freshness_days="${freshnessDays}" ` +
+    `doc_type="${docType}" ` +
+    `match_specificity="${specificity}"`
+  );
+}
+
 function renderRetrievedKnowledge(
   chunks: ReadonlyArray<KnowledgeChunkV1>,
   opts: { degraded: boolean; degradationReason: string },
@@ -157,16 +199,21 @@ function renderRetrievedKnowledge(
   let charsSoFar = 0;
   let truncated = false;
   for (const c of chunks) {
+    let block: string;
     if (c.source === "confluence") {
-      throw new Error(
-        "prompt_builder: confluence knowledge rendering is not ported (out of scope); " +
-          "see renderRetrievedKnowledge NOTE",
-      );
+      // T16 path: full r3 attribute set + nested-wrapper strip + the confluence:<space>/<page> locator.
+      const attrs = confluenceAttrs(c);
+      const body = stripInnerDocWrapper(c.body);
+      const spaceKey = c.space_key ?? "";
+      const pageId = c.page_id ?? "";
+      const header = `### chunk_id=${c.chunk_id} — confluence:${spaceKey}/${pageId}`;
+      block = `\n<knowledge ${attrs}>\n${header}\n${body}\n</knowledge>\n`;
+    } else {
+      const path = c.relative_path;
+      const heading = c.heading_path.length > 0 ? c.heading_path.join(" › ") : "";
+      const header = `### chunk_id=${c.chunk_id} — ${path}` + (heading ? ` — § ${heading}` : "");
+      block = `\n${header}\n${c.body}\n`;
     }
-    const path = c.relative_path;
-    const heading = c.heading_path.length > 0 ? c.heading_path.join(" › ") : "";
-    const header = `### chunk_id=${c.chunk_id} — ${path}` + (heading ? ` — § ${heading}` : "");
-    const block = `\n${header}\n${c.body}\n`;
     if (charsSoFar + pyLen(block) > MAX_KNOWLEDGE_CHARS) {
       truncated = true;
       break;
@@ -701,23 +748,69 @@ function buildLinterAwareReviewPrompt(args: {
   return sections.join("\n\n");
 }
 
-// ── budget enforcement (off-path only) ──────────────────────────────────────────────────────────
+// ── budget enforcement (1:1 with _apply_budget) ──────────────────────────────────────────────────
 function applyBudget(
   context: ReviewContextV1,
 ): { policyForRender: ResolvedGuidanceBundleV1 | null; knowledgeForRender: ReadonlyArray<KnowledgeChunkV1> } {
-  // Python: prefer context.budget_enforcement (workflow-body-resolved); else the env var truthy
-  // vocabulary {"1","true","yes"}. The env var is read in the worker; this pure builder has no
-  // process env access (and must not, per replay determinism), so we honor only the contract flag.
-  if (context.budget_enforcement) {
-    throw new Error(
-      "prompt_builder: budget_enforcement=true requires the assemble_prompt budget subsystem, " +
-        "which is not ported (out of scope). Off-path (budget_enforcement=false) is byte-exact.",
-    );
+  // Python: prefer context.budget_enforcement (workflow-body-resolved, history-deterministic); else
+  // the env var truthy vocabulary {"1","true","yes"}. The env var is read in the worker; this pure
+  // builder has no process env access (and must not, per replay determinism), so we honor only the
+  // contract flag — the env-var fallback covers in-flight pre-R-35 histories the worker resolves.
+  if (!context.budget_enforcement) {
+    return {
+      policyForRender: context.applicable_policy,
+      knowledgeForRender: context.retrieved_knowledge,
+    };
   }
-  return {
-    policyForRender: context.applicable_policy,
-    knowledgeForRender: context.retrieved_knowledge,
-  };
+
+  // Wrap bare KnowledgeChunkV1 in ScoredKnowledgeChunkV1 so assemblePrompt can token-cost them. Score
+  // is a placeholder (RetrieveKnowledgeActivity already ranked via RRF; B-4's budget enforcer doesn't
+  // re-rank, just takes in-order). 1:1 with the Python `ScoredKnowledgeChunkV1(chunk=c, score=1.0,
+  // stage="rrf")` wrapping.
+  const scoredKnowledge: ReadonlyArray<ScoredKnowledgeChunkV1> = context.retrieved_knowledge.map(
+    (c) => ({ schema_version: 1, chunk: c, score: 1.0, stage: "rrf" }),
+  );
+  const assembled = assemblePrompt({
+    policyBundle: context.applicable_policy,
+    knowledgeResults: scoredKnowledge,
+  });
+  emitAssembledPromptCounters(assembled);
+
+  // R-4 — project resolution_explanation to kept rule_ids so the ResolvedGuidanceBundleV1
+  // parallel-tuple invariant survives the trim. 1:1 with the Python `model_copy(update={...})`: keep
+  // every other bundle field (schema_version, changed_path), replace applicable_rules with the kept
+  // policy_blocks, and filter resolution_explanation to the entries whose rule was kept.
+  let policyForRender: ResolvedGuidanceBundleV1 | null = context.applicable_policy;
+  if (context.applicable_policy !== null) {
+    const orig = context.applicable_policy;
+    const keptRuleIds = new Set<string>(
+      assembled.policy_blocks.map((deduped) => deduped.rule.rule_id),
+    );
+    // Python `zip(applicable_rules, resolution_explanation, strict=False)` stops at the shorter of the
+    // two tuples — reproduce with the min length so a mismatched-length bundle projects identically.
+    const pairCount = Math.min(
+      orig.applicable_rules.length,
+      orig.resolution_explanation.length,
+    );
+    const trimmedExplanations: Array<string> = [];
+    for (let i = 0; i < pairCount; i += 1) {
+      // eslint-disable-next-line security/detect-object-injection -- `i` is a bounded numeric loop index into two parallel local arrays (no prototype-chain read).
+      const deduped = orig.applicable_rules[i]!;
+      if (keptRuleIds.has(deduped.rule.rule_id)) {
+        // eslint-disable-next-line security/detect-object-injection -- `i` is a bounded numeric loop index into a local array (no prototype-chain read).
+        trimmedExplanations.push(orig.resolution_explanation[i]!);
+      }
+    }
+    policyForRender = {
+      ...orig,
+      applicable_rules: assembled.policy_blocks,
+      resolution_explanation: trimmedExplanations,
+    };
+  }
+  const knowledgeForRender: ReadonlyArray<KnowledgeChunkV1> = assembled.knowledge_blocks.map(
+    (scored) => scored.chunk,
+  );
+  return { policyForRender, knowledgeForRender };
 }
 
 // ── buildUserMessage (1:1 with _build_user_message) ─────────────────────────────────────────────

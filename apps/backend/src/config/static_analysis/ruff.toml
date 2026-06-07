@@ -1,0 +1,27 @@
+# codemaster's opinionated Ruff baseline.
+#
+# See docs/superpowers/plans/2026-05-16-bundled-static-analysis-configs.md
+# for design rationale. Architect-approved rule selection (conservative):
+# the bot is a bug-finder / security-reviewer / correctness-reviewer —
+# NOT a formatter / style enforcer / refactor assistant. Refactor families
+# (UP, SIM, C90) intentionally OUT to keep signal-to-noise high before
+# the curator's filtering tier.
+#
+# Memory: feedback_platform_owned_review_baseline.md — codemaster brings
+# its own opinions; per-repo pyproject.toml is irrelevant to bot review.
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "F",       # pyflakes — unused imports, undefined names
+    "E",       # pycodestyle errors
+    "B",       # flake8-bugbear — real bugs (mutable default arg, etc.)
+    "S",       # flake8-bandit — security (sql, exec, etc.)
+    "RUF",     # ruff-specific (cyrillic homoglyphs, ambiguous unicode)
+]
+ignore = [
+    "E501",    # line too long — noisy; leave to formatters
+    "S101",    # assert used — common in tests
+]

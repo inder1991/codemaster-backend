@@ -598,6 +598,92 @@ export class GitHubApiClient {
     return repos;
   }
 
+  // ─── Manifest fetch (FOLLOW-UP-confluence-pr-context-manifests) ──────────────────────────────
+  // These satisfy the `GithubContentsPort` shape the fetch_manifest_snapshots activity consumes
+  // (structural typing — no `implements` to avoid a circular import). `installationUuid` is accepted for
+  // that port shape (a Python telemetry param); the TS `_request` does not consume it.
+
+  /**
+   * GET /repos/{owner}/{repo}/contents/{path}?ref={ref} (1:1 with the Python `get_contents`). Returns
+   * `[contentBase64AsciiBytes, blobSha]` on 200 (content is base64 per GitHub's contents API — the caller
+   * base64-decodes), or `null` on 404 / non-file / malformed. `GitHubAppUnauthorized` propagates.
+   */
+  public async getContents(args: {
+    installationId: number;
+    installationUuid: string;
+    owner: string;
+    repo: string;
+    path: string;
+    ref: string;
+  }): Promise<readonly [Uint8Array, string] | null> {
+    // Encode each path SEGMENT but preserve the '/' separators — GitHub's contents API resolves
+    // /repos/{owner}/{repo}/contents/{a}/{b}/{c}, so encodeURIComponent on the whole path (which turns
+    // '/' into %2F) 404s nested monorepo manifests like services/api/package.json.
+    const encodedPath = args.path.split("/").map(encodeURIComponent).join("/");
+    const encodedRef = encodeURIComponent(args.ref);
+    let resp: GitHubHttpResponse;
+    try {
+      resp = await this._request(
+        "GET",
+        `/repos/${args.owner}/${args.repo}/contents/${encodedPath}?ref=${encodedRef}`,
+        { installationId: args.installationId },
+      );
+    } catch (e) {
+      if (e instanceof GitHubNotFoundError) {
+        return null; // file absent at the ref — caller tries the next candidate
+      }
+      throw e;
+    }
+    const body = GitHubApiClient.jsonOf(resp, "get_contents");
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return null;
+    }
+    const rec = body as Record<string, unknown>;
+    if (rec["type"] !== "file") {
+      return null; // a directory/symlink/submodule listing — not a manifest file
+    }
+    const contentB64 = rec["content"];
+    const sha = rec["sha"];
+    if (typeof contentB64 !== "string" || typeof sha !== "string") {
+      return null;
+    }
+    // Python returns `content_b64.encode("ascii")`; base64 chars are ASCII so the ASCII-byte encoding
+    // round-trips identically. The activity base64-decodes these bytes.
+    return [new Uint8Array(Buffer.from(contentB64, "ascii")), sha] as const;
+  }
+
+  /**
+   * GET /repos/{owner}/{repo}/git/trees/{treeSha}?recursive=1 (1:1 with the Python `get_recursive_tree`).
+   * Returns `[blobPaths (ASCII-sorted), truncated]`; `truncated=true` when the repo exceeded GitHub's
+   * 100k tree-entry cap. Best-effort — callers wrap in try/catch + degrade the nearest-walk on any throw.
+   */
+  public async getRecursiveTree(args: {
+    installationId: number;
+    installationUuid: string;
+    owner: string;
+    repo: string;
+    treeSha: string;
+  }): Promise<readonly [ReadonlyArray<string>, boolean]> {
+    const encodedSha = encodeURIComponent(args.treeSha);
+    const resp = await this._request(
+      "GET",
+      `/repos/${args.owner}/${args.repo}/git/trees/${encodedSha}?recursive=1`,
+      { installationId: args.installationId },
+    );
+    const body = GitHubApiClient.jsonOf(resp, "get_recursive_tree");
+    const rec = (body !== null && typeof body === "object" ? body : {}) as Record<string, unknown>;
+    const truncated = Boolean(rec["truncated"]);
+    const entries = Array.isArray(rec["tree"]) ? (rec["tree"] as Array<unknown>) : [];
+    const paths = entries
+      .filter(
+        (e): e is Record<string, unknown> => e !== null && typeof e === "object" && !Array.isArray(e),
+      )
+      .filter((e) => e["type"] === "blob" && typeof e["path"] === "string")
+      .map((e) => e["path"] as string)
+      .sort();
+    return [paths, truncated] as const;
+  }
+
   // ─── Generic verb helpers (post-comment etc. build on these) ────────────────────────────────
 
   public async get(

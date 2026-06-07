@@ -243,3 +243,85 @@ describe("TenancyPlugin — cross-tenant-audit escape", () => {
     });
   });
 });
+
+// ── #8 deep-AST hardening: OR-defeat + nested query bodies (CTE / subquery / union / DELETE USING) ──
+// Previously these passed UN-scoped (the walker only looked at the top-level FROM + a coarse shared
+// WHERE, and accepted an `installation_id =` found ANYWHERE incl. inside an OR). Now each is refused.
+describe("TenancyPlugin — OR-defeated tenant scope is refused", () => {
+  it("SELECT `installation_id = :x OR head_sha = :y` throws (the OR sibling matches across tenants)", () => {
+    const node = db()
+      .selectFrom("core.review_runs")
+      .select("run_id")
+      .where((eb) => eb.or([eb("installation_id", "=", IID), eb("head_sha", "=", "abc")]))
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+
+  it("SELECT `installation_id = :x AND (a OR b)` PASSES (the tenant filter is a top-level conjunct)", () => {
+    const node = db()
+      .selectFrom("core.review_runs")
+      .select("run_id")
+      .where("installation_id", "=", IID)
+      .where((eb) => eb.or([eb("head_sha", "=", "a"), eb("head_sha", "=", "b")]))
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).not.toThrow();
+  });
+});
+
+describe("TenancyPlugin — nested query bodies are descended into", () => {
+  it("CTE whose body selects a scoped table WITHOUT a filter throws", () => {
+    const node = db()
+      .with("t", (d) => d.selectFrom("core.review_runs").select("run_id"))
+      .selectFrom("t")
+      .select("run_id")
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+
+  it("CTE whose body filters the scoped table PASSES", () => {
+    const node = db()
+      .with("t", (d) =>
+        d.selectFrom("core.review_runs").select("run_id").where("installation_id", "=", IID),
+      )
+      .selectFrom("t")
+      .select("run_id")
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).not.toThrow();
+  });
+
+  it("FROM-subquery (derived table) on a scoped table WITHOUT a filter throws", () => {
+    const node = db()
+      .selectFrom((eb) => eb.selectFrom("core.review_runs").select("run_id").as("sub"))
+      .select("sub.run_id")
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+
+  it("WHERE-IN subselect on a scoped table WITHOUT a filter throws (even from a non-scoped outer table)", () => {
+    const node = db()
+      .selectFrom("public.app_meta")
+      .select("id")
+      .where("id", "in", (eb) => eb.selectFrom("core.review_runs").select("run_id"))
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+
+  it("UNION branch on a scoped table WITHOUT a filter throws (even when the first branch IS scoped)", () => {
+    const node = db()
+      .selectFrom("core.review_runs")
+      .select("run_id")
+      .where("installation_id", "=", IID)
+      .union(db().selectFrom("core.review_runs").select("run_id"))
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+
+  it("DELETE … USING a scoped table WITHOUT a filter throws", () => {
+    const node = db()
+      .deleteFrom("public.app_meta")
+      .using("core.review_runs")
+      .whereRef("public.app_meta.id", "=", "core.review_runs.run_id")
+      .toOperationNode();
+    expect(() => enforceTenancyOnNode(node)).toThrow(TenancyViolation);
+  });
+});

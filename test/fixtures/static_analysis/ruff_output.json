@@ -1,0 +1,133 @@
+[
+  {
+    "cell": null,
+    "code": "F401",
+    "end_location": {
+      "column": 10,
+      "row": 1
+    },
+    "filename": "/private/tmp/sapclean/bad.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "",
+          "end_location": {
+            "column": 1,
+            "row": 2
+          },
+          "location": {
+            "column": 1,
+            "row": 1
+          }
+        }
+      ],
+      "message": "Remove unused import: `os`"
+    },
+    "location": {
+      "column": 8,
+      "row": 1
+    },
+    "message": "`os` imported but unused",
+    "noqa_row": 1,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unused-import"
+  },
+  {
+    "cell": null,
+    "code": "F401",
+    "end_location": {
+      "column": 18,
+      "row": 2
+    },
+    "filename": "/private/tmp/sapclean/bad.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "",
+          "end_location": {
+            "column": 1,
+            "row": 3
+          },
+          "location": {
+            "column": 1,
+            "row": 2
+          }
+        }
+      ],
+      "message": "Remove unused import: `subprocess`"
+    },
+    "location": {
+      "column": 8,
+      "row": 2
+    },
+    "message": "`subprocess` imported but unused",
+    "noqa_row": 2,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unused-import"
+  },
+  {
+    "cell": null,
+    "code": "B006",
+    "end_location": {
+      "column": 22,
+      "row": 5
+    },
+    "filename": "/private/tmp/sapclean/bad.py",
+    "fix": {
+      "applicability": "unsafe",
+      "edits": [
+        {
+          "content": "None",
+          "end_location": {
+            "column": 22,
+            "row": 5
+          },
+          "location": {
+            "column": 20,
+            "row": 5
+          }
+        },
+        {
+          "content": "    if items is None:\n        items = []\n",
+          "end_location": {
+            "column": 1,
+            "row": 6
+          },
+          "location": {
+            "column": 1,
+            "row": 6
+          }
+        }
+      ],
+      "message": "Replace with `None`; initialize within function"
+    },
+    "location": {
+      "column": 20,
+      "row": 5
+    },
+    "message": "Do not use mutable data structures for argument defaults",
+    "noqa_row": 5,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/mutable-argument-default"
+  },
+  {
+    "cell": null,
+    "code": "S307",
+    "end_location": {
+      "column": 14,
+      "row": 6
+    },
+    "filename": "/private/tmp/sapclean/bad.py",
+    "fix": null,
+    "location": {
+      "column": 5,
+      "row": 6
+    },
+    "message": "Use of possibly insecure function; consider using `ast.literal_eval`",
+    "noqa_row": 6,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/suspicious-eval-usage"
+  }
+]

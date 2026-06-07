@@ -1,0 +1,23 @@
+interactions:
+  - request:
+      method: GET
+      uri: https://api.github.com/repos/acme/example/issues/42
+      headers:
+        Accept: application/vnd.github+json
+        Authorization: Bearer <ghs-redacted>
+        X-GitHub-Api-Version: "2022-11-28"
+    response:
+      status_code: 200
+      headers:
+        ETag: '"abc123etag"'
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4999"
+        X-RateLimit-Reset: "1799999999"
+        Content-Type: application/json
+      body: |-
+        {
+          "number": 42,
+          "title": "Fix the widget rendering",
+          "body": "The widget renders upside down.",
+          "state": "open"
+        }

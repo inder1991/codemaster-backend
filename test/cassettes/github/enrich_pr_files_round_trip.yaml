@@ -1,0 +1,46 @@
+schema_version: 1
+service: github
+scenario: "enrich_pr_files_activity_v2 round-trip — GET /pulls/7/files paginated (2 pages), real patches across added/modified/renamed/removed/binary/changed/unchanged"
+recorded_at: "2026-06-06T00:00:00Z"
+recorded_by: "enrich-pr-files-v2-port"
+interactions:
+  - request:
+      method: GET
+      uri: https://api.github.com/repos/acme/widgets/pulls/7/files?per_page=100&page=1
+      headers:
+        Accept: application/vnd.github+json
+        X-GitHub-Api-Version: "2022-11-28"
+    response:
+      status_code: 200
+      headers:
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4990"
+        X-RateLimit-Reset: "1799999999"
+        Content-Type: application/json
+        Link: '<https://api.github.com/repos/acme/widgets/pulls/7/files?per_page=100&page=2>; rel="next"'
+      body: |-
+        [
+          {"filename":"src/added_file.py","status":"added","additions":4,"deletions":0,"changes":4,"patch":"@@ -0,0 +1,4 @@\n+line1\n+line2\n+line3\n+line4"},
+          {"filename":"src/modified_multi_hunk.py","status":"modified","additions":2,"deletions":1,"changes":3,"patch":"@@ -4,0 +5,3 @@\n+a\n+b\n+c\n@@ -29,1 +30,1 @@\n-old\n+new"},
+          {"filename":"src/renamed_with_edit.py","status":"renamed","additions":1,"deletions":1,"changes":2,"previous_filename":"src/old_name.py","patch":"@@ -1,2 +1,3 @@\n unchanged\n-old line\n+new line\n+extra"}
+        ]
+  - request:
+      method: GET
+      uri: https://api.github.com/repos/acme/widgets/pulls/7/files?per_page=100&page=2
+      headers:
+        Accept: application/vnd.github+json
+        X-GitHub-Api-Version: "2022-11-28"
+    response:
+      status_code: 200
+      headers:
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4989"
+        X-RateLimit-Reset: "1799999999"
+        Content-Type: application/json
+      body: |-
+        [
+          {"filename":"src/removed_file.py","status":"removed","additions":0,"deletions":3,"changes":3,"patch":"@@ -1,3 +0,0 @@\n-x\n-y\n-z"},
+          {"filename":"assets/logo.png","status":"added","additions":0,"deletions":0,"changes":0,"patch":null},
+          {"filename":"src/touched.py","status":"changed","additions":1,"deletions":0,"changes":1,"patch":"@@ -9,0 +10,1 @@\n+touched"},
+          {"filename":"src/whitespace_only.py","status":"unchanged","additions":0,"deletions":0,"changes":0,"patch":null}
+        ]

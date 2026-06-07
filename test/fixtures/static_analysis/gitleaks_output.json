@@ -1,0 +1,22 @@
+[
+ {
+  "RuleID": "slack-bot-token",
+  "Description": "Identified a Slack Bot token, which may compromise bot integrations and communication channel security.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 13,
+  "EndColumn": 69,
+  "Match": "__SLACK_BAIT_TOKEN__",
+  "Secret": "__SLACK_BAIT_TOKEN__",
+  "File": "/tmp/sapclean/secrets.env",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 5.012629,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "/tmp/sapclean/secrets.env:slack-bot-token:1"
+ }
+]

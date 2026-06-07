@@ -1,15 +1,22 @@
 // Retriever wiring — port of the frozen Python
 // vendor/codemaster-py/codemaster/wiring/retrievers.py (Sprint 26 / B-2 stage 6; R-31 single-call DI
-// factory). This is the LEGACY (BM25 + ANN + RRF) wiring only.
+// factory). Wires the LEGACY (BM25 + ANN + RRF) path AND the Sub-spec B T12 confluence/hybrid path.
 //
-// ── DEFERRED (faithful to the Python default; marker-gated OFF) ──────────────────────────────────
-// The frozen Python `build_retrieve_knowledge_activity` ALSO wires a `HybridRetriever` (BM25 + ANN +
-// PostgresConfluenceRetrieval + an IdentityRerankPort no-op rerank) so the activity's hybrid branch can
-// fire when `include_confluence=True`. That whole hybrid/Confluence path + the real LLM rerank are
-// DEFERRED here — `RetrieveKnowledgeActivity` is constructed with NO hybrid retriever, so it always
-// runs the legacy fusion (1:1 with the Python default behaviour when `hybrid_retriever=None`):
-//   - FOLLOW-UP-retrieve-knowledge-hybrid-confluence  (HybridRetriever + PostgresConfluenceRetrieval)
-//   - FOLLOW-UP-retrieve-knowledge-llm-rerank         (BedrockRerank port)
+// ── HYBRID / CONFLUENCE wiring (1:1 with the Python `build_retrieve_knowledge_activity`) ──────────
+// The frozen Python `build_retrieve_knowledge_activity` wires a `HybridRetriever` (BM25 + ANN +
+// PostgresConfluenceRetrieval + an IdentityRerankPort no-op rerank) so the activity's hybrid branch
+// fires when the workflow body dispatches with `include_confluence=True` + the supporting fields. This
+// TS factory wires the SAME composition: it constructs `PostgresConfluenceRetrieval` over the shared
+// core pool + a `HybridRetriever` (sharing the SAME Bm25Retriever / AnnRetriever instances the legacy
+// path uses, plus an `LlmRerank({ port: new IdentityRerankPort() })`) and threads it onto the activity.
+// The activity still runs the legacy fusion unless ALL five confluence-supporting fields are present
+// (the `_shouldUseHybrid` gate), so a legacy dispatch (include_confluence=false) is byte-identical.
+//   - FOLLOW-UP-retrieve-knowledge-llm-rerank / FOLLOW-UP-production-reranker — the production
+//     Bedrock-backed reranker is OWNER-PROVIDED; until it lands the IdentityRerankPort no-op is wired
+//     (matching the frozen Python, which ships only the identity no-op).
+//   - FOLLOW-UP-embedder-cache — PostgresConfluenceRetrieval accepts an EmbedderCache for the
+//     Phase-A/Phase-C generation dispatch; that cache is unported, so the adapter runs the legacy direct
+//     query (`embedderCache=null`). Same posture as the AnnRetriever embedder-cache deferral below.
 //
 // ── DSN gate (DIVERGES from the Python; documented for the verifier) ─────────────────────────────
 // The Python `build_bm25_port` / `build_ann_port` fall back to EMPTY InMemory*Port test doubles when
@@ -25,11 +32,16 @@
 // matching the Python R-43 "share one core session_factory across both ports".
 
 import { RetrieveKnowledgeActivity } from "#backend/activities/retrieve_knowledge.activity.js";
+import { PostgresConfluenceRetrieval } from "#backend/adapters/postgres_confluence_retrieval.js";
 import { type EmbeddingsPort } from "#backend/adapters/embeddings_port.js";
 import { AnnRetriever } from "#backend/retrieval/ann_retriever.js";
 import { type AnnPort, PostgresAnnPort } from "#backend/retrieval/ann_port.js";
 import { type Bm25Port, PostgresBm25Port } from "#backend/retrieval/bm25_port.js";
 import { Bm25Retriever } from "#backend/retrieval/bm25_retriever.js";
+import type { ConfluenceRetrievalPort } from "#backend/retrieval/confluence_source.js";
+import { HybridRetriever } from "#backend/retrieval/hybrid_retriever.js";
+import { IdentityRerankPort, LlmRerank } from "#backend/retrieval/llm_rerank.js";
+import type { RerankLlmCacheLike } from "#backend/retrieval/llm_backed_rerank.js";
 
 import { tenantKysely } from "#platform/db/database.js";
 
@@ -66,6 +78,23 @@ export function buildAnnPort(): AnnPort {
   return new PostgresAnnPort({ db: resolveCoreDb() });
 }
 
+/**
+ * Return the production {@link ConfluenceRetrievalPort} ({@link PostgresConfluenceRetrieval} over the
+ * shared core pool). Fail-loud when `CODEMASTER_PG_CORE_DSN` is unset (see the header divergence note).
+ *
+ * The confluence corpus is PLATFORM-SHARED (migration 0063 dropped `installation_id`) — the adapter does
+ * NO `installation_id` filter; the by-design cross-tenant access posture lives on the adapter's
+ * `// tenant:exempt` raw-SQL markers (the frozen Python's `@privileged_path` + `cross_tenant_audit`).
+ *
+ * FOLLOW-UP-embedder-cache: the Python threads an optional EmbedderCache into the adapter for the
+ * Phase-A/Phase-C generation dispatch; that cache is `None` in the current composition AND unported, so
+ * no `embedderCache` is passed here (the adapter runs the legacy direct query) — same posture as
+ * {@link buildAnnPort}.
+ */
+export function buildConfluencePort(): ConfluenceRetrievalPort {
+  return new PostgresConfluenceRetrieval({ db: resolveCoreDb() });
+}
+
 export type BuildRetrieveKnowledgeActivityOptions = {
   /** The production {@link EmbeddingsPort} (resolved by `resolveEmbeddingsConsumer`). */
   embedder: EmbeddingsPort;
@@ -73,20 +102,31 @@ export type BuildRetrieveKnowledgeActivityOptions = {
   modelName?: string;
   /** Per-chunk retrieval result cap (1:1 with the Python `top_k=5`). */
   topK?: number;
+  /**
+   * Optional rerank LLM cache (E). Threaded to {@link RetrieveKnowledgeActivity}; when wired AND
+   * `CODEMASTER_LLM_RERANK_ENABLED=true`, the activity builds a per-invocation LLM-backed reranker instead
+   * of the static IdentityRerankPort no-op. Omitted → identity rerank (1:1 with Python).
+   */
+  rerankCache?: RerankLlmCacheLike;
 };
 
 /**
- * Single-call DI factory for the LEGACY {@link RetrieveKnowledgeActivity} (1:1 with the Python
- * `build_retrieve_knowledge_activity`, minus the DEFERRED hybrid/Confluence wiring — see the header).
+ * Single-call DI factory for the {@link RetrieveKnowledgeActivity} (1:1 with the Python
+ * `build_retrieve_knowledge_activity`, including the Sub-spec B T12 hybrid/Confluence wiring).
  *
  * Composes {@link Bm25Retriever} (over {@link buildBm25Port}) + {@link AnnRetriever} (over
- * {@link buildAnnPort} + the injected embedder) and binds them into the activity holder. The worker
- * registers `holder.retrieveKnowledge` as the `retrieve_knowledge_activity` Temporal activity.
+ * {@link buildAnnPort} + the injected embedder), then wires a {@link HybridRetriever} over the SAME two
+ * retriever instances + a {@link PostgresConfluenceRetrieval} (over {@link buildConfluencePort}) + an
+ * {@link LlmRerank} backed by the {@link IdentityRerankPort} no-op (FOLLOW-UP-production-reranker). The
+ * activity runs the hybrid path only when the workflow body dispatches with the five confluence-supporting
+ * fields (the `_shouldUseHybrid` gate); a legacy dispatch falls through to the BM25+ANN+RRF fusion. The
+ * worker registers `holder.retrieveKnowledge` as the `retrieve_knowledge_activity` Temporal activity.
  */
 export function buildRetrieveKnowledgeActivity({
   embedder,
   modelName = "qwen3-embed-0.6b",
   topK = 5,
+  rerankCache,
 }: BuildRetrieveKnowledgeActivityOptions): RetrieveKnowledgeActivity {
   const bm25Retriever = new Bm25Retriever({ port: buildBm25Port() });
   const annRetriever = new AnnRetriever({
@@ -94,5 +134,21 @@ export function buildRetrieveKnowledgeActivity({
     embeddings: embedder,
     modelName,
   });
-  return new RetrieveKnowledgeActivity({ bm25Retriever, annRetriever, topK });
+  // Sub-spec B T12 — the hybrid retriever shares the SAME BM25 / ANN instances (1:1 with the Python R-43
+  // "share one core session_factory across both ports"). The IdentityRerankPort is the no-op the frozen
+  // Python ships until the owner provides the Bedrock-backed reranker (FOLLOW-UP-production-reranker).
+  const hybridRetriever = new HybridRetriever({
+    bm25: bm25Retriever,
+    ann: annRetriever,
+    rerank: new LlmRerank({ port: new IdentityRerankPort() }),
+    confluence: buildConfluencePort(),
+  });
+  return new RetrieveKnowledgeActivity({
+    bm25Retriever,
+    annRetriever,
+    topK,
+    hybridRetriever,
+    // exactOptionalPropertyTypes: only pass the key when defined (never an explicit `undefined`).
+    ...(rerankCache !== undefined ? { rerankCache } : {}),
+  });
 }

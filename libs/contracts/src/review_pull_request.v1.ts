@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { PublicationOutcome } from "./posted_review.v1.js";
+
 // Zod port of contracts/review_pull_request/payload_v1.py (frozen Python). Parity-validated in
 // review_pull_request.v1.parity.test.ts.
 //
@@ -59,3 +61,52 @@ export const ReviewPullRequestPayloadV1 = z
   })
   .strict();
 export type ReviewPullRequestPayloadV1 = z.infer<typeof ReviewPullRequestPayloadV1>;
+
+// ─── ReviewPullRequestResultV1 — the @workflow.run RETURN contract ────────────────────────────────
+//
+// Zod port of the frozen Python `ReviewPullRequestResultV1`
+// (vendor/codemaster-py/codemaster/workflows/review_pull_request.py:417) — the terminal envelope the
+// ReviewPullRequestWorkflow returns to its caller (start_review_for_webhook / the workflow-result
+// persistence / analytics). The Python contract lives in the WORKFLOW module (not contracts/), so this is
+// a port-introduced contract; its constituent `PublicationOutcome` IS parity-validated in posted_review.v1.
+//
+// FIELD-PORT NOTES (1:1 with the Python BaseModel(extra="forbid")):
+//  - schema_version: Python `int = 1` (PLAIN int, NOT Literal) → z.number().int().default(1) (a literal
+//    would false-reject a future schema_version=2). NOTE: this is the RESULT envelope's own
+//    schema_version (1), distinct from the v2 PAYLOAD envelope above.
+//  - status: Python `Literal[...]` over the 5 status strings → z.enum([...]). The spine happy path emits
+//    "accepted"; the gate-skip statuses (skipped_busy / skipped_disabled) + the bcompat statuses
+//    (closed / skipped_legacy_payload) are Stage-2/3 surfaces but stay in the enum so the contract is
+//    shape-complete (a future gate-port emits them without a contract change).
+//  - pr_number: int (REQUIRED, no ge — the Python field carries no Field(ge=…)) → z.number().int().
+//  - review_id: str | None = None → z.string().nullable().default(null). Python stringifies the int
+//    review id (`str(review_id_int)`) — the wire form is a string, NOT a UUID; left a bare str here.
+//  - findings_count: int = 0 → z.number().int().default(0).
+//  - mutex_id: str | None = None → z.string().nullable().default(null). Stage-2 lifecycle field; the thin
+//    body never holds a mutex, so it is always null here (matches the Python `mutex_id=None` at return —
+//    "already released; don't expose to caller").
+//  - installation_id / pr_id: uuid.UUID | None = None → z.string().uuid().nullable().default(null)
+//    (Pydantic lowercases on model_dump(mode="json"); surfaced so observers correlate the result back to
+//    the DM tables). The thin body sets them from the typed payload.
+//  - publication_outcome: PublicationOutcome | None = None → PublicationOutcome.nullable().default(null).
+//    None when no publication actually happened (the orchestrator raised before post_review).
+export const ReviewPullRequestResultV1 = z
+  .object({
+    schema_version: z.number().int().default(1),
+    status: z.enum([
+      "accepted",
+      "skipped_busy",
+      "skipped_disabled",
+      "closed",
+      "skipped_legacy_payload",
+    ]),
+    pr_number: z.number().int(),
+    review_id: z.string().nullable().default(null),
+    findings_count: z.number().int().default(0),
+    mutex_id: z.string().nullable().default(null),
+    installation_id: z.string().uuid().nullable().default(null),
+    pr_id: z.string().uuid().nullable().default(null),
+    publication_outcome: PublicationOutcome.nullable().default(null),
+  })
+  .strict();
+export type ReviewPullRequestResultV1 = z.infer<typeof ReviewPullRequestResultV1>;

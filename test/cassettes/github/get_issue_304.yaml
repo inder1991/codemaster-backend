@@ -1,0 +1,17 @@
+interactions:
+  - request:
+      method: GET
+      uri: https://api.github.com/repos/acme/example/issues/42
+      headers:
+        Accept: application/vnd.github+json
+        Authorization: Bearer <ghs-redacted>
+        X-GitHub-Api-Version: "2022-11-28"
+        If-None-Match: '"cached-etag"'
+    response:
+      status_code: 304
+      headers:
+        ETag: '"cached-etag"'
+        X-RateLimit-Limit: "5000"
+        X-RateLimit-Remaining: "4998"
+        X-RateLimit-Reset: "1799999999"
+      body: ""
