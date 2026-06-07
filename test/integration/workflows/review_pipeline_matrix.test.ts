@@ -69,6 +69,13 @@ import { ComputedPolicyRulesV1 } from "#contracts/policy_compute.v1.js";
 import { WorkspaceHandle } from "#contracts/workspace_handle.v1.js";
 import { PrFilesEnrichmentResultV1 } from "#contracts/pr_files_enrichment.v1.js";
 import { RetrievedEvidenceV1 } from "#contracts/retrieved_evidence.v1.js";
+// Dispatch-contract guard: the stubs `.parse()` their received input against these so this real-proxy test
+// also catches a camelCase/snake_case dispatch drift (parity with review_pipeline_composition.test.ts).
+import { ClassifyFilesInputV1 } from "#contracts/classify_files.v1.js";
+import { ChunkAndRedactInputV1 } from "#contracts/chunk_and_redact.v1.js";
+import { StaticAnalysisInputV1 } from "#contracts/static_analysis_input.v1.js";
+import { SelectCarryForwardInputV1 } from "#contracts/select_carry_forward_input.v1.js";
+import { AggregateFindingsInputV1 } from "#contracts/aggregate_findings.v1.js";
 import {
   ReviewPullRequestPayloadV1,
   ReviewPullRequestResultV1,
@@ -305,8 +312,9 @@ function makeStubActivities(
       calls.push("computePolicyRules");
       return ComputedPolicyRulesV1.parse({ bundles: {} });
     },
-    classifyFiles: async (): Promise<unknown> => {
+    classifyFiles: async (input: unknown): Promise<unknown> => {
       calls.push("classify");
+      ClassifyFilesInputV1.parse(input);
       return FileRoutingV1.parse({
         review_files: ["src/a.ts"],
         sandbox_files: [],
@@ -314,12 +322,14 @@ function makeStubActivities(
         classifier_failures: [],
       });
     },
-    chunkAndRedact: async (): Promise<unknown> => {
+    chunkAndRedact: async (input: unknown): Promise<unknown> => {
       calls.push("chunkAndRedact");
+      ChunkAndRedactInputV1.parse(input);
       return [THE_CHUNK];
     },
-    staticAnalysis: async (): Promise<unknown> => {
+    staticAnalysis: async (input: unknown): Promise<unknown> => {
       calls.push("staticAnalysis");
+      StaticAnalysisInputV1.parse(input);
       return StaticAnalysisResultV1.parse({});
     },
     // #6 carry-forward loader is ALWAYS dispatched now; with the env flag off it returns the empty set.
@@ -327,8 +337,9 @@ function makeStubActivities(
       parent_review_id: null,
       parent_findings: [],
     }),
-    selectCarryForward: async (): Promise<unknown> => {
+    selectCarryForward: async (input: unknown): Promise<unknown> => {
       calls.push("selectCarryForward");
+      SelectCarryForwardInputV1.parse(input);
       return CarryForwardSelectionV1.parse({
         carried: [],
         to_review: [THE_CHUNK],
@@ -354,12 +365,10 @@ function makeStubActivities(
         semantic_skipped: false,
       });
     },
-    aggregateFindings: async (input: {
-      findings?: ReadonlyArray<unknown>;
-      policyRevision?: number;
-    }): Promise<unknown> => {
+    aggregateFindings: async (input: unknown): Promise<unknown> => {
       calls.push("aggregate");
-      const findings = [...(input.findings ?? [])];
+      const parsed = AggregateFindingsInputV1.parse(input);
+      const findings = [...parsed.findings];
       return AggregatedFindingsV1.parse({
         findings,
         dedupe_stats: {
@@ -368,7 +377,7 @@ function makeStubActivities(
           semantic_merged: 0,
           capped: 0,
         },
-        policy_revision: input.policyRevision ?? 0,
+        policy_revision: parsed.policy_revision,
       });
     },
     persistReviewFindings: async (input: {

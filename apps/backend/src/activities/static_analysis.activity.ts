@@ -71,7 +71,7 @@ import {
 
 import type { AnalysisFindingV1 } from "#contracts/analysis_findings.v1.js";
 import type { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
-import type { StaticAnalysisInputV1 } from "#contracts/static_analysis_input.v1.js";
+import { StaticAnalysisInputV1 } from "#contracts/static_analysis_input.v1.js";
 import { StaticAnalysisResultV1 } from "#contracts/static_analysis_result.v1.js";
 import type { ToolStatusV1 } from "#contracts/tool_status.v1.js";
 import type { PrMetaV1 } from "#contracts/walkthrough.v1.js";
@@ -144,7 +144,11 @@ export class StaticAnalysisActivity {
    * Dispatch the static-analysis subsystem against the input envelope. Bound as an arrow property so
    * it stays wired when destructured into `buildActivities`'s registration map.
    */
-  public staticAnalysis = async (input: StaticAnalysisInputV1): Promise<StaticAnalysisResultV1> => {
+  public staticAnalysis = async (rawInput: StaticAnalysisInputV1): Promise<StaticAnalysisResultV1> => {
+    // Parse at the activity boundary: a wrong-shape dispatch (e.g. a camelCase key from a drifting caller)
+    // throws a clear ZodError here instead of silently reading `undefined`. Shadow `input` with the parsed
+    // (defaulted + validated) value so every downstream read uses it.
+    const input = StaticAnalysisInputV1.parse(rawInput);
     const files = input.sandbox_files;
     // 1. Empty-routing fast path — no runner fires; the default envelope is the faithful "nothing to
     //    analyze" answer (1:1 with the frozen Python `if not files: return StaticAnalysisResultV1()`).

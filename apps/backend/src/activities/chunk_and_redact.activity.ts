@@ -53,7 +53,7 @@ import { ChunkerRegistry } from "../chunking/selector.js";
 import { type HunkRange } from "../chunking/treesitter_python.js";
 
 import { computeChunkId, DiffChunkV1 } from "#contracts/diff_chunking.v1.js";
-import type { ChunkAndRedactInputV1 } from "#contracts/chunk_and_redact.v1.js";
+import { ChunkAndRedactInputV1 } from "#contracts/chunk_and_redact.v1.js";
 
 /** Platform path separator (resolved paths use it). Module-level so the traversal check reads cleanly. */
 const pathSep = process.platform === "win32" ? "\\" : "/";
@@ -199,11 +199,14 @@ export async function doChunkAndRedact(args: {
  * is process-wide so every registry shares the warm parsers), and delegates to {@link doChunkAndRedact}.
  */
 export async function chunkAndRedact(input: ChunkAndRedactInputV1): Promise<Array<DiffChunkV1>> {
+  // Parse at the activity boundary: a wrong-shape dispatch (e.g. a camelCase key from a drifting caller)
+  // throws a clear ZodError here instead of crashing in `resolve(undefined)` deeper in.
+  const parsed = ChunkAndRedactInputV1.parse(input);
   const registry = ChunkerRegistry.build();
   return doChunkAndRedact({
-    workspacePath: input.workspace_path,
-    files: input.files,
-    changedLineRanges: input.changed_line_ranges,
+    workspacePath: parsed.workspace_path,
+    files: parsed.files,
+    changedLineRanges: parsed.changed_line_ranges,
     registry,
   });
 }

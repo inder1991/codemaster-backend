@@ -38,7 +38,7 @@ import {
 import { aggregateSemantic } from "#backend/review/aggregation_semantic.js";
 
 import type { EmbeddingsPort } from "#backend/adapters/embeddings_port.js";
-import type { AggregateFindingsInputV1 } from "#contracts/aggregate_findings.v1.js";
+import { AggregateFindingsInputV1 } from "#contracts/aggregate_findings.v1.js";
 import type { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
 import type { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 
@@ -102,7 +102,9 @@ export async function doAggregate(
 export async function aggregateFindings(
   input: AggregateFindingsInputV1,
 ): Promise<AggregatedFindingsV1> {
-  return doAggregate(input.findings, input.policy_revision);
+  // Parse at the activity boundary: a wrong-shape dispatch throws a clear ZodError here (defense-in-depth).
+  const parsed = AggregateFindingsInputV1.parse(input);
+  return doAggregate(parsed.findings, parsed.policy_revision);
 }
 
 /**
@@ -127,6 +129,8 @@ export class AggregateFindingsActivity {
   public readonly aggregateFindings = async (
     input: AggregateFindingsInputV1,
   ): Promise<AggregatedFindingsV1> => {
-    return doAggregate(input.findings, input.policy_revision, this.embedder);
+    // Parse at the activity boundary: a wrong-shape dispatch throws a clear ZodError here (defense-in-depth).
+    const parsed = AggregateFindingsInputV1.parse(input);
+    return doAggregate(parsed.findings, parsed.policy_revision, this.embedder);
   };
 }

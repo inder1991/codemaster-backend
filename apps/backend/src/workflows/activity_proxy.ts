@@ -79,13 +79,13 @@ import type { ArbitrationResultV1 } from "#contracts/arbitration_result.v1.js";
 import type { RecordToolRunsInputV1 } from "#contracts/record_tool_runs_input.v1.js";
 import type { GenerateFixPromptInputV1 } from "#contracts/generate_fix_prompt.v1.js";
 import type { FixPromptActivityResultV1 } from "#contracts/fix_prompt_activity_result.v1.js";
-import type {
-  ClassifyInput,
-  ChunkAndRedactInput,
-  StaticAnalysisInput,
-  SelectCarryForwardInput,
-  AggregateInput,
-} from "#backend/review/pipeline/activity_ports.js";
+// The five former camelCase envelopes are gone — the proxy now declares each activity's input as its REAL
+// snake_case contract, the SAME shape the registered activity parses (no camel/snake fork at the seam).
+import type { ClassifyFilesInputV1 } from "#contracts/classify_files.v1.js";
+import type { ChunkAndRedactInputV1 } from "#contracts/chunk_and_redact.v1.js";
+import type { StaticAnalysisInputV1 } from "#contracts/static_analysis_input.v1.js";
+import type { SelectCarryForwardInputV1 } from "#contracts/select_carry_forward_input.v1.js";
+import type { AggregateFindingsInputV1 } from "#contracts/aggregate_findings.v1.js";
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // toActivityOptions — adapt a `RetryActivityOptions` (the load-bearing RETRY_POLICIES transcription, which
@@ -162,19 +162,19 @@ export function makeActivityPorts(): ReviewActivityPorts {
   }>(toActivityOptions(RETRY_POLICIES.computePolicyRules));
 
   const { classifyFiles } = proxyActivities<{
-    classifyFiles(input: ClassifyInput): Promise<FileRoutingV1>;
+    classifyFiles(input: ClassifyFilesInputV1): Promise<FileRoutingV1>;
   }>(toActivityOptions(RETRY_POLICIES.classify));
 
   const { chunkAndRedact } = proxyActivities<{
-    chunkAndRedact(input: ChunkAndRedactInput): Promise<ReadonlyArray<DiffChunkV1>>;
+    chunkAndRedact(input: ChunkAndRedactInputV1): Promise<ReadonlyArray<DiffChunkV1>>;
   }>(toActivityOptions(RETRY_POLICIES.chunkAndRedact));
 
   const { staticAnalysis } = proxyActivities<{
-    staticAnalysis(input: StaticAnalysisInput): Promise<StaticAnalysisResultV1>;
+    staticAnalysis(input: StaticAnalysisInputV1): Promise<StaticAnalysisResultV1>;
   }>(toActivityOptions(RETRY_POLICIES.staticAnalysis));
 
   const { selectCarryForward } = proxyActivities<{
-    selectCarryForward(input: SelectCarryForwardInput): Promise<CarryForwardSelectionV1>;
+    selectCarryForward(input: SelectCarryForwardInputV1): Promise<CarryForwardSelectionV1>;
   }>(toActivityOptions(RETRY_POLICIES.selectCarryForward));
 
   const { embedQuery } = proxyActivities<{
@@ -194,7 +194,7 @@ export function makeActivityPorts(): ReviewActivityPorts {
   }>(toActivityOptions(RETRY_POLICIES.dedupFindings));
 
   const { aggregateFindings } = proxyActivities<{
-    aggregateFindings(input: AggregateInput): Promise<AggregatedFindingsV1>;
+    aggregateFindings(input: AggregateFindingsInputV1): Promise<AggregatedFindingsV1>;
   }>(toActivityOptions(RETRY_POLICIES.aggregate));
 
   const { persistReviewFindings } = proxyActivities<{

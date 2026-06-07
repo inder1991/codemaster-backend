@@ -203,8 +203,8 @@ function makeStub(o: StubOverrides = {}): RecordingStub {
       calls.push("selectCarryForward");
       return CarryForwardSelectionV1.parse({
         carried: [],
-        to_review: [...input.currentChunks],
-        parent_review_id: input.parentReviewId,
+        to_review: [...input.current_chunks],
+        parent_review_id: input.parent_review_id,
       });
     },
     embedQuery: async () => {
@@ -253,7 +253,7 @@ function makeStub(o: StubOverrides = {}): RecordingStub {
           semantic_merged: 0,
           capped: 0,
         },
-        policy_revision: input.policyRevision,
+        policy_revision: input.policy_revision,
       });
     },
     persistReviewFindings: async (input) => {

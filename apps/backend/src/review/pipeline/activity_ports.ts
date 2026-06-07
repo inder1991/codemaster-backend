@@ -25,7 +25,11 @@ import type { ClonedRepoV1 } from "#contracts/cloned_repo.v1.js";
 import type { CloneRepoIntoWorkspaceInput } from "#contracts/clone_repo_into_workspace_input.v1.js";
 import type { FileRoutingV1 } from "#contracts/file_routing.v1.js";
 import type { DiffChunkV1 } from "#contracts/diff_chunking.v1.js";
-import type { ChangedLineRange } from "#contracts/chunk_and_redact.v1.js";
+import type { ChangedLineRange, ChunkAndRedactInputV1 } from "#contracts/chunk_and_redact.v1.js";
+import type { ClassifyFilesInputV1 } from "#contracts/classify_files.v1.js";
+import type { StaticAnalysisInputV1 } from "#contracts/static_analysis_input.v1.js";
+import type { SelectCarryForwardInputV1 } from "#contracts/select_carry_forward_input.v1.js";
+import type { AggregateFindingsInputV1 } from "#contracts/aggregate_findings.v1.js";
 import type { StaticAnalysisResultV1 } from "#contracts/static_analysis_result.v1.js";
 import type { CarryForwardSelectionV1 } from "#contracts/carry_forward.v1.js";
 import type { EmbedQueryInputV1, EmbedQueryResultV1 } from "#contracts/embed_query.v1.js";
@@ -36,8 +40,7 @@ import type {
 import type { ReviewContextV1 } from "#contracts/review_context.v1.js";
 import type { ReviewChunkResponseV1 } from "#contracts/review_chunk_response.v1.js";
 import type { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
-import type { WalkthroughV1, PrMetaV1 } from "#contracts/walkthrough.v1.js";
-import type { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
+import type { WalkthroughV1 } from "#contracts/walkthrough.v1.js";
 import type { PostReviewInputV1 } from "#contracts/post_review_input.v1.js";
 import type { PostedReviewV1 } from "#contracts/posted_review.v1.js";
 import type { ReleaseWorkspaceInput } from "#contracts/release_workspace_input.v1.js";
@@ -71,43 +74,13 @@ import type { FixPromptActivityResultV1 } from "#contracts/fix_prompt_activity_r
 export type ChangedLineRanges = Readonly<Record<string, ReadonlyArray<ChangedLineRange>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// Per-activity input envelopes (finding 9). Some activities already have a single typed Pydantic/Zod
-// input (clone, embedQuery, retrieveKnowledge, reviewChunk, postReview, cleanup) — those reuse the
-// contract type directly. The remaining ones (classify, chunkAndRedact, staticAnalysis, selectCarryForward,
-// aggregate, generateWalkthrough, postCheckRun) dispatch via positional args=[...] in the Python; finding 9
-// collapses each into ONE typed envelope so the orchestrator never passes positional args. The field names
-// mirror the Python positional argument names at each dispatch site.
+// Per-activity inputs (finding 9): EVERY port takes its real snake_case `*InputV1` contract directly — the
+// SAME contract the registered activity parses. The earlier hand-rolled camelCase envelopes (ClassifyInput,
+// ChunkAndRedactInput, StaticAnalysisInput, SelectCarryForwardInput, AggregateInput) were DELETED: they were
+// a second, drifting shape that the proxyActivities() type bridge silently dispatched RAW (Temporal does NOT
+// translate object keys), so the activity read `input.workspace_path` = undefined and crashed at runtime.
+// One contract per dispatch seam — no camelCase/snake_case fork.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-export type ClassifyInput = {
-  workspacePath: string;
-  files: ReadonlyArray<string>;
-};
-
-export type ChunkAndRedactInput = {
-  workspacePath: string;
-  files: ReadonlyArray<string>;
-  ranges: ChangedLineRanges;
-};
-
-export type StaticAnalysisInput = {
-  workspacePath: string;
-  files: ReadonlyArray<string>;
-  ranges: ChangedLineRanges;
-  prMeta: PrMetaV1;
-};
-
-export type SelectCarryForwardInput = {
-  parentFindings: ReadonlyArray<ReviewFindingV1>;
-  currentChunks: ReadonlyArray<DiffChunkV1>;
-  changedLineRanges: ChangedLineRanges;
-  parentReviewId: string | null;
-};
-
-export type AggregateInput = {
-  findings: ReadonlyArray<ReviewFindingV1>;
-  policyRevision: number;
-};
 
 // `generateWalkthrough` + `postCheckRun` dispatch the REAL ported activity contracts
 // (GenerateWalkthroughInputV1 / PostCheckRunInputV1) rather than a hand-rolled envelope — the orchestrator
@@ -124,15 +97,15 @@ export type ReviewActivityPorts = {
   clone(input: CloneRepoIntoWorkspaceInput): Promise<ClonedRepoV1>;
   loadRepoConfig(input: LoadRepoConfigInputV1): Promise<CodemasterConfigV1>;
   computePolicyRules(input: ComputePolicyRulesInputV1): Promise<ComputedPolicyRulesV1>;
-  classify(input: ClassifyInput): Promise<FileRoutingV1>;
-  chunkAndRedact(input: ChunkAndRedactInput): Promise<ReadonlyArray<DiffChunkV1>>;
-  staticAnalysis(input: StaticAnalysisInput): Promise<StaticAnalysisResultV1>;
-  selectCarryForward(input: SelectCarryForwardInput): Promise<CarryForwardSelectionV1>;
+  classify(input: ClassifyFilesInputV1): Promise<FileRoutingV1>;
+  chunkAndRedact(input: ChunkAndRedactInputV1): Promise<ReadonlyArray<DiffChunkV1>>;
+  staticAnalysis(input: StaticAnalysisInputV1): Promise<StaticAnalysisResultV1>;
+  selectCarryForward(input: SelectCarryForwardInputV1): Promise<CarryForwardSelectionV1>;
   embedQuery(input: EmbedQueryInputV1): Promise<EmbedQueryResultV1>;
   retrieveKnowledge(input: RetrieveKnowledgeInputV1): Promise<RetrieveKnowledgeResultV1>;
   reviewChunk(input: ReviewContextV1): Promise<ReviewChunkResponseV1>;
   dedupFindings(input: DedupFindingsInputV1): Promise<DedupedFindingsV1>;
-  aggregate(input: AggregateInput): Promise<AggregatedFindingsV1>;
+  aggregate(input: AggregateFindingsInputV1): Promise<AggregatedFindingsV1>;
   persistReviewFindings(input: PersistReviewFindingsInputV1): Promise<ReadonlyArray<string>>;
   generateWalkthrough(input: GenerateWalkthroughInputV1): Promise<WalkthroughV1>;
   persistReviewWalkthrough(input: PersistReviewWalkthroughInputV1): Promise<void>;

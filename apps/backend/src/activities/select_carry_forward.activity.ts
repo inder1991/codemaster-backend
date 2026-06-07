@@ -45,7 +45,7 @@
 import type { CarryForwardSelectionV1 } from "#contracts/carry_forward.v1.js";
 import type { DiffChunkV1 } from "#contracts/diff_chunking.v1.js";
 import type { ReviewFindingV1 } from "#contracts/review_findings.v1.js";
-import type { SelectCarryForwardInputV1 } from "#contracts/select_carry_forward_input.v1.js";
+import { SelectCarryForwardInputV1 } from "#contracts/select_carry_forward_input.v1.js";
 
 /** The wire shape of `changed_line_ranges`: path → array of [start, end] inclusive line-range pairs. */
 type ChangedLineRanges = Readonly<Record<string, ReadonlyArray<readonly [number, number]>>>;
@@ -146,5 +146,7 @@ export function doSelectCarryForward(input: SelectCarryForwardInputV1): CarryFor
 export async function selectCarryForward(
   input: SelectCarryForwardInputV1,
 ): Promise<CarryForwardSelectionV1> {
-  return doSelectCarryForward(input);
+  // Parse at the activity boundary: a wrong-shape dispatch (e.g. a camelCase key from a drifting caller)
+  // throws a clear ZodError here instead of silently reading `undefined` downstream.
+  return doSelectCarryForward(SelectCarryForwardInputV1.parse(input));
 }

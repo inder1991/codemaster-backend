@@ -45,7 +45,7 @@ import { join } from "node:path";
 import { type FileClassifierPort, MagikaFileClassifier } from "#backend/files/magika_classifier.js";
 import { decideRoute } from "#backend/files/router.js";
 
-import type { ClassifyFilesInputV1 } from "#contracts/classify_files.v1.js";
+import { ClassifyFilesInputV1 } from "#contracts/classify_files.v1.js";
 import type { FileClassificationV1 } from "#contracts/file_classification.v1.js";
 import type { FileRoutingV1 } from "#contracts/file_routing.v1.js";
 
@@ -131,10 +131,13 @@ export async function doClassify(args: {
  * so every instance shares the single loaded model), and delegates to {@link doClassify}.
  */
 export async function classifyFiles(input: ClassifyFilesInputV1): Promise<FileRoutingV1> {
+  // Parse at the activity boundary: a wrong-shape dispatch (e.g. a camelCase key from a drifting caller)
+  // throws a clear ZodError here instead of silently reading `undefined` downstream.
+  const parsed = ClassifyFilesInputV1.parse(input);
   const classifier = new MagikaFileClassifier();
   return doClassify({
-    workspace: input.workspace_path,
-    files: input.files,
+    workspace: parsed.workspace_path,
+    files: parsed.files,
     classifier,
   });
 }
