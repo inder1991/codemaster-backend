@@ -20,8 +20,9 @@
  * `buildActivities()` constructs the real collaborators but the `*.fromDsn(...)` constructors build a
  * LAZY pool (no connection at construction), and the LlmClientCache + Vault wiring is deferred to first
  * `bedrockReviewChunk` invocation (the same production-deferred-Vault pattern the sibling post_* activities
- * use). So construction is cheap: it reads `CODEMASTER_PG_CORE_DSN` + `CODEMASTER_GITHUB_INSTALLATION_ID`
- * (+ `CODEMASTER_QWEN_DSN` for the embedder), which this test sets to dummy values; it never connects.
+ * use). So construction is cheap: it reads `CODEMASTER_PG_CORE_DSN` (+ `CODEMASTER_QWEN_DSN` for the
+ * embedder), which this test sets to dummy values; it never connects. Per-review routing: it NO LONGER
+ * reads `CODEMASTER_GITHUB_INSTALLATION_ID` (the per-PR id is threaded through each activity input).
  */
 
 import { readFileSync } from "node:fs";
@@ -137,13 +138,13 @@ const EXPECTED_ACTIVITY_NAMES = [
 
 describe("buildActivities() composition root", () => {
   // Snapshot + set dummy env so construction succeeds WITHOUT a DB connection or live Vault/GitHub. The
-  // DSN is a syntactically-valid Postgres DSN (lazy pool — never dialed); the installation id is a
-  // positive integer (the cloner + GitHub activities validate it as such); the Qwen DSN routes the
-  // embedder through the dev recording client sentinel (no Qwen round-trip).
+  // DSN is a syntactically-valid Postgres DSN (lazy pool — never dialed); the Qwen DSN routes the embedder
+  // through the dev recording client sentinel (no Qwen round-trip). Per-review routing: buildActivities() NO
+  // LONGER reads CODEMASTER_GITHUB_INSTALLATION_ID — the per-PR id is threaded through each activity input,
+  // so the composition root boots WITHOUT it (this DUMMY_ENV omits it deliberately as the regression guard).
   const SAVED: Record<string, string | undefined> = {};
   const DUMMY_ENV: Record<string, string> = {
     CODEMASTER_PG_CORE_DSN: "postgresql://codemaster:codemaster@localhost:5433/codemaster_test",
-    CODEMASTER_GITHUB_INSTALLATION_ID: "12345",
     CODEMASTER_QWEN_DSN: "stub://recording",
   };
 

@@ -207,29 +207,6 @@ function requireCoreDsn(): string {
   return dsn;
 }
 
-/**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID` (the numeric GitHub App installation id this pod
- * clones as). 1:1 with `post_check_run.activity.ts::readGithubInstallationId` (which mirrors the frozen
- * Python `_read_github_installation_id`). Static `process.env.X` access (no dynamic indexing).
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the worker composition root " +
-        "(the git cloner clones as this GitHub App installation). Set it to the numeric installation id.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`);
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
-}
-
 // ─── real git cloner (the cloneRepoIntoWorkspace production deps) ─────────────────────────────────
 
 /**
@@ -326,9 +303,11 @@ function makeLazyIssueClient(): GithubIssuePortShape {
 
 // ─── lazy GitHubApiReviewClient (the fix-prompt advisory-comment seam — deferred-Vault) ───────────
 
-/** The `createIssueComment` slice the FixPromptActivities consumes (1:1 with its FixPromptIssueCommentClient). */
+/** The `createIssueComment` slice the FixPromptActivities consumes (1:1 with its FixPromptIssueCommentClient).
+ *  `installationId` is PER-CALL (per-review routing) — the seam is no longer bound to one installation. */
 type FixPromptIssueCommentClientShape = {
   createIssueComment(args: {
+    installationId: number;
     owner: string;
     repo: string;
     prNumber: number;
@@ -337,39 +316,40 @@ type FixPromptIssueCommentClientShape = {
 };
 
 /**
- * Build the REAL {@link GitHubApiReviewClient} for `generateFixPrompt`'s advisory PR-comment seam — the SAME
- * wiring `post_review_placeholder` / `post_review_results` use (Vault token provider → GitHubApiClient →
- * wrapped client). The fix-prompt activity only ever calls `createIssueComment`, so the wrapped client
- * satisfies its loose {@link FixPromptIssueCommentClientShape}. Deferred to the first comment post (async
- * `fromEnv`-build) so worker boot stays off `VAULT_ADDR` / GitHub round-trips.
+ * Build the REAL {@link GitHubApiClient} for `generateFixPrompt`'s advisory PR-comment seam — the SAME
+ * Vault token provider → GitHubApiClient wiring `post_review_results` uses. Installation-agnostic
+ * (per-review routing): the per-PR id is supplied PER-CALL, so the thin {@link GitHubApiReviewClient}
+ * wrapper is built per comment with the call's installation id (the expensive token provider + api are
+ * memoized). Deferred to the first comment post (async `fromEnv`-build) so worker boot stays off
+ * `VAULT_ADDR` / GitHub round-trips.
  */
-async function buildFixPromptReviewClient(githubInstallationId: number): Promise<GitHubApiReviewClient> {
+async function buildFixPromptApi(): Promise<GitHubApiClient> {
   const clock = new WallClock();
   const githubHttp = new FetchGitHubHttpClient({});
   const vault = VaultHttpPort.fromEnv();
   const tokenProvider = await GitHubAppTokenProvider.fromEnv({ vault, http: githubHttp, clock });
-  const api = new GitHubApiClient({
+  return new GitHubApiClient({
     tokenProvider: tokenProvider.getToken.bind(tokenProvider),
     http: githubHttp,
     clock,
   });
-  return new GitHubApiReviewClient({ api, installationId: githubInstallationId });
 }
 
 /**
- * A {@link FixPromptIssueCommentClientShape} that builds the real {@link GitHubApiReviewClient} on first
- * `createIssueComment` (the deferred-Vault pattern) and memoizes it. A faithful, fully-real client seam —
- * construction is deferred to the moment a fix-prompt advisory comment actually posts.
+ * A {@link FixPromptIssueCommentClientShape} that builds the real {@link GitHubApiClient} on first
+ * `createIssueComment` (the deferred-Vault pattern) and memoizes it, then wraps it in a thin
+ * {@link GitHubApiReviewClient} PER-CALL bound to the call's installation id (per-review routing — one seam
+ * serves every org). A faithful, fully-real client seam.
  */
-function makeLazyFixPromptIssueClient(githubInstallationId: number): FixPromptIssueCommentClientShape {
-  let memo: Promise<GitHubApiReviewClient> | undefined;
+function makeLazyFixPromptIssueClient(): FixPromptIssueCommentClientShape {
+  let memo: Promise<GitHubApiClient> | undefined;
   return {
-    createIssueComment: async (args) => {
+    createIssueComment: async ({ installationId, ...rest }) => {
       if (memo === undefined) {
-        memo = buildFixPromptReviewClient(githubInstallationId);
+        memo = buildFixPromptApi();
       }
-      const client = await memo;
-      return client.createIssueComment(args);
+      const api = await memo;
+      return new GitHubApiReviewClient({ api, installationId }).createIssueComment(rest);
     },
   };
 }
@@ -485,7 +465,9 @@ function makeLazyManifestContentsClient(): GithubContentsPort {
 
 export function buildActivities(): Record<string, (input: never) => Promise<unknown>> {
   const dsn = requireCoreDsn();
-  const githubInstallationId = readGithubInstallationId();
+  // Per-review routing: the worker composition root NO LONGER reads CODEMASTER_GITHUB_INSTALLATION_ID. Every
+  // GitHub-touching activity (clone, post, check-run, fix-prompt, pr-description) resolves the per-PR numeric
+  // installation id from its typed input; the cloner + fix-prompt seam mint per-call. One pod serves all orgs.
 
   // The real platform embedder (Qwen / OpenAI-compat per ADR-0059; fail-loud on missing env). Shared by
   // the aggregate semantic-merge stage, the embed_query activity, and the retrieve-knowledge ANN port.
@@ -550,7 +532,7 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
   const fixPromptActivities = new FixPromptActivities({
     cache: llmCache,
     repo: FixPromptRepo.fromDsn(dsn),
-    gh: makeLazyFixPromptIssueClient(githubInstallationId),
+    gh: makeLazyFixPromptIssueClient(),
     clock,
   });
 

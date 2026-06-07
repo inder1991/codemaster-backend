@@ -9,8 +9,8 @@
  * EVERY activity into a 1-arg Temporal activity — closing both the missing-activities gap and the
  * 2-arg-crash class.
  *
- * `buildActivities()` reads env (`CODEMASTER_PG_CORE_DSN`, `CODEMASTER_GITHUB_INSTALLATION_ID`, the
- * embedder vars) and constructs LAZY pools / deferred-Vault wiring, so calling it at module load would
+ * `buildActivities()` reads env (`CODEMASTER_PG_CORE_DSN`, the embedder vars) and constructs LAZY pools /
+ * deferred-Vault wiring, so calling it at module load would
  * couple any importer to those env reads. The worker bootstrap (`main.ts`) therefore calls
  * `buildActivities()` itself at `runWorker()` time (when the env is populated). This module re-exports the
  * composition root so the bootstrap + any bundle self-check stay decoupled from the individual activity

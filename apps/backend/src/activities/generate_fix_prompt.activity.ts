@@ -57,6 +57,9 @@ import type { GenerateFixPromptInputV1 } from "#contracts/generate_fix_prompt.v1
  */
 export type FixPromptIssueCommentClient = {
   createIssueComment(args: {
+    // Per-review routing: the numeric GitHub installation id the advisory comment posts under (per-call,
+    // NOT bound at construction). DISTINCT from payload.installation_id (the internal UUID used for persist).
+    installationId: number;
     owner: string;
     repo: string;
     prNumber: number;
@@ -126,17 +129,25 @@ export class FixPromptActivities {
     // the post itself stays best-effort.
     const commentBody = renderFixPromptComment(record.prompt);
     let posted = false;
-    try {
-      await this.gh.createIssueComment({
-        owner: payload.owner,
-        repo: payload.repo,
-        prNumber: payload.pr_number,
-        body: commentBody,
-      });
-      posted = true;
-    } catch {
-      // Advisory post; never fail the review. The persisted record still serves the API/UI. 1:1 with the
-      // Python bare `except Exception:` (which warns + continues; the WARN log is an off-observable side-effect).
+    // Per-review routing: the advisory comment posts under the per-PR numeric installation id from the input.
+    // Best-effort — a null id (a synthetic/legacy trigger) simply skips the comment; the persisted fix-prompt
+    // record still serves the API/UI. The post itself stays inside the swallow (a GitHub failure never fails
+    // the review).
+    const ghInstallationId = payload.github_installation_id;
+    if (ghInstallationId !== null) {
+      try {
+        await this.gh.createIssueComment({
+          installationId: ghInstallationId,
+          owner: payload.owner,
+          repo: payload.repo,
+          prNumber: payload.pr_number,
+          body: commentBody,
+        });
+        posted = true;
+      } catch {
+        // Advisory post; never fail the review. The persisted record still serves the API/UI. 1:1 with the
+        // Python bare `except Exception:` (which warns + continues; the WARN log is an off-observable side-effect).
+      }
     }
 
     return FixPromptActivityResultV1.parse({

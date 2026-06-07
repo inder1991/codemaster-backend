@@ -281,11 +281,15 @@ class FakeRepo {
   }
 }
 
-/** A fake issue-comment client recording every posted comment. */
+/** The per-review numeric GitHub installation id threaded through the input (per-review routing). */
+const GH_INSTALLATION_ID = 4815162342;
+
+/** A fake issue-comment client recording every posted comment (incl. the per-call installation id). */
 class FakeGh implements FixPromptIssueCommentClient {
-  public posted: Array<{ owner: string; repo: string; prNumber: number; body: string }> = [];
+  public posted: Array<{ installationId: number; owner: string; repo: string; prNumber: number; body: string }> = [];
   public throwOnPost = false;
   async createIssueComment(args: {
+    installationId: number;
     owner: string;
     repo: string;
     prNumber: number;
@@ -303,6 +307,7 @@ function input(findings: ReadonlyArray<Record<string, unknown>>): GenerateFixPro
   return GenerateFixPromptInputV1.parse({
     review_id: REVIEW_ID,
     installation_id: INSTALLATION_ID,
+    github_installation_id: GH_INSTALLATION_ID,
     pr_number: 77,
     owner: "acme",
     repo: "widget",
@@ -340,6 +345,11 @@ describe("FixPromptActivities.generateFixPrompt", () => {
     expect(result.generated).toBe(true);
     expect(result.generation_mode).toBe("llm");
     expect(result.comment_posted).toBe(true);
+
+    // Per-review routing: the advisory comment posted under the input's NUMERIC github_installation_id (not
+    // a pod-wide env id, and NOT the internal UUID installation_id used for the persist below).
+    expect(gh.posted).toHaveLength(1);
+    expect(gh.posted[0]?.installationId).toBe(GH_INSTALLATION_ID);
 
     // Persisted exactly once, tenancy-scoped, with the built prompt.
     expect(repo.persisted).toHaveLength(1);
