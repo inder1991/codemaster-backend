@@ -35,6 +35,8 @@ import {
   NotificationRuleV1,
   OrgsListV1,
   PullRequestListResponseV1,
+  RetrievalAggregatePRListV1,
+  RetrievalAggregateV1,
   RetrievalTraceListPageV1,
   ReviewsListPageV1,
   TaxonomyGapListV1,
@@ -49,6 +51,12 @@ import {
   getGeneration,
 } from "#backend/api/admin/embedder_read.js";
 import { buildMembersPage } from "#backend/api/admin/members_read.js";
+import {
+  RetrievalAggregateDataIntegrityError,
+  RetrievalAggregateTraceNotFoundError,
+  getByReview,
+  listByPr,
+} from "#backend/api/admin/retrieval_aggregate_read.js";
 import {
   getRetrievalTrace,
   listRetrievalTraces,
@@ -250,6 +258,58 @@ export async function registerAdminRoutes(
           return reply.code(404).send({ detail: { code: "trace_not_found", trace_id: traceId } });
         }
         return reply.code(200).send(trace);
+      },
+    );
+
+    scope.get(
+      "/api/admin/retrieval-aggregates/reviews/:review_id",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const reviewId = (request.params as { review_id: string }).review_id;
+        if (!UUID_RE.test(reviewId)) {
+          return reply.code(422).send({ detail: "review_id must be a UUID" });
+        }
+        try {
+          const agg = await getByReview(opts.db, reviewId);
+          return reply.code(200).send(RetrievalAggregateV1.parse(agg));
+        } catch (e) {
+          if (e instanceof RetrievalAggregateTraceNotFoundError) {
+            return reply
+              .code(404)
+              .send({ detail: { code: "review_traces_not_found", review_id: reviewId } });
+          }
+          if (e instanceof RetrievalAggregateDataIntegrityError) {
+            return reply
+              .code(500)
+              .send({ detail: { code: "data_integrity_error", kind: e.kind, details: e.details } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.get(
+      "/api/admin/retrieval-aggregates/pull-requests/:pr_id",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const prId = (request.params as { pr_id: string }).pr_id;
+        if (!UUID_RE.test(prId)) {
+          return reply.code(422).send({ detail: "pr_id must be a UUID" });
+        }
+        try {
+          const page = await listByPr(opts.db, prId);
+          return reply.code(200).send(RetrievalAggregatePRListV1.parse(page));
+        } catch (e) {
+          if (e instanceof RetrievalAggregateTraceNotFoundError) {
+            return reply.code(404).send({ detail: { code: "pr_traces_not_found", pr_id: prId } });
+          }
+          if (e instanceof RetrievalAggregateDataIntegrityError) {
+            return reply
+              .code(500)
+              .send({ detail: { code: "data_integrity_error", kind: e.kind, details: e.details } });
+          }
+          throw e;
+        }
       },
     );
 

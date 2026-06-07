@@ -667,3 +667,86 @@ export const RetrievalTraceListPageV1 = z
   })
   .strict();
 export type RetrievalTraceListPageV1 = z.infer<typeof RetrievalTraceListPageV1>;
+
+// ─── Retrieval aggregates (GET /api/admin/retrieval-aggregates/{reviews,pull-requests}) ──────────────
+// 1:1 with contracts/admin/retrieval_aggregate/v1.py. metadata_as_of comes from
+// `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` (a NAIVE timestamp string, no offset) so its datetime() guard
+// permits both offset-bearing and local (offset-less) forms. captured-at fields are timestamptz → offset.
+
+/** Lenient ISO-datetime guard: accepts Z, ±offset, or naive (the metadata_as_of / DB-emitted forms). */
+const aggregateTs = () => z.string().datetime({ offset: true, local: true });
+
+/** GET /api/admin/retrieval-aggregates/reviews/{review_id} — per-review historical rollup + meta snapshot. */
+export const RetrievalAggregateV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    aggregate_snapshot_kind: z.literal("historical_review_scoped"),
+    metadata_as_of: aggregateTs(),
+    aggregation_scope: z.enum(["review_scoped"]),
+    lineage_confidence: z.enum(["exact", "mixed_run_possible"]),
+    lineage_warning: z.string().nullable().default(null),
+    review_id: z.string().uuid(),
+    pr_id: z.string().uuid(),
+    pr_number: z.number().int(),
+    installation_id: z.string().uuid(),
+    repository_id: z.string().uuid(),
+    repo_full_name: z.string(),
+    latest_run_id: z.string().uuid().nullable().default(null),
+    latest_run_lifecycle_state: z.string().nullable().default(null),
+    latest_run_terminal_reason: z.string().nullable().default(null),
+    superseded_run_count: z.number().int().min(0),
+    pr_current_head_sha: z.string(),
+    total_trace_count: z.number().int().min(0),
+    returned_trace_count: z.number().int().min(0),
+    parsed_trace_count: z.number().int().min(0),
+    invalid_trace_count: z.number().int().min(0),
+    trace_count_truncated: z.boolean(),
+    earliest_captured_at: aggregateTs().nullable().default(null),
+    latest_captured_at: aggregateTs().nullable().default(null),
+    starvation_any: z.boolean(),
+    starvation_trace_count: z.number().int().min(0),
+    effective_labels_union: z.array(z.string()).max(500).default([]),
+    pipeline_versions_seen: z.array(z.number().int()).default([]),
+    taxonomy_versions_seen: z.array(z.number().int()).default([]),
+    version_drift_detected: z.boolean(),
+    top_spaces_retrieved: z.array(z.string()).max(5).default([]),
+    top_labels_retrieved: z.array(z.string()).max(5).default([]),
+  })
+  .strict();
+export type RetrievalAggregateV1 = z.infer<typeof RetrievalAggregateV1>;
+
+/** One per-review summary in the by-PR list. */
+export const RetrievalAggregatePRReviewSummaryV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    review_id: z.string().uuid(),
+    earliest_captured_at: aggregateTs().nullable().default(null),
+    latest_captured_at: aggregateTs().nullable().default(null),
+    trace_count: z.number().int().min(0),
+    starvation_any: z.boolean(),
+    starvation_trace_count: z.number().int().min(0),
+    latest_run_id: z.string().uuid().nullable().default(null),
+    latest_run_lifecycle_state: z.string().nullable().default(null),
+    superseded_run_count: z.number().int().min(0).default(0),
+  })
+  .strict();
+export type RetrievalAggregatePRReviewSummaryV1 = z.infer<typeof RetrievalAggregatePRReviewSummaryV1>;
+
+/** GET /api/admin/retrieval-aggregates/pull-requests/{pr_id} — every review with traces for the PR. */
+export const RetrievalAggregatePRListV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    pr_id: z.string().uuid(),
+    pr_number: z.number().int(),
+    installation_id: z.string().uuid(),
+    repository_id: z.string().uuid(),
+    repo_full_name: z.string(),
+    pr_current_head_sha: z.string(),
+    metadata_as_of: aggregateTs(),
+    reviews: z.array(RetrievalAggregatePRReviewSummaryV1).max(500).default([]),
+    total_review_count: z.number().int().min(0),
+    returned_review_count: z.number().int().min(0),
+    review_count_truncated: z.boolean(),
+  })
+  .strict();
+export type RetrievalAggregatePRListV1 = z.infer<typeof RetrievalAggregatePRListV1>;
