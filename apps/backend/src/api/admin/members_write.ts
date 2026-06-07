@@ -284,7 +284,10 @@ export async function rejectChange(
 /** Optional audit-emit callback. Shape mirrors the Python AuditEmitPort.emit kwargs. */
 export type MemberAuditEmitter = (e: {
   actorUserId: string;
-  installationId: string;
+  // string | null — platform-scope admin actions (e.g. integrations DELETE on the platform-shared
+  // core.integrations table) emit a NULL installation_id (audit_events.installation_id is nullable per
+  // migration 0062). Member flows always pass a concrete installation id; the widening is for those callers.
+  installationId: string | null;
   action: string;
   targetKind: string;
   targetId: string;

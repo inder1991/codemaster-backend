@@ -124,6 +124,7 @@ import {
   TypedConfirmRequiredError,
   typedConfirmPhraseFor,
 } from "#backend/api/admin/flags_write.js";
+import { deleteIntegration, IntegrationNotFoundError } from "#backend/api/admin/integrations_write.js";
 import { insertTaxonomySuggestion } from "#backend/api/admin/taxonomy_write.js";
 import {
   getRetrievalTrace,
@@ -772,6 +773,32 @@ export async function registerAdminRoutes(
             return reply.code(400).send({ detail: "invalid cursor" });
           }
           throw e;
+        }
+      },
+    );
+
+    scope.delete(
+      "/api/admin/integrations/:integration_id",
+      { preHandler: requireRole(["platform_owner", "super_admin"]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const integrationId = (request.params as { integration_id: string }).integration_id;
+        if (!UUID_RE.test(integrationId)) {
+          return reply.code(422).send({ detail: "integration_id must be a uuid" });
+        }
+        try {
+          await deleteIntegration(opts.db, {
+            integrationId,
+            actorUserId: principal.userId,
+            now: opts.clock.now(),
+            audit: opts.audit,
+          });
+          return reply.code(204).send();
+        } catch (err) {
+          if (err instanceof IntegrationNotFoundError) {
+            return reply.code(404).send({ detail: "integration not found" });
+          }
+          throw err;
         }
       },
     );

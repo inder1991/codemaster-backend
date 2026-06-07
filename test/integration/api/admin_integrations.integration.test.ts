@@ -74,17 +74,29 @@ async function makeApp() {
 
 describeDb("admin integrations (disposable :5434)", () => {
   it("listIntegrationsPage: created_at-DESC keyset, config_json is a raw string, cursor paginates", async () => {
-    const all = await listIntegrationsPage(db, null, 50);
-    expect(all.rows.map((r) => r.integration_id)).toEqual([I3, I2, I1]);
-    expect(typeof all.rows[0]?.config_json).toBe("string");
-    expect(all.rows[0]?.config_json).toContain("GAMMA");
+    // core.integrations is PLATFORM-SHARED (no installation_id) so concurrent integrations tests (e.g.
+    // admin_integrations_delete) coexist in the same table — assert only over THIS test's own rows.
+    const MINE = new Set([I1, I2, I3]);
+    const mine = (ids: Array<string>): Array<string> => ids.filter((id) => MINE.has(id));
 
-    const page1 = await listIntegrationsPage(db, null, 2);
-    expect(page1.rows.map((r) => r.integration_id)).toEqual([I3, I2]);
-    expect(page1.nextCursor).not.toBeNull();
-    const page2 = await listIntegrationsPage(db, page1.nextCursor, 2);
-    expect(page2.rows.map((r) => r.integration_id)).toEqual([I1]);
-    expect(page2.nextCursor).toBeNull();
+    // Full list: own rows surface newest-first (created_at DESC); config_json comes back as a raw string.
+    const all = await listIntegrationsPage(db, null, 500);
+    expect(mine(all.rows.map((r) => r.integration_id))).toEqual([I3, I2, I1]);
+    const i3 = all.rows.find((r) => r.integration_id === I3);
+    expect(typeof i3?.config_json).toBe("string");
+    expect(i3?.config_json).toContain("GAMMA");
+
+    // Cursor paginates with no gaps/dupes: page through the whole table (size 2) and assert this test's
+    // rows surface exactly once each, in created_at DESC order, and that pagination terminates.
+    const seen: Array<string> = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 5000; guard++) {
+      const page: Awaited<ReturnType<typeof listIntegrationsPage>> = await listIntegrationsPage(db, cursor, 2);
+      seen.push(...page.rows.map((r) => r.integration_id));
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
+    }
+    expect(mine(seen)).toEqual([I3, I2, I1]);
   });
 
   it("GET /api/admin/integrations — 200, bad cursor → 400, authz", async () => {
