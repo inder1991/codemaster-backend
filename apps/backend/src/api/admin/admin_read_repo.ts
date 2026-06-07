@@ -7,6 +7,7 @@ import { type Kysely, sql } from "kysely";
 import type {
   FindingRowV1,
   FlagDetailV1,
+  IntegrationListItemV1,
   LlmModelV1,
   LlmProviderConfigV1,
   LlmPurposeModelV1,
@@ -15,6 +16,7 @@ import type {
   TaxonomyGapEntryV1,
 } from "#contracts/admin.v1.js";
 
+import { keysetSlice } from "#backend/api/admin/_keyset_cursor.js";
 import { SUPER_ADMIN_PLATFORM_VIEW_UUID } from "#backend/infra/sentinels.js";
 
 /**
@@ -155,6 +157,65 @@ export async function searchReviews(
   }));
   const total = r.rows.length > 0 ? Number(r.rows[0]!.total_count) : 0;
   return { items, total };
+}
+
+// ─── Integrations (platform-scope; in-memory keyset over all rows) ────────────────────────────────
+
+type IntegrationDbRow = {
+  integration_id: string;
+  kind: "confluence_space";
+  config_json: string; // config_json::text
+  enabled: boolean;
+  last_validated_at: Date | null;
+  last_validation_error: string | null;
+  created_at: Date;
+  updated_at: Date;
+  trust_tier: "trusted" | "semi" | null;
+  default_governance_ack_at: Date | null;
+  visibility: string;
+  strict_label_mode: boolean;
+};
+
+function mapIntegration(row: IntegrationDbRow): IntegrationListItemV1 {
+  return {
+    integration_id: row.integration_id,
+    kind: row.kind,
+    config_json: row.config_json,
+    enabled: row.enabled,
+    last_validated_at: row.last_validated_at === null ? null : new Date(row.last_validated_at).toISOString(),
+    last_validation_error: row.last_validation_error,
+    created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+    trust_tier: row.trust_tier,
+    default_governance_ack_at:
+      row.default_governance_ack_at === null ? null : new Date(row.default_governance_ack_at).toISOString(),
+    visibility: row.visibility,
+    strict_label_mode: row.strict_label_mode,
+  };
+}
+
+/** GET /api/admin/integrations — all integrations, paginated in-memory by the (created_at, integration_id)
+ *  keyset (1:1 with the Python's fetch-all + _apply_keyset_slice_integrations). size clamped to [1, 200]. */
+export async function listIntegrationsPage(
+  db: Kysely<unknown>,
+  cursor: string | null,
+  size: number,
+): Promise<{ rows: Array<IntegrationListItemV1>; nextCursor: string | null }> {
+  const clamped = Math.min(Math.max(size, 1), 200);
+  const r = await sql<IntegrationDbRow>`
+    SELECT integration_id, kind, config_json::text AS config_json, enabled, last_validated_at,
+           last_validation_error, created_at, updated_at, trust_tier, default_governance_ack_at,
+           visibility, strict_label_mode
+    FROM core.integrations ORDER BY created_at DESC
+  `.execute(db);
+  const all = r.rows.map(mapIntegration);
+  const { page, nextCursor } = keysetSlice(
+    all,
+    (row) => ({ ts: row.created_at, id: row.integration_id }),
+    cursor,
+    clamped,
+  );
+  return { rows: page, nextCursor };
 }
 
 // ─── Notification rules (platform-scope; no installation_id column post-migration-0061) ───────────

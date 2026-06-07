@@ -18,6 +18,7 @@ import {
   DashboardSummaryV1,
   FindingListResponseV1,
   FlagListV1,
+  IntegrationListPageV1,
   LlmModelListV1,
   LlmProviderConfigV1,
   LlmPurposeModelListV1,
@@ -29,11 +30,13 @@ import {
   TaxonomyGapListV1,
 } from "#contracts/admin.v1.js";
 
+import { CursorInvalidError } from "#backend/api/admin/_keyset_cursor.js";
 import {
   getLlmProviderConfig,
   getNotificationRule,
   listFindings,
   listFlags,
+  listIntegrationsPage,
   listLlmModels,
   listLlmPurposeModels,
   listNotificationRules,
@@ -121,6 +124,24 @@ export async function registerAdminRoutes(
       async (request, reply) => {
         const orgs = await listOrgs(opts.db, request.authPrincipal!.installationId);
         return reply.code(200).send(OrgsListV1.parse({ orgs }));
+      },
+    );
+
+    scope.get(
+      "/api/admin/integrations",
+      { preHandler: requireRole([...READER_ROLES]) },
+      async (request, reply) => {
+        const q = request.query as AdminQuery;
+        const size = clampLimit(q.size, 50, 200);
+        try {
+          const { rows, nextCursor } = await listIntegrationsPage(opts.db, optStr(q.cursor), size);
+          return reply.code(200).send(IntegrationListPageV1.parse({ rows, next_cursor: nextCursor }));
+        } catch (e) {
+          if (e instanceof CursorInvalidError) {
+            return reply.code(400).send({ detail: "invalid cursor" });
+          }
+          throw e;
+        }
       },
     );
 

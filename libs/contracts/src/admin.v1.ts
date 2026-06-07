@@ -22,6 +22,35 @@ export const OrgsListV1 = z
   .strict();
 export type OrgsListV1 = z.infer<typeof OrgsListV1>;
 
+// ─── Integrations (platform-scope; in-memory keyset pagination) ──────────────────────────────────
+
+/** One integration in GET /api/admin/integrations (config_json kept as an opaque raw JSON string). */
+export const IntegrationListItemV1 = z
+  .object({
+    integration_id: z.string().uuid(),
+    kind: z.literal("confluence_space"),
+    config_json: z.string(),
+    enabled: z.boolean(),
+    last_validated_at: z.string().datetime({ offset: true }).nullable().default(null),
+    last_validation_error: z.string().nullable().default(null),
+    created_at: z.string().datetime({ offset: true }),
+    updated_at: z.string().datetime({ offset: true }),
+    trust_tier: z.enum(["trusted", "semi"]).nullable().default(null),
+    default_governance_ack_at: z.string().datetime({ offset: true }).nullable().default(null),
+    visibility: z.string().default("platform"),
+    strict_label_mode: z.boolean().default(false),
+  })
+  .strict();
+export type IntegrationListItemV1 = z.infer<typeof IntegrationListItemV1>;
+
+export const IntegrationListPageV1 = z
+  .object({
+    rows: z.array(IntegrationListItemV1),
+    next_cursor: z.string().nullable().default(null),
+  })
+  .strict();
+export type IntegrationListPageV1 = z.infer<typeof IntegrationListPageV1>;
+
 // ─── Notification rules (platform-scope) ─────────────────────────────────────────────────────────
 
 const SlackRecipientV1 = z
