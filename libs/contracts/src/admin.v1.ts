@@ -489,3 +489,55 @@ export const DashboardSummaryV1 = z
   })
   .strict();
 export type DashboardSummaryV1 = z.infer<typeof DashboardSummaryV1>;
+
+// ─── Members (GET /api/admin/members) ──────────────────────────────────────────────────────────────
+// 1:1 with contracts/admin/members/v1.py. The role enum mirrors core.role_grants (ADR-0023 reduced
+// shape: super_admin lives in core.local_users, NOT this enum). schema_version is 2 on the row
+// contracts, 1 on the page envelope — matching the Python literals exactly.
+
+/** One active role grant joined to core.users. `granted_by_user_id` is nullable (see members_read.ts —
+ *  the production core.role_grants has no granter column, so the port emits null). */
+export const MemberV1 = z
+  .object({
+    schema_version: z.literal(2).default(2),
+    user_id: z.string().uuid(),
+    email: z.string(),
+    display_name: z.string(),
+    role: z.enum(["platform_owner", "platform_operator", "reader"]),
+    granted_at: z.string().datetime({ offset: true }),
+    granted_by_user_id: z.string().uuid().nullable().default(null),
+    scope: z.enum(["platform", "installation"]).default("installation"),
+  })
+  .strict();
+export type MemberV1 = z.infer<typeof MemberV1>;
+
+/** One queued grant/revoke from core.role_grant_pending awaiting a second-user approval. */
+export const RoleChangePendingV1 = z
+  .object({
+    schema_version: z.literal(2).default(2),
+    pending_id: z.string().uuid(),
+    subject_kind: z.enum(["user", "team"]),
+    subject_id: z.string().uuid(),
+    role: z.enum(["platform_owner", "platform_operator", "reader"]),
+    action: z.enum(["grant", "revoke"]),
+    requested_at: z.string().datetime({ offset: true }),
+    requested_by_user_id: z.string().uuid(),
+    expires_at: z.string().datetime({ offset: true }),
+    approved_at: z.string().datetime({ offset: true }).nullable().default(null),
+    approved_by_user_id: z.string().uuid().nullable().default(null),
+    applied_at: z.string().datetime({ offset: true }).nullable().default(null),
+    state: z.enum(["pending", "approved", "applied", "rejected", "expired"]),
+    scope: z.enum(["platform", "installation"]).default("installation"),
+  })
+  .strict();
+export type RoleChangePendingV1 = z.infer<typeof RoleChangePendingV1>;
+
+/** GET /api/admin/members — active members + every in-flight pending change in one round-trip. */
+export const MembersPageV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    members: z.array(MemberV1),
+    pending_changes: z.array(RoleChangePendingV1),
+  })
+  .strict();
+export type MembersPageV1 = z.infer<typeof MembersPageV1>;

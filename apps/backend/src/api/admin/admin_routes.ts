@@ -12,6 +12,7 @@ import { type Kysely } from "kysely";
 import type { FastifyInstance } from "fastify";
 
 import type { Clock } from "#platform/clock.js";
+import type { KeyRegistry } from "#platform/crypto/key_registry.js";
 
 import {
   AuditSearchResponseV1,
@@ -26,6 +27,7 @@ import {
   LlmModelListV1,
   LlmProviderConfigV1,
   LlmPurposeModelListV1,
+  MembersPageV1,
   NotificationRulesPageV1,
   NotificationRuleV1,
   OrgsListV1,
@@ -37,6 +39,7 @@ import {
 import { CursorInvalidError } from "#backend/api/admin/_keyset_cursor.js";
 import { CostCapSettingsMissingError, buildCostCapsPage } from "#backend/api/admin/cost_caps_read.js";
 import { buildDefaultCorpusHealth } from "#backend/api/admin/default_corpus_read.js";
+import { buildMembersPage } from "#backend/api/admin/members_read.js";
 import {
   getLearningWithRevisions,
   getLlmProviderConfig,
@@ -97,6 +100,9 @@ export type AdminRoutesOptions = {
   db: Kysely<unknown>;
   signingKey: Buffer | Uint8Array;
   clock: Clock;
+  /** Field-encryption registry for decrypting core.users.email in the members read. server.ts always
+   *  provides it; the field is optional only so endpoint tests that don't exercise members need no crypto. */
+  registry?: KeyRegistry;
 };
 
 /** The static dashboard summary (1:1 with the shipped Python: _HealthyProbe for the 4 services +
@@ -132,6 +138,30 @@ export async function registerAdminRoutes(
       async (request, reply) => {
         const orgs = await listOrgs(opts.db, request.authPrincipal!.installationId);
         return reply.code(200).send(OrgsListV1.parse({ orgs }));
+      },
+    );
+
+    scope.get(
+      "/api/admin/members",
+      { preHandler: requireRole(["super_admin", "platform_owner"]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const installationId = optStr((request.query as AdminQuery).installation_id);
+        if (installationId === null || !UUID_RE.test(installationId)) {
+          return reply.code(422).send({ detail: "installation_id must be a UUID" });
+        }
+        // Tenancy guard: platform_owner is scoped to their session install; super_admin may cross-tenant read.
+        if (principal.role !== "super_admin" && installationId !== principal.installationId) {
+          return reply.code(403).send({
+            detail:
+              "platform_owner cannot read members of another installation; super_admin is required for cross-tenant reads",
+          });
+        }
+        if (opts.registry === undefined) {
+          throw new Error("members endpoint requires a key registry (server misconfiguration)");
+        }
+        const page = await buildMembersPage({ db: opts.db, registry: opts.registry, installationId });
+        return reply.code(200).send(MembersPageV1.parse(page));
       },
     );
 

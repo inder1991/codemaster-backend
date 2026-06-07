@@ -77,7 +77,7 @@ export async function runServer(): Promise<void> {
       secureCookies: (process.env["CODEMASTER_SECURE_COOKIES"] ?? "true") !== "false",
     });
     // D2 — admin READ endpoints (operator visibility), behind the same makeRequireRole gate + signing key.
-    await registerAdminRoutes(app, { db: coreDb, signingKey, clock });
+    await registerAdminRoutes(app, { db: coreDb, signingKey, clock, registry });
   }
 
   // ── More routers register here as they land ──
