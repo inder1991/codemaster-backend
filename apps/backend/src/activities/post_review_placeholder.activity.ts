@@ -288,7 +288,13 @@ export async function postReviewPlaceholder(input: PostReviewPlaceholderInput): 
     if (dsn === undefined || dsn === "") {
       throw new Error("CODEMASTER_PG_CORE_DSN is not set");
     }
-    const installationId = readGithubInstallationId();
+    // Per-review routing: the numeric installation id comes from the input. The placeholder is dispatched
+    // EARLY (before clone), so a null id is reachable (synthetic/legacy triggers) — throwing here is caught
+    // by the surrounding try → logged "not_configured" → the placeholder is skipped (best-effort, non-fatal).
+    const installationId = parsed.github_installation_id;
+    if (installationId === null) {
+      throw new Error("github_installation_id is null in the post_review_placeholder input (per-review routing)");
+    }
     const clock = new WallClock();
     const githubHttp = new FetchGitHubHttpClient({});
     const vault = VaultHttpPort.fromEnv();
@@ -311,29 +317,4 @@ export async function postReviewPlaceholder(input: PostReviewPlaceholderInput): 
   }
 
   await doPostPlaceholder(parsed, deps);
-}
-
-/**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID` (the numeric GitHub App installation id this pod
- * authenticates as). 1:1 with the sibling `post_review_results.activity.ts::readGithubInstallationId`.
- * Static `process.env.X` access (no dynamic indexing) so no object-injection sink is introduced.
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the post_review_placeholder activity. " +
-        "Set it to the numeric GitHub App installation id this pod authenticates as.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(
-      `CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`,
-    );
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
 }

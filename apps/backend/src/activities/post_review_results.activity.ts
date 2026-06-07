@@ -1221,35 +1221,10 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
 // ─── Temporal activity entry point ───────────────────────────────────────────────────────────────
 
 /**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID` (the numeric GitHub App installation id this pod
- * authenticates as). 1:1 with the sibling `post_check_run.activity.ts::readGithubInstallationId` (which
- * mirrors the frozen Python `_read_github_installation_id`). Static `process.env.X` access (no dynamic
- * indexing) so no object-injection sink is introduced.
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the post_review_results activity. " +
-        "Set it to the numeric GitHub App installation id this pod authenticates as.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(
-      `CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`,
-    );
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
-}
-
-/**
  * The registered `post_review_results` Temporal activity (single typed-input envelope per CLAUDE.md
  * invariant 11). Resolves the DSN from `CODEMASTER_PG_CORE_DSN` + the numeric GitHub installation id from
- * `CODEMASTER_GITHUB_INSTALLATION_ID`, constructs the production {@link GitHubApiReviewClient} over a
+ * the activity input (`github_installation_id` — per-review routing, replacing the removed
+ * `CODEMASTER_GITHUB_INSTALLATION_ID` env pin), constructs the production {@link GitHubApiReviewClient} over a
  * {@link GitHubApiClient} (Vault token provider + the shared GitHub HTTP transport), and delegates to
  * {@link doPost}. Mirrors the sibling `postCheckRun` wiring (ONE token provider → ONE GitHubApiClient →
  * wrapped client) and is 1:1 in intent with the frozen Python `PostReviewActivity.post_review_results`.
@@ -1262,7 +1237,16 @@ export async function postReviewResults(input: PostReviewInputV1): Promise<Poste
       "CODEMASTER_PG_CORE_DSN is not set; cannot run the post_review_results atomic claim",
     );
   }
-  const installationId = readGithubInstallationId();
+  // Per-review routing: the numeric GitHub installation id comes from the activity input. Defensive null
+  // guard — post_review_results runs only after a successful clone (which fail-closes on a null id), so this
+  // should never fire; throwing rather than minting under a wrong identity is the fail-closed posture.
+  const installationId = parsed.github_installation_id;
+  if (installationId === null) {
+    throw new Error(
+      "github_installation_id is null in the post_review_results input — cannot post the review without a " +
+        "per-review installation id (per-review routing).",
+    );
+  }
   const clock = new WallClock();
   // One GitHub HTTP transport shared by the token-provider's JWT→installation-token mint AND the
   // GitHubApiClient's review calls (mirrors the frozen-Python worker passing one `_http_client` to both).

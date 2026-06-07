@@ -133,38 +133,22 @@ export async function doPostCheckRun({
 }
 
 /**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID`. 1:1 with the frozen Python
- * `_read_github_installation_id`: the worker is single-installation-per-pod for v1; the env var pins which
- * GitHub App installation this pod's GitHub-facing activities authenticate as. Static `process.env.X`
- * access (not dynamic indexing) so no object-injection sink is introduced.
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the post_check_run activity. " +
-        "Set it to the numeric GitHub App installation id this pod authenticates as.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`);
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
-}
-
-/**
  * The registered activity. Takes the single typed {@link PostCheckRunInputV1} envelope (invariant 11),
  * constructs the REAL {@link GitHubApiCheckRunClient} over a {@link GitHubApiClient} (Vault token provider
- * + env installation id), and delegates to {@link doPostCheckRun}. Mirrors the frozen-Python worker
- * wiring: ONE token provider → ONE GitHubApiClient → wrapped in the check-run client at a fixed
- * installation id.
+ * + the per-review numeric installation id from the input), and delegates to {@link doPostCheckRun}.
+ * Per-review routing (replaces the removed `CODEMASTER_GITHUB_INSTALLATION_ID` env pin): ONE token provider
+ * → ONE GitHubApiClient → wrapped in the check-run client at the input's installation id.
  */
 export async function postCheckRun(input: PostCheckRunInputV1): Promise<PostedCheckRunV1> {
-  const installationId = readGithubInstallationId();
+  // Per-review routing: the numeric installation id comes from the input. Defensive null guard — the
+  // check-run posts only after a successful clone (which fail-closes on null), so this should never fire.
+  const installationId = input.github_installation_id;
+  if (installationId === null) {
+    throw new Error(
+      "github_installation_id is null in the post_check_run input — cannot post without a per-review " +
+        "installation id (per-review routing).",
+    );
+  }
   const clock = new WallClock();
   // One GitHub HTTP transport shared by the token-provider's JWT→installation-token mint AND the
   // GitHubApiClient's check-run calls (mirrors the frozen-Python worker passing one `_http_client` to

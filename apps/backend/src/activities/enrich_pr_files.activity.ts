@@ -252,38 +252,6 @@ export async function doEnrichPrFiles(
 // ─── Temporal activity entry point ─────────────────────────────────────────────────────────────────
 
 /**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID` (the numeric GitHub App installation id this pod
- * authenticates as). 1:1 with the sibling `post_review_results.activity.ts::readGithubInstallationId`.
- * Static `process.env.X` access (no dynamic indexing) so no object-injection sink is introduced.
- *
- * NOTE: the activity input already carries `github_installation_id` (the per-PR numeric id from the
- * payload). The production token-provider authenticates the GitHub HTTP transport with the POD's
- * installation id from the env (mirroring the sibling post-activities' wiring), while the files-fetch
- * is scoped to the input's `github_installation_id`. In a single-active-GitHub-host environment
- * (CLAUDE.md invariant 4) these are the same value; threading both keeps the seam faithful to the
- * Python (the activity took `installation_id_int` as a positional arg).
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the enrich_pr_files_activity_v2 " +
-        "activity. Set it to the numeric GitHub App installation id this pod authenticates as.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(
-      `CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`,
-    );
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
-}
-
-/**
  * Adapt the production {@link GitHubApiClient} onto the {@link GitHubPrFilesPort} the activity
  * consumes. The client's paginated `getPullRequestFiles({ installationId, owner, repo, prNumber })`
  * IS the `GET .../pulls/{n}/files` round-trip; this wrapper maps the port's keyword names onto it.
@@ -314,9 +282,8 @@ export async function enrichPrFilesV2(
       "CODEMASTER_PG_CORE_DSN is not set; cannot run the enrich_pr_files_activity_v2 persistence",
     );
   }
-  // The pod's installation id is read + validated for the token-provider mint, faithful to the
-  // sibling post-activities' wiring (the files-fetch itself is scoped to the input's id below).
-  readGithubInstallationId();
+  // Per-review routing: the files-fetch is scoped to the input's `github_installation_id` (used by
+  // `doEnrichPrFiles` for the GitHub client) — no pod-wide env read. The contract requires it (non-null).
   const clock = new WallClock();
   // One GitHub HTTP transport shared by the token-provider's JWT→installation-token mint AND the
   // GitHubApiClient's files calls (mirrors the frozen-Python worker passing one `_http_client` to both).

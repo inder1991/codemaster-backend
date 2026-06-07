@@ -280,39 +280,23 @@ export async function doUpdatePrDescriptionSummary({
 // ─── Env wiring + registered activity ─────────────────────────────────────────────────────────────
 
 /**
- * Read + validate `CODEMASTER_GITHUB_INSTALLATION_ID`. 1:1 with the frozen Python
- * `_read_github_installation_id` (the same helper post_check_run uses): the worker is
- * single-installation-per-pod for v1; the env var pins which GitHub App installation this pod's
- * GitHub-facing activities authenticate as. Static `process.env.X` access (not dynamic indexing) so no
- * object-injection sink is introduced.
- */
-function readGithubInstallationId(): number {
-  const raw = process.env.CODEMASTER_GITHUB_INSTALLATION_ID;
-  if (raw === undefined || raw.trim() === "") {
-    throw new Error(
-      "CODEMASTER_GITHUB_INSTALLATION_ID env var is required for the update_pr_description_summary " +
-        "activity. Set it to the numeric GitHub App installation id this pod authenticates as.",
-    );
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value)) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be an integer; got ${JSON.stringify(raw)}`);
-  }
-  if (value <= 0) {
-    throw new Error(`CODEMASTER_GITHUB_INSTALLATION_ID must be >= 1; got ${value}`);
-  }
-  return value;
-}
-
-/**
  * The registered activity. Takes the single typed {@link UpdatePrDescriptionInputV1} envelope
  * (invariant 11), constructs the REAL {@link GitHubApiPrDescriptionClient} over a {@link GitHubApiClient}
- * (Vault token provider + env installation id), and delegates to {@link doUpdatePrDescriptionSummary}.
- * Mirrors the frozen-Python worker wiring: ONE token provider → ONE GitHubApiClient → wrapped in the
- * PR-description client at a fixed installation id.
+ * (Vault token provider + the per-review numeric installation id from the input), and delegates to
+ * {@link doUpdatePrDescriptionSummary}. Per-review routing (replaces the removed
+ * `CODEMASTER_GITHUB_INSTALLATION_ID` env pin): ONE token provider → ONE GitHubApiClient → wrapped in the
+ * PR-description client at the input's installation id.
  */
 export async function updatePrDescriptionSummary(input: UpdatePrDescriptionInputV1): Promise<void> {
-  const installationId = readGithubInstallationId();
+  // Per-review routing: the numeric installation id comes from the input. Defensive null guard — the
+  // PR-description update runs only after a successful review (post-clone), so this should never fire.
+  const installationId = input.github_installation_id;
+  if (installationId === null) {
+    throw new Error(
+      "github_installation_id is null in the update_pr_description_summary input — cannot patch the PR " +
+        "description without a per-review installation id (per-review routing).",
+    );
+  }
   const clock = new WallClock();
   // One GitHub HTTP transport shared by the token-provider's JWT→installation-token mint AND the
   // GitHubApiClient's PR GET/PATCH calls (mirrors the frozen-Python worker passing one `_http_client` to
