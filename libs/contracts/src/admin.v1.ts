@@ -939,3 +939,31 @@ export const RepositoryEnableUpdateV1 = z
   })
   .strict();
 export type RepositoryEnableUpdateV1 = z.infer<typeof RepositoryEnableUpdateV1>;
+
+// ─── Taxonomy suggestions (POST /api/admin/taxonomy/suggestions) ─────────────────────────────────────
+// 1:1 with contracts/admin/taxonomy_gaps/v1.py. schema_version is a plain int in the Python (not Literal).
+
+/** Operator-submitted suggestion to formalize an `unrecognized:*` label into a curated one. */
+export const TaxonomySuggestionV1 = z
+  .object({
+    schema_version: z.number().int().default(1),
+    label: z.string().min(14).regex(/^unrecognized:[a-z][a-z0-9_-]*$/),
+    proposed_canonical_label: z
+      .string()
+      .min(3)
+      .regex(/^(default|(lang|framework|infra|topic|org|version):[a-z][a-z0-9_-]*)$/),
+    rationale: z.string().min(20).max(2000),
+    suggester_email: z.string().email().nullable().default(null),
+  })
+  .strict();
+export type TaxonomySuggestionV1 = z.infer<typeof TaxonomySuggestionV1>;
+
+/** 201 response — the minted id + queued-for-review timestamp. */
+export const TaxonomySuggestionAcceptedV1 = z
+  .object({
+    schema_version: z.number().int().default(1),
+    suggestion_id: z.string().uuid(),
+    queued_at: z.string().datetime({ offset: true }),
+  })
+  .strict();
+export type TaxonomySuggestionAcceptedV1 = z.infer<typeof TaxonomySuggestionAcceptedV1>;

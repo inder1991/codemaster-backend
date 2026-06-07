@@ -55,6 +55,8 @@ import {
   RoleChangePendingV1,
   RoleChangeRequestV1,
   TaxonomyGapListV1,
+  TaxonomySuggestionAcceptedV1,
+  TaxonomySuggestionV1,
 } from "#contracts/admin.v1.js";
 
 import { CursorInvalidError } from "#backend/api/admin/_keyset_cursor.js";
@@ -109,6 +111,7 @@ import {
   upsertPurposeModel,
 } from "#backend/api/admin/llm_catalog_write.js";
 import { setEnabled } from "#backend/api/admin/repositories_write.js";
+import { insertTaxonomySuggestion } from "#backend/api/admin/taxonomy_write.js";
 import {
   getRetrievalTrace,
   listRetrievalTraces,
@@ -1076,6 +1079,24 @@ export async function registerAdminRoutes(
         );
         const rows = await listTaxonomyGaps(opts.db, limit);
         return reply.code(200).send(TaxonomyGapListV1.parse({ rows }));
+      },
+    );
+
+    scope.post(
+      "/api/admin/taxonomy/suggestions",
+      { preHandler: requireRole(["platform_owner", "super_admin"]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = TaxonomySuggestionV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const accepted = await insertTaxonomySuggestion(opts.db, {
+          suggestion: parsed.data,
+          actorUserId: principal.userId,
+          now: opts.clock.now(),
+        });
+        return reply.code(201).send(TaxonomySuggestionAcceptedV1.parse(accepted));
       },
     );
 
