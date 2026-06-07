@@ -208,6 +208,32 @@ export const IntegrationListPageV1 = z
   .strict();
 export type IntegrationListPageV1 = z.infer<typeof IntegrationListPageV1>;
 
+/** Atlassian space-key charset (1:1 with integrations.py _SPACE_KEY_REGEX). Anchored; refuses
+ *  path-traversal before any Confluence call. */
+const SPACE_KEY_RE = /^[A-Z0-9_-]{1,255}$/;
+/** 'platform' | 'org:<slug>' (1:1 with _AddConfluenceSpaceV1.visibility pattern). */
+const INTEGRATION_VISIBILITY_RE = /^(platform|org:[a-z][a-z0-9_-]*)$/;
+
+/**
+ * POST /api/admin/integrations/confluence-spaces request body — 1:1 with integrations.py
+ * `_AddConfluenceSpaceV1`. No cross-field rule: page_tree_root_id is NOT required even when
+ * scope='page_tree' (the Python does not pair them — preserve the gap). .strict() ⇔ extra="forbid".
+ * The 201 response reuses IntegrationListItemV1 (the Python _IntegrationHTTP is field-identical).
+ */
+export const AddConfluenceSpaceRequestV1 = z
+  .object({
+    space_key: z.string().min(1).max(255).regex(SPACE_KEY_RE),
+    space_name: z.string().min(1).max(255),
+    scope: z.enum(["whole_space", "page_tree"]).default("whole_space"),
+    page_tree_root_id: z.string().max(64).nullable().default(null),
+    trust_tier: z.enum(["trusted", "semi"]).default("trusted"),
+    governance_ack: z.boolean().default(false),
+    visibility: z.string().max(64).regex(INTEGRATION_VISIBILITY_RE).default("platform"),
+    strict_label_mode: z.boolean().default(false),
+  })
+  .strict();
+export type AddConfluenceSpaceRequestV1 = z.infer<typeof AddConfluenceSpaceRequestV1>;
+
 // ─── Notification rules (platform-scope) ─────────────────────────────────────────────────────────
 
 const SlackRecipientV1 = z

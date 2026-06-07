@@ -15,6 +15,7 @@ import type { Clock } from "#platform/clock.js";
 import type { KeyRegistry } from "#platform/crypto/key_registry.js";
 
 import {
+  AddConfluenceSpaceRequestV1,
   AuditSearchResponseV1,
   BedrockConfigV1,
   CostCapChangeRequestV1,
@@ -27,6 +28,7 @@ import {
   EmbeddingGenerationV1,
   FindingListResponseV1,
   FlagListV1,
+  IntegrationListItemV1,
   IntegrationListPageV1,
   LearningDetailV1,
   LearningListPageV1,
@@ -130,7 +132,14 @@ import {
   TypedConfirmRequiredError,
   typedConfirmPhraseFor,
 } from "#backend/api/admin/flags_write.js";
-import { deleteIntegration, IntegrationNotFoundError } from "#backend/api/admin/integrations_write.js";
+import {
+  deleteIntegration,
+  insertConfluenceSpace,
+  IntegrationDuplicateError,
+  IntegrationNotFoundError,
+  IntegrationValidationError,
+} from "#backend/api/admin/integrations_write.js";
+import { type GetConfluenceValidator } from "#backend/integrations/confluence/confluence_validator.js";
 import { type VaultPort } from "#backend/adapters/vault_port.js";
 import { PostgresLlmProviderSettingsRepo } from "#backend/integrations/llm/llm_provider_settings_repo.js";
 import { type GetPreflightValidator } from "#backend/integrations/llm/preflight_validator.js";
@@ -214,6 +223,9 @@ export type AdminRoutesOptions = {
    *  llm-provider-config credential routes 503. Production wires the real Bedrock/AnthropicDirect SDK
    *  validators; tests inject a stub. */
   getPreflightValidator?: GetPreflightValidator;
+  /** Injected Confluence space-validator factory. Undefined → the integrations CREATE route 503. Production
+   *  wires the real Confluence v2 adapter (deferred — live-untested surface); tests inject a stub. */
+  getConfluenceValidator?: GetConfluenceValidator;
 };
 
 /** The static dashboard summary (1:1 with the shipped Python: _HealthyProbe for the 4 services +
@@ -814,6 +826,57 @@ export async function registerAdminRoutes(
         } catch (err) {
           if (err instanceof IntegrationNotFoundError) {
             return reply.code(404).send({ detail: "integration not found" });
+          }
+          throw err;
+        }
+      },
+    );
+
+    // POST /integrations/confluence-spaces — register a Confluence space. 1:1 with add_confluence_space.
+    // platform_owner+. dedup → validate (injected Confluence validator) → INSERT → audit. 201 on success.
+    scope.post(
+      "/api/admin/integrations/confluence-spaces",
+      { preHandler: requireRole(["platform_owner", "super_admin"]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = AddConfluenceSpaceRequestV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        if (opts.getConfluenceValidator === undefined) {
+          return reply.code(503).send({ detail: "confluence validator unwired" });
+        }
+        const body = parsed.data;
+        try {
+          const item = await insertConfluenceSpace(opts.db, {
+            spaceKey: body.space_key,
+            spaceName: body.space_name,
+            scope: body.scope,
+            pageTreeRootId: body.page_tree_root_id,
+            trustTier: body.trust_tier,
+            governanceAck: body.governance_ack,
+            visibility: body.visibility,
+            strictLabelMode: body.strict_label_mode,
+            actorUserId: principal.userId,
+            now: opts.clock.now(),
+            validator: opts.getConfluenceValidator(),
+            audit: opts.audit,
+          });
+          return reply.code(201).send(IntegrationListItemV1.parse(item));
+        } catch (err) {
+          if (err instanceof IntegrationDuplicateError) {
+            return reply.code(409).send({ detail: { code: "duplicate", space_key: body.space_key } });
+          }
+          if (err instanceof IntegrationValidationError) {
+            if (err.code === "rate_limited") {
+              // Retry-After header + 503 (1:1 with the Python rate-limit branch).
+              return reply
+                .code(503)
+                .header("Retry-After", "60")
+                .send({ detail: { code: "rate_limited", detail: err.validationDetail } });
+            }
+            // auth_error | not_found | validation_failed → 422 with the nested {code, detail} body.
+            return reply.code(422).send({ detail: { code: err.code, detail: err.validationDetail } });
           }
           throw err;
         }
