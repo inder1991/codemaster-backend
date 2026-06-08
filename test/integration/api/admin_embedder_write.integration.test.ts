@@ -78,6 +78,17 @@ async function resetEmbedderState(): Promise<void> {
   `.execute(db);
   await sql`DELETE FROM core.chunk_embeddings WHERE generation_id > ${SEED_ACTIVE_GENERATION}`.execute(db);
   await sql`DELETE FROM core.embedding_generations WHERE generation_id > ${SEED_ACTIVE_GENERATION}`.execute(db);
+  // Restore gen 1 to 'active' — the activate/rollback tests demote it to 'ready' (the singleton pointer was
+  // already restored above, but the row's own state must match). active biconditional: activated_at NOT NULL
+  // AND retired_at NULL.
+  await sql`
+    UPDATE core.embedding_generations
+       SET state = 'active',
+           activated_at = COALESCE(activated_at, now()),
+           retired_at = NULL,
+           retire_reason = NULL
+     WHERE generation_id = ${SEED_ACTIVE_GENERATION}
+  `.execute(db);
 }
 
 beforeEach(async () => {
@@ -157,6 +168,41 @@ async function seedReadyWithChunks(modelName: string, n = 1): Promise<number> {
     await sql`
       INSERT INTO core.chunk_embeddings (chunk_table, chunk_id, generation_id, embedding_model_name, embedding, content_sha256)
       VALUES ('knowledge_chunks', gen_random_uuid(), ${genId}, ${modelName}, ${zeroVec}::vector, ${`sha-${genId}-${i}`})
+    `.execute(db);
+  }
+  return genId;
+}
+
+/** Insert a generation in `ready` state with validation_passed=false (activate must reject it). */
+async function seedReadyFailedValidation(modelName: string): Promise<number> {
+  const r = await sql<{ generation_id: string | number }>`
+    INSERT INTO core.embedding_generations (
+      state, model_name, embedding_dimension, created_by_email,
+      chunker_version, preprocessing_version, normalization_version,
+      backfill_started_at, backfill_completed_at, validation_passed
+    ) VALUES ('ready', ${modelName}, 1024, 'ops@example.com', '1', '1', '1', now(), now(), false)
+    RETURNING generation_id
+  `.execute(db);
+  return Number(r.rows[0]!.generation_id);
+}
+
+/** Insert a generation in `retired` state (retire_reason='demoted') with `n` chunk_embeddings rows, NOT
+ *  GC'd — the rollback path target. */
+async function seedRetiredWithChunks(modelName: string, n = 1): Promise<number> {
+  const r = await sql<{ generation_id: string | number }>`
+    INSERT INTO core.embedding_generations (
+      state, model_name, embedding_dimension, created_by_email,
+      chunker_version, preprocessing_version, normalization_version,
+      backfill_started_at, backfill_completed_at, validation_passed, retired_at, retire_reason
+    ) VALUES ('retired', ${modelName}, 1024, 'ops@example.com', '1', '1', '1', now(), now(), true, now(), 'demoted')
+    RETURNING generation_id
+  `.execute(db);
+  const genId = Number(r.rows[0]!.generation_id);
+  const zeroVec = `[${Array(1024).fill(0).join(",")}]`;
+  for (let i = 0; i < n; i += 1) {
+    await sql`
+      INSERT INTO core.chunk_embeddings (chunk_table, chunk_id, generation_id, embedding_model_name, embedding, content_sha256)
+      VALUES ('knowledge_chunks', gen_random_uuid(), ${genId}, ${modelName}, ${zeroVec}::vector, ${`sha-r-${genId}-${i}`})
     `.execute(db);
   }
   return genId;
@@ -390,6 +436,73 @@ describeDb("embedder write lifecycle (disposable :5439)", () => {
     });
     expect(res.statusCode).toBe(404);
     expect(res.json<{ detail: { error: string } }>().detail.error).toBe("generation_not_found");
+    await app.close();
+  });
+
+  it("POST /reembed/activate: promotes ready→active, demotes previous active to ready", async () => {
+    const { app, audited } = await makeApp();
+    const genId = await seedReadyWithChunks("activate-test", 1);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/embedder/reembed/activate",
+      cookies: owner(),
+      payload: { schema_version: 1, generation_id: genId },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ active_generation: number }>().active_generation).toBe(genId);
+    expect(audited.some((a) => a.action === "embedder.generation.activated")).toBe(true);
+
+    // Previous active (seed gen 1) was demoted to 'ready'.
+    const demoted = await sql<{ state: string }>`
+      SELECT state FROM core.embedding_generations WHERE generation_id = ${SEED_ACTIVE_GENERATION}
+    `.execute(db);
+    expect(demoted.rows[0]!.state).toBe("ready");
+    await app.close();
+  });
+
+  it("POST /reembed/activate: 422 validation_not_passed", async () => {
+    const { app } = await makeApp();
+    const genId = await seedReadyFailedValidation("activate-fail");
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/embedder/reembed/activate",
+      cookies: owner(),
+      payload: { schema_version: 1, generation_id: genId },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json<{ detail: { error: string } }>().detail.error).toBe("validation_not_passed");
+    await app.close();
+  });
+
+  it("POST /reembed/activate: 409 generation_data_collected when zero chunk_embeddings", async () => {
+    const { app } = await makeApp();
+    // seedReadyWithChunks(..., 0) → 'ready' with no chunk_embeddings rows.
+    const genId = await seedReadyWithChunks("activate-empty", 0);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/embedder/reembed/activate",
+      cookies: owner(),
+      payload: { schema_version: 1, generation_id: genId },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json<{ detail: { error: string } }>().detail.error).toBe("generation_data_collected");
+    await app.close();
+  });
+
+  it("POST /reembed/rollback: alias of activate, allows from retired", async () => {
+    const { app, audited } = await makeApp();
+    const genId = await seedRetiredWithChunks("rollback-test", 1);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/embedder/reembed/rollback",
+      cookies: owner(),
+      payload: { schema_version: 1, target_generation_id: genId },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ active_generation: number }>().active_generation).toBe(genId);
+    expect(audited.some((a) => a.action === "embedder.generation.rolled_back")).toBe(true);
     await app.close();
   });
 });
