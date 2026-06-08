@@ -9,12 +9,14 @@
 
 import cookie from "@fastify/cookie";
 import { type Kysely } from "kysely";
+import { z } from "zod";
 import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Clock } from "#platform/clock.js";
 import type { KeyRegistry } from "#platform/crypto/key_registry.js";
 
 import {
+  ActivateGenerationRequestV1,
   AddConfluenceSpaceRequestV1,
   AuditSearchResponseV1,
   BedrockConfigV1,
@@ -60,7 +62,10 @@ import {
   PutFlagRequestV1,
   PutFlagResponseV1,
   RejectProposalV1,
+  RetrievalModeRequestV1,
+  RollbackGenerationRequestV1,
   StaleWriteV1,
+  StartReembedRequestV1,
   UpdateLearningBodyV1,
   RetrievalAggregatePRListV1,
   RetrievalAggregateV1,
@@ -102,6 +107,29 @@ import {
   buildEmbedderState,
   getGeneration,
 } from "#backend/api/admin/embedder_read.js";
+import { PostgresEmbeddingGenerationsRepo } from "#backend/domain/repos/embedding_generations_repo.js";
+import { PostgresEmbedderRuntimeStateRepo } from "#backend/domain/repos/embedder_runtime_state_repo.js";
+import {
+  CoverageGapPresentError,
+  EmbedderGenerationService,
+  EmbeddingDimensionInvariantError,
+  GCRetentionNotElapsedError,
+  GenerationDataAlreadyCollectedError,
+  GenerationNotFoundError,
+  InvalidStateTransitionError,
+  PendingGenerationInFlightError,
+  ValidationNotPassedError,
+} from "#backend/domain/services/embedder_generation_service.js";
+import {
+  activateReembedGeneration,
+  cancelReembedGeneration,
+  gcReembedGeneration,
+  manualRetireReembedGeneration,
+  rollbackReembedGeneration,
+  setRetrievalMode,
+  startReembedGeneration,
+  toEmbeddingGenerationV1,
+} from "#backend/api/admin/embedder_write.js";
 import { buildMembersPage } from "#backend/api/admin/members_read.js";
 import type { AdminTemporalPort } from "#backend/api/admin/_admin_temporal_port.js";
 import {
@@ -508,6 +536,15 @@ export async function registerAdminRoutes(
 
     const EMBEDDER_ROLES = ["platform_owner", "super_admin"] as const;
 
+    // The embedder WRITE endpoints (Batch 4) share a single service constructed over the process-wide pool
+    // (ADR-0062). The service is the sole authorized writer of embedder lifecycle transitions (spec §5).
+    const embedderGensRepo = new PostgresEmbeddingGenerationsRepo({ db: opts.db });
+    const embedderStateRepo = new PostgresEmbedderRuntimeStateRepo({ db: opts.db });
+    const embedderService = new EmbedderGenerationService({
+      gensRepo: embedderGensRepo,
+      stateRepo: embedderStateRepo,
+    });
+
     scope.get(
       "/api/admin/embedder/state",
       { preHandler: requireRole([...EMBEDDER_ROLES]) },
@@ -539,6 +576,388 @@ export async function registerAdminRoutes(
           });
         }
         return reply.code(200).send(EmbeddingGenerationV1.parse(gen));
+      },
+    );
+
+    // ─── Embedder WRITE lifecycle (Batch 4 — platform_owner / super_admin) ───────────────────────────
+    // 1:1 with codemaster/api/admin/embedder.py. The service is the sole authorized writer; the route owns
+    // body parse, Temporal dispatch/signal, audit emit, and the wire serialization. Audit target_kind is
+    // 'embedder_generation' for every endpoint (retrieval-mode uses target_id='singleton'); installation_id
+    // is the actor's session install (mirrors the Python _emit, which passes _require_owner()'s install id).
+    const EMBEDDER_GENERATION_ID_BODY = z
+      .object({ schema_version: z.literal(1).default(1), generation_id: z.number().int().min(1) })
+      .strict();
+
+    scope.post(
+      "/api/admin/embedder/retrieval-mode",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = RetrievalModeRequestV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          await setRetrievalMode(embedderService, body, principal.userId);
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.retrieval_mode.set",
+            targetKind: "embedder_generation",
+            targetId: "singleton",
+            before: null,
+            after: { mode: body.mode },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbedderStateV1.parse(await buildEmbedderState(opts.db)));
+        } catch (e) {
+          if (e instanceof CoverageGapPresentError) {
+            return reply.code(422).send({ detail: { error: "coverage_gap_present", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/start",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = StartReembedRequestV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          const gen = await startReembedGeneration(embedderService, body, principal.userId);
+          // Mirror the service fallback (source = active when caller omits) so the workflow input carries the
+          // same value the service persisted; defensive '1' for the unreachable NULL branch.
+          const sourceForWorkflow = gen.created_from_generation ?? 1;
+          if (opts.temporal) {
+            await opts.temporal.dispatchWorkflow({
+              workflowType: "ReembedGenerationWorkflow",
+              workflowId: `reembed-generation-${gen.generation_id}`,
+              taskQueue: "embedder-maintenance",
+              input: {
+                schema_version: 1,
+                generation_id: gen.generation_id,
+                target_model_name: body.target_model_name,
+                source_generation_id: sourceForWorkflow,
+                triggered_by_email: principal.userId,
+              },
+              idReusePolicy: "REJECT_DUPLICATE",
+            });
+          }
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.created",
+            targetKind: "embedder_generation",
+            targetId: String(gen.generation_id),
+            before: null,
+            after: {
+              generation_id: gen.generation_id,
+              target_model_name: body.target_model_name,
+              generation_label: body.generation_label,
+              generation_reason: body.generation_reason,
+              source_generation_id: sourceForWorkflow,
+            },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbeddingGenerationV1.parse(toEmbeddingGenerationV1(gen)));
+        } catch (e) {
+          if (e instanceof PendingGenerationInFlightError) {
+            return reply.code(409).send({ detail: { error: "pending_generation_in_flight", msg: e.message } });
+          }
+          if (e instanceof EmbeddingDimensionInvariantError) {
+            return reply.code(422).send({ detail: { error: "dimension_mismatch", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/cancel",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = EMBEDDER_GENERATION_ID_BODY.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          const updated = await cancelReembedGeneration(embedderService, body.generation_id, principal.userId);
+          // Best-effort cancel signal AFTER persistence — swallow not-found / already-completed.
+          if (opts.temporal) {
+            try {
+              await opts.temporal.signalWorkflow({
+                workflowId: `reembed-generation-${body.generation_id}`,
+                signalName: "cancel",
+              });
+            } catch {
+              // Workflow may already be terminal + GC'd by Temporal; the DB row already says 'retired'.
+            }
+          }
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.cancelled",
+            targetKind: "embedder_generation",
+            targetId: String(body.generation_id),
+            before: null,
+            after: { generation_id: body.generation_id, retire_reason: updated.retire_reason },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbeddingGenerationV1.parse(toEmbeddingGenerationV1(updated)));
+        } catch (e) {
+          if (e instanceof GenerationNotFoundError) {
+            return reply.code(404).send({ detail: { error: "generation_not_found", msg: e.message } });
+          }
+          if (e instanceof InvalidStateTransitionError) {
+            return reply.code(409).send({ detail: { error: "invalid_state_transition", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/validate",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const bodySchema = z
+          .object({
+            schema_version: z.literal(1).default(1),
+            generation_id: z.number().int().min(1),
+            sample_size: z.number().int().min(10).max(1000).nullable().default(null),
+          })
+          .strict();
+        const parsed = bodySchema.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+
+        const gen = await getGeneration(opts.db, body.generation_id);
+        if (gen === null) {
+          return reply.code(404).send({
+            detail: { error: "generation_not_found", msg: `generation_id=${body.generation_id} does not exist` },
+          });
+        }
+        if (gen.state !== "backfilling" && gen.state !== "ready") {
+          return reply.code(409).send({
+            detail: {
+              error: "invalid_state_transition",
+              msg: `validate: gen ${body.generation_id} state='${gen.state}'; validation only permitted on 'backfilling' or 'ready' generations`,
+            },
+          });
+        }
+
+        // Dispatch AFTER the state-check. Default sample_size from the workflow contract when omitted.
+        if (opts.temporal) {
+          await opts.temporal.dispatchWorkflow({
+            workflowType: "ValidateGenerationWorkflow",
+            workflowId: `validate-generation-${body.generation_id}`,
+            taskQueue: "embedder-maintenance",
+            input:
+              body.sample_size === null
+                ? { schema_version: 1, generation_id: body.generation_id }
+                : { schema_version: 1, generation_id: body.generation_id, sample_size: body.sample_size },
+            idReusePolicy: "ALLOW_DUPLICATE",
+          });
+        }
+        await opts.audit?.({
+          actorUserId: principal.userId,
+          installationId: principal.installationId,
+          action: "embedder.generation.validated",
+          targetKind: "embedder_generation",
+          targetId: String(body.generation_id),
+          before: null,
+          after: { generation_id: body.generation_id, sample_size: body.sample_size },
+          now: opts.clock.now(),
+        });
+        // Pre-validation snapshot — caller polls /reembed/status for the result.
+        return reply.code(200).send(EmbeddingGenerationV1.parse(gen));
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/activate",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = ActivateGenerationRequestV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          await activateReembedGeneration(embedderService, body.generation_id, principal.userId);
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.activated",
+            targetKind: "embedder_generation",
+            targetId: String(body.generation_id),
+            before: null,
+            after: { generation_id: body.generation_id },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbedderStateV1.parse(await buildEmbedderState(opts.db)));
+        } catch (e) {
+          if (e instanceof GenerationNotFoundError) {
+            return reply.code(404).send({ detail: { error: "generation_not_found", msg: e.message } });
+          }
+          if (e instanceof InvalidStateTransitionError) {
+            return reply.code(409).send({ detail: { error: "invalid_state_transition", msg: e.message } });
+          }
+          if (e instanceof GenerationDataAlreadyCollectedError) {
+            return reply.code(409).send({ detail: { error: "generation_data_collected", msg: e.message } });
+          }
+          if (e instanceof ValidationNotPassedError) {
+            return reply.code(422).send({ detail: { error: "validation_not_passed", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/rollback",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = RollbackGenerationRequestV1.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          await rollbackReembedGeneration(embedderService, body.target_generation_id, principal.userId);
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.rolled_back",
+            targetKind: "embedder_generation",
+            targetId: String(body.target_generation_id),
+            before: null,
+            after: { target_generation_id: body.target_generation_id },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbedderStateV1.parse(await buildEmbedderState(opts.db)));
+        } catch (e) {
+          if (e instanceof GenerationNotFoundError) {
+            return reply.code(404).send({ detail: { error: "generation_not_found", msg: e.message } });
+          }
+          if (e instanceof InvalidStateTransitionError) {
+            return reply.code(409).send({ detail: { error: "invalid_state_transition", msg: e.message } });
+          }
+          if (e instanceof GenerationDataAlreadyCollectedError) {
+            return reply.code(409).send({ detail: { error: "generation_data_collected", msg: e.message } });
+          }
+          if (e instanceof ValidationNotPassedError) {
+            return reply.code(422).send({ detail: { error: "validation_not_passed", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/manual-retire",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = EMBEDDER_GENERATION_ID_BODY.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          const updated = await manualRetireReembedGeneration(
+            embedderService,
+            body.generation_id,
+            principal.userId,
+          );
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.manual_retired",
+            targetKind: "embedder_generation",
+            targetId: String(body.generation_id),
+            before: null,
+            after: { generation_id: body.generation_id, retire_reason: updated.retire_reason },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbeddingGenerationV1.parse(toEmbeddingGenerationV1(updated)));
+        } catch (e) {
+          if (e instanceof GenerationNotFoundError) {
+            return reply.code(404).send({ detail: { error: "generation_not_found", msg: e.message } });
+          }
+          if (e instanceof InvalidStateTransitionError) {
+            return reply.code(409).send({ detail: { error: "invalid_state_transition", msg: e.message } });
+          }
+          throw e;
+        }
+      },
+    );
+
+    scope.post(
+      "/api/admin/embedder/reembed/gc",
+      { preHandler: requireRole([...EMBEDDER_ROLES]) },
+      async (request, reply) => {
+        const principal = request.authPrincipal!;
+        const parsed = EMBEDDER_GENERATION_ID_BODY.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(422).send({ detail: "request body failed schema validation" });
+        }
+        const body = parsed.data;
+        try {
+          const updated = await gcReembedGeneration(
+            embedderService,
+            body.generation_id,
+            principal.userId,
+            opts.clock.now(),
+          );
+          // Dispatch the GC workflow ONLY after a successful service.gc() (which set gc_started_at).
+          if (opts.temporal) {
+            await opts.temporal.dispatchWorkflow({
+              workflowType: "GarbageCollectGenerationWorkflow",
+              workflowId: `gc-generation-${body.generation_id}`,
+              taskQueue: "embedder-maintenance",
+              input: { schema_version: 1, generation_id: body.generation_id },
+              idReusePolicy: "ALLOW_DUPLICATE",
+            });
+          }
+          await opts.audit?.({
+            actorUserId: principal.userId,
+            installationId: principal.installationId,
+            action: "embedder.generation.gc_started",
+            targetKind: "embedder_generation",
+            targetId: String(body.generation_id),
+            before: null,
+            after: { generation_id: body.generation_id },
+            now: opts.clock.now(),
+          });
+          return reply.code(200).send(EmbeddingGenerationV1.parse(toEmbeddingGenerationV1(updated)));
+        } catch (e) {
+          if (e instanceof GenerationNotFoundError) {
+            return reply.code(404).send({ detail: { error: "generation_not_found", msg: e.message } });
+          }
+          if (e instanceof InvalidStateTransitionError) {
+            return reply.code(409).send({ detail: { error: "invalid_state_transition", msg: e.message } });
+          }
+          if (e instanceof GCRetentionNotElapsedError) {
+            // IMPORTANT: do NOT dispatch the workflow on this failure (gc_started_at was never written).
+            return reply.code(409).send({ detail: { error: "gc_retention_not_elapsed", msg: e.message } });
+          }
+          throw e;
+        }
       },
     );
 

@@ -1060,6 +1060,50 @@ export const EmbedderCoverageV1 = z
   .strict();
 export type EmbedderCoverageV1 = z.infer<typeof EmbedderCoverageV1>;
 
+// ─── Embedder WRITE request bodies (Batch 4 — POST /retrieval-mode + /reembed/{start,activate,rollback}) ──
+// 1:1 with contracts/admin/embedder/v1.py (StartReembedRequestV1 / ActivateGenerationRequestV1 /
+// RollbackGenerationRequestV1 / RetrievalModeRequestV1). cancel / validate / manual-retire / gc bodies are
+// declared inline at the route (mirroring the Python _GenerationIdRequest / _ValidateRequest).
+
+/** POST /api/admin/embedder/reembed/start body. */
+export const StartReembedRequestV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    target_model_name: z.string().min(1).max(256),
+    generation_label: z.string().nullable().default(null),
+    generation_reason: z.string().nullable().default(null),
+    created_from_generation: z.number().int().nullable().default(null),
+  })
+  .strict();
+export type StartReembedRequestV1 = z.infer<typeof StartReembedRequestV1>;
+
+/** POST /api/admin/embedder/reembed/activate body. */
+export const ActivateGenerationRequestV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    generation_id: z.number().int().min(1),
+  })
+  .strict();
+export type ActivateGenerationRequestV1 = z.infer<typeof ActivateGenerationRequestV1>;
+
+/** POST /api/admin/embedder/reembed/rollback body. */
+export const RollbackGenerationRequestV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    target_generation_id: z.number().int().min(1),
+  })
+  .strict();
+export type RollbackGenerationRequestV1 = z.infer<typeof RollbackGenerationRequestV1>;
+
+/** POST /api/admin/embedder/retrieval-mode body. */
+export const RetrievalModeRequestV1 = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    mode: z.enum(["fallback", "generation_only"]),
+  })
+  .strict();
+export type RetrievalModeRequestV1 = z.infer<typeof RetrievalModeRequestV1>;
+
 // ─── Retrieval-trace inspector list (GET /api/admin/retrieval-traces) ────────────────────────────────
 // 1:1 with contracts/admin/retrieval_traces/v1.py. One flattened row of the v_retrieval_traces_recent
 // materialized view (all columns derived from the trace JSONB). The detail endpoint reuses the full
