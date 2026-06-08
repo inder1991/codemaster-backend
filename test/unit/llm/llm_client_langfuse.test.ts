@@ -134,12 +134,28 @@ describe("LlmClient Langfuse export wiring", () => {
     expect(t.prompt_redacted_snippet).toBe("sys");
   });
 
-  it("exports a timeout trace on an SDK timeout (status=timeout)", async () => {
+  it("records an SDK-mapped LlmTimeoutError as status=failed (Python: it subclasses LlmInvocationError, caught by `except Exception`)", async () => {
+    // The SDK adapter maps every provider timeout to LlmTimeoutError. In the Python oracle that subclasses
+    // LlmInvocationError(Exception), NOT the builtin TimeoutError, so it falls through to `except Exception`
+    // and is recorded status="failed" — NOT the `except TimeoutError` (status="timeout") arm.
     const exporter = new RecordingExporter();
     const sdk = throwingSdk(new LlmTimeoutError("bedrock timeout"));
     await expect(invoke(newClient({ sdk, langfuse: exporter }))).rejects.toBeInstanceOf(
       LlmInvocationError,
     );
+
+    expect(exporter.traces).toHaveLength(1);
+    const t = exporter.traces[0]!;
+    expect(t.status).toBe("failed");
+    expect(t.prompt_tokens).toBe(0);
+    expect(t.completion_tokens).toBe(0);
+  });
+
+  it("records a RAW (unmapped) timeout — an Error whose name is TimeoutError — as status=timeout (Python `except TimeoutError` arm)", async () => {
+    const exporter = new RecordingExporter();
+    const rawTimeout = Object.assign(new Error("transport abort"), { name: "TimeoutError" });
+    const sdk = throwingSdk(rawTimeout);
+    await expect(invoke(newClient({ sdk, langfuse: exporter }))).rejects.toThrow();
 
     expect(exporter.traces).toHaveLength(1);
     const t = exporter.traces[0]!;

@@ -71,7 +71,7 @@ import {
 import { redactPii } from "#backend/redact/pii_redactor.js";
 import { OutputSafetyValidator } from "#backend/security/output_safety.js";
 
-import { LlmInvocationError, LlmOutputUnsafeError, LlmTimeoutError } from "./errors.js";
+import { LlmInvocationError, LlmOutputUnsafeError } from "./errors.js";
 import { hashMessagesForLedger, type LlmInvocationLedgerPort } from "./invocation_ledger.js";
 
 import type { BlobRef } from "#contracts/blob_ref.v1.js";
@@ -869,12 +869,14 @@ function hashMessages(messages: ReadonlyArray<LlmMessage>): string {
 
 /**
  * True iff `e` should be recorded as a `timeout` (vs `failed`) telemetry status — the Python
- * `except TimeoutError` branch. The SDK adapter maps a Bedrock timeout to {@link LlmTimeoutError}; we
- * also match an error whose `name` is `TimeoutError` (a raw transport abort) for robustness. Everything
- * else is `failed`.
+ * `except TimeoutError` branch. Python's `LlmTimeoutError` subclasses `LlmInvocationError(Exception)`,
+ * NOT the builtin `TimeoutError`, and the SDK adapter maps every provider timeout to `LlmTimeoutError`; so
+ * an SDK-mapped timeout is caught by `except Exception` and recorded `status="failed"`. ONLY a RAW (unmapped)
+ * timeout — an error whose `name` is `TimeoutError` (e.g. a transport abort) — reaches the
+ * `except TimeoutError` arm. Everything else, INCLUDING `LlmTimeoutError`, is `failed`.
  */
-function isTimeoutError(e: unknown): boolean {
-  return e instanceof LlmTimeoutError || (e instanceof Error && e.name === "TimeoutError");
+export function isTimeoutError(e: unknown): boolean {
+  return e instanceof Error && e.name === "TimeoutError";
 }
 
 /**
