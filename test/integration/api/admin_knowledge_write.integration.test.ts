@@ -79,8 +79,8 @@ afterAll(async () => {
     await sql`DELETE FROM core.learning_proposals WHERE proposal_id = ${PROPOSAL_ID}`.execute(db);
     await sql`DELETE FROM core.installations WHERE installation_id = ${INST}`.execute(db);
   }
+  // db.destroy() ends the underlying pg Pool; no separate pool.end() (avoids double-end).
   await db?.destroy();
-  await pool?.end();
 });
 
 function mintCookie(role: Role, userId: string = APPROVER_ID): string {
