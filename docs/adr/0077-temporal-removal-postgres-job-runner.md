@@ -6,8 +6,10 @@
   - **Objection = operational weight** → **Stage 0**: Temporal on PostgreSQL-only persistence. ~zero code, ~zero risk.
   - **Objection = the Temporal dependency itself** → a **coarse-grained `review_jobs` runner** (one job = one whole review, executed in one process). Recommended at our scale. **DBOS** (a Postgres-only durable-execution *library*) is the alternative if fine-grained durable resume is wanted without owning runner code.
   - **Do NOT build a fine-grained, per-step job runner** (Appendix B).
-- Revision: **v5** — closes the execution gaps from the v4 review. Specifically: (1) `orchestrate()` is reused *mostly* unchanged but needs a new non-Temporal **review-job shell**; (2) a small **cancellation/failure/metrics seam** to de-Temporalize `degradation.ts`/`posting.ts`; (3) **admin commands** (knowledge approve/reject, embedder cancel) replace `signalWorkflow`; (4) the **LLM-ledger guarantee is weakened** + a cost/ledger reconcile job; (5) the **post-tail side-effects** are enumerated with per-effect retry behavior; (6) **per-activity internal retries stay** so a whole-review re-run is only for hard crashes; (7) the **schema is expanded**; (8) a **finalizer protocol**; (9) the **scheduler default is fixed** (in-app + advisory lock); (10) **duplicate posting is a bug to prevent**, not an acceptable outcome; (11) the **cutover is detailed**; (12) a **chaos test plan**. **v6** — adds the full **Implementation design** section closing the pre-build details: non-review workloads, the exact review-job shell contract, the activity retry wrapper, the in-flight LLM ledger protocol, cost-reservation reconciliation, fix-prompt/PR-description idempotency, workspace-cleanup ownership, the job state machine, explicit supersede checkpoints, scheduler table/overlap semantics, the outbox-sink migration, the operator API/UI minimum, and a 13th chaos case. **v7** — a final Opus adversarial pass found that several v6 *implementation specifics* were unbuildable-as-written (the §4 `FOR UPDATE` ledger block, the §5 per-call cost reservation, the §2 background mutex-renew, the §13 lost-claim `comment_ids` collision, the §6 fix-prompt key); v7 corrects them and consolidates all 14 findings into an **Implementation hazards & corrections** register. The architecture is unchanged and converged; the register is the input to the implementation plan.
+- Revision: **v5** — closes the execution gaps from the v4 review. Specifically: (1) `orchestrate()` is reused *mostly* unchanged but needs a new non-Temporal **review-job shell**; (2) a small **cancellation/failure/metrics seam** to de-Temporalize `degradation.ts`/`posting.ts`; (3) **admin commands** (knowledge approve/reject, embedder cancel) replace `signalWorkflow`; (4) the **LLM-ledger guarantee is weakened** + a cost/ledger reconcile job; (5) the **post-tail side-effects** are enumerated with per-effect retry behavior; (6) **per-activity internal retries stay** so a whole-review re-run is only for hard crashes; (7) the **schema is expanded**; (8) a **finalizer protocol**; (9) the **scheduler default is fixed** (in-app + advisory lock); (10) **duplicate posting is a bug to prevent**, not an acceptable outcome; (11) the **cutover is detailed**; (12) a **chaos test plan**. **v6** — adds the full **Implementation design** section closing the pre-build details: non-review workloads, the exact review-job shell contract, the activity retry wrapper, the in-flight LLM ledger protocol, cost-reservation reconciliation, fix-prompt/PR-description idempotency, workspace-cleanup ownership, the job state machine, explicit supersede checkpoints, scheduler table/overlap semantics, the outbox-sink migration, the operator API/UI minimum, and a 13th chaos case. **v7** — a final Opus adversarial pass found that several v6 *implementation specifics* were unbuildable-as-written (the §4 `FOR UPDATE` ledger block, the §5 per-call cost reservation, the §2 background mutex-renew, the §13 lost-claim `comment_ids` collision, the §6 fix-prompt key); v7 corrects them and consolidates all 14 findings into an **Implementation hazards & corrections** register. The architecture is unchanged and converged; the register is the input to the implementation plan. **v8 (consolidation)** — resolves the v7-review's #1 (the corrections-vs-stale-body self-contradiction) with a top-of-doc **authority banner** + inline supersedes (cost-model, fix-prompt-key, delivery-setters row, the per-run uniqueness overclaim); folds the rest of the v7 review (#2–#11, all plan-content) into the **Implementation-plan required deliverables** checklist; and revises the effort to **~8–12 weeks**. No architecture change. The ADR is decision-complete; the next artifact is the plan, not a v9.
 - Relates to: ADR-0066, ADR-0068 (LLM ledger — load-bearing), ADR-0074/0075/0076; `docs/architecture/temporal-workflow-integration.md`; spikes in `docs/adr/0077-spikes/`.
+
+> ⚠ **AUTHORITATIVE-ORDER NOTE (read first).** Where any earlier section conflicts with §"Implementation hazards & corrections (v7)", **the v7 register is authoritative and supersedes the earlier text** — do not implement from the superseded passages. Specifically **superseded**: the §4 in-flight-ledger `FOR UPDATE`/"block-the-waiter" text (use poll-with-backoff, no held transaction), the §5 `cost_reservations(reservation_id …)` per-call model (use a compensating signed journal), the §6 fix-prompt `run_id` marker key (use `review_id` + a DB-fenced claim), and the side-effects table's "delivery setters safe (idempotent on rfid)" row (false on the lost-claim path). The implementation plan implements the v7 register, not the v4–v6 prose.
 
 ## Context
 
@@ -22,7 +24,7 @@ What we already operate in Postgres: `core.outbox` (lease/attempts/dead-letter),
 | Objection | Recommended path | Cost | Risk |
 |---|---|---|---|
 | operational weight | **Stage 0** (Temporal on Postgres-only) | an afternoon | ~none |
-| the dependency itself | **Coarse-grained `review_jobs` runner** | ~4–6 weeks | low–moderate |
+| the dependency itself | **Coarse-grained `review_jobs` runner** | **~8–12 weeks** (revised v8 — see Effort) | low–moderate |
 | dependency, prefer not to own runner code | **DBOS** (library) | ~6–9 weeks | moderate (young library on the core loop) |
 | — | fine-grained per-step runner | multi-quarter | high — **do not build** (Appendix B) |
 
@@ -64,7 +66,8 @@ CREATE TABLE core.review_jobs (
   target_engine   text,                 -- cutover only: 'temporal' | 'review_jobs'
   created_at      timestamptz NOT NULL DEFAULT now()
 );
--- at most one active job per run/review:
+-- at most one active job per RUN (this is per-run only; review-level ownership is via
+-- pull_request_reviews.current_run_id + the PR mutex, NOT this index — do not overclaim):
 CREATE UNIQUE INDEX uq_review_jobs_active ON core.review_jobs (run_id)
   WHERE state IN ('ready','leased');
 ```
@@ -99,7 +102,7 @@ A whole-review re-run replays the tail; each external effect needs a defined beh
 | `update_pr_description` | **must be idempotent** (no re-append) | read-modify-write guarded by a marker block; needs a dedicated key |
 | `fix_prompt` comment | **must not double-post** | needs a deterministic external key (GitHub has no native idempotency) |
 | placeholder delete | safe | best-effort, marker-matched |
-| delivery-lifecycle setters | safe (idempotent on rfid) | `record_delivery_*` keyed to finding ids |
+| delivery-lifecycle setters | ⚠ **NOT safe on the lost-claim path** (superseded — see v7 §5/§13) | the lost-claim `PUT` returns `comment_ids=[]` → F9 guard blocks finalize → `delivery_outcome=NULL`; needs persisted `comment_ids` or a reconcile job |
 
 ### LLM-ledger guarantee (corrected — finding #4)
 
@@ -136,7 +139,7 @@ Advisory ⇒ the **availability** bar is relaxed: a late/missing/retried review 
 
 ### Effort
 
-**~4–6 weeks** (v4 said 3–5; the shell + de-Temporal seam + finalizers + reconcile job + cutover detail add ~a week). Still the smallest No-Temporal option, no new dependency, no maturity bet; the bulk is the shell, cutover/parity, the small per-review operator UI, and the chaos soak.
+**~8–12 weeks** (revised at v8). v4–v6's 3–6 week figure under-counted the work the v7 register exposed: the **cost-accounting redesign** (a compensating journal / per-reservation rows against the parity-critical spine enforcer — a sub-project with its own migration + parity tests, and a build-gating decision), the **in-flight LLM ledger mini-protocol** (polling/backoff/lease/takeover/heartbeat/retention), the review-job **shell**, the **retry wrapper** (timeouts + AbortSignal + subprocess kill), the **`background_jobs`** subsystem, the **scheduler** + dedicated runner process, the **cutover** (outbox sink + engine-pinning + redelivery), the **operator UI**, and the **chaos/parity harness**. Still the smallest No-Temporal option and no new dependency — but it is a multi-month core-loop program, not a few weeks. (Stage 0 remains an afternoon.)
 
 ## Cutover & rollback (finding #11)
 
@@ -301,7 +304,22 @@ A final Opus adversarial pass (4 lenses, code-verified) found **3 critical + 11 
 
 ### Convergence
 
-The **architecture is settled and unchanged across all seven revisions** — the v7 findings are implementation specifics, not architectural. Three adversarial passes have now driven this from a decision into a code-grounded hazards register, and further ADR rounds have **diminishing returns**. **This ADR is decision-complete.** The right next artifact is the **implementation plan**, where each hazard above is resolved against the code with TDD and the (now 9-case) chaos suite — not a v8.
+The **architecture is settled and unchanged across all eight revisions** — every finding since v3 has been an implementation specific, not architectural. **This ADR is decision-complete and now internally consistent** (the v8 authority banner + inline supersedes resolve the v7-corrections-vs-stale-body conflict). The right next artifact is the **implementation plan** — not a v9.
+
+**Implementation-plan required deliverables** (the v7-review items, which are plan content, not more ADR design). The plan MUST specify, each with TDD + the 9-case chaos suite:
+
+1. **Cost accounting — build-gating, decide first:** a signed per-call **compensating journal** (derive/check totals; heal an orphan by appending a release row) *or* explicit per-reservation rows — with migration + parity tests against `checkOrRaise`/`recordCallCost`. **Do not start the runner until this is designed.**
+2. **In-flight LLM ledger mini-protocol:** polling backoff, max-wait, stale-owner takeover (fenced via `attempt_token`), heartbeat-renew across provider retries, failed-row retry, ledger-row retention/cleanup.
+3. **Finalizer vs slow-but-alive worker:** stale worker fenced before any finalizer mutates DB; workspace deletion owner-pod/local-only with grace; every GitHub POST preceded by a synchronous claim/`current` check; finalizers idempotent + attempt-token-aware.
+4. **`background_jobs` schema + execution contract:** job/idempotency key, installation/repo scope, state machine, payload schema version, retry policy, finalizer behavior, concurrency caps.
+5. **Scheduler anchoring — pick one:** convert interval cadences to cron *or* anchor windows to DB `now()` in the emit transaction (not both).
+6. **Admin-command contract:** command id, target type/id, actor/user id, requested state, idempotency key, audit record, `consumed_at`/`failed_at`, RBAC mapping.
+7. **Retry wrapper beyond loops:** per-attempt timeout, `AbortSignal`, subprocess-kill, client/fetch timeout propagation, retryable-vs-terminal classification without Temporal error classes.
+8. **Cutover/outbox detail:** `target_engine` on the row vs payload; old `TemporalWorkflowStartPayloadV1` rows keep dispatching; redelivery seeing a different target engine; pinning one run to one engine until terminal.
+9. **Operator UI/API additions:** cost reservation/ledger state, finalizer attempts/errors, claim/checkpoint status, engine target, last-heartbeat, and a manual **"reconcile delivery outcome"** action for the lost-claim class.
+10. **Two-reaper unification** (§v7 hazards) and the **§9 two-signal separation** (mutex-lease fail-open vs `current_run_id` fail-closed).
+
+And it is all gated on the one open decision: **operational weight → Stage 0 (this plan is never written); the dependency itself → write this plan.**
 
 ## Alternatives considered
 
