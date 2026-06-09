@@ -58,3 +58,17 @@ describeDb("ReviewJobsRepo.heartbeat", () => {
     expect(await repo.heartbeat({ jobId: c!.job_id, owner: "w1", token: c!.attempt_token!, leaseMs: 1000 })).toBe(false);
   });
 });
+
+describeDb("ReviewJobsRepo.markDone", () => {
+  it("completes for the owning token and clears the lease; a stale token is applied:false", async () => {
+    const repo = new ReviewJobsRepo(db); const s = await seedRun(db); await repo.enqueue(s);
+    const c = await repo.claim({ owner: "w1", leaseMs: 1000, maxRuntimeMs: 60_000 });
+    expect((await repo.markDone({ jobId: c!.job_id, owner: "w1", token: crypto.randomUUID() })).applied).toBe(false);
+    expect((await repo.getById(c!.job_id))!.state).toBe("leased");
+    expect((await repo.markDone({ jobId: c!.job_id, owner: "w1", token: c!.attempt_token! })).applied).toBe(true);
+    const done = await repo.getById(c!.job_id);
+    expect(done!.state).toBe("done");
+    expect((done as any).attempt_token).toBeNull();          // lease metadata cleared (v3 #9)
+    expect((done as any).lease_owner).toBeNull();
+  });
+});

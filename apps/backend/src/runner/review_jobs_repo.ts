@@ -49,4 +49,14 @@ export class ReviewJobsRepo {
         AND (timeout_at IS NULL OR now() < timeout_at)`.execute(this.db);
     return Number(r.numAffectedRows ?? 0n) === 1;
   }
+
+  async markDone(a: { jobId: string; owner: string; token: string }): Promise<FencedResult> {
+    // tenant:exempt reason=PK-lookup-by-job_id follow_up=FOLLOW-UP-gf3-error-mode
+    const r = await sql`UPDATE core.review_jobs
+        SET state = 'done', finished_at = now(),
+            leased_until = NULL, lease_owner = NULL, attempt_token = NULL, timeout_at = NULL, heartbeat_at = NULL
+      WHERE job_id = ${a.jobId} AND state = 'leased' AND lease_owner = ${a.owner} AND attempt_token = ${a.token}`
+      .execute(this.db);
+    return { applied: Number(r.numAffectedRows ?? 0n) === 1 };
+  }
 }
