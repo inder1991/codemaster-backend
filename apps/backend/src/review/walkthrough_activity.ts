@@ -34,9 +34,12 @@
 // so the LLM client / crypto / uuid / clock all live INSIDE the activity, exactly like
 // bedrockReviewChunk — none of it is in the workflow bundle.
 
+import { createHash } from "node:crypto";
+
 import { LlmInvocationError, LlmOutputUnsafeError } from "#backend/integrations/llm/errors.js";
 import type { LlmClient } from "#backend/integrations/llm/client.js";
 import { BedrockBudgetExceededError } from "#backend/cost/enforcer.js";
+import { purposeChunkId } from "#backend/integrations/llm/invocation_ledger.js";
 import { buildSystemPrompt } from "#backend/llm/review_prompt.js";
 import { modelForPurpose } from "#backend/llm/model_router.js";
 import { wrapUntrusted } from "#backend/security/trust_tier_wrapping.js";
@@ -74,6 +77,19 @@ export type LlmClientCacheLike = {
  * the 2026-06-02 smoke (PR #122).
  */
 export const WALKTHROUGH_MAX_TOKENS = 4096;
+
+/**
+ * de-Temporal Phase 2 (D2 / W2.2) — the tool-schema-version component of the walkthrough's LLM-invocation
+ * idempotency key. A content-addressable digest of WALKTHROUGH_TOOL_SCHEMA: when the tool schema changes
+ * (which changes the SHAPE of the structured output, and therefore the parse), the key changes and a
+ * stale stored response is NOT replayed. Per-site (distinct from review_activity's REVIEW_TOOL_SCHEMA_VERSION),
+ * so two PR-level purposes never share a tool-schema digest. `createHash` is the gate-sanctioned hashing
+ * primitive (clock_random gate bans random fns, NOT createHash; mirrors review_activity.ts:55).
+ */
+export const WALKTHROUGH_TOOL_SCHEMA_VERSION = `wts-${createHash("sha256")
+  .update(Buffer.from(JSON.stringify(WALKTHROUGH_TOOL_SCHEMA), "utf-8"))
+  .digest("hex")
+  .slice(0, 16)}`;
 
 /**
  * Strip the `refs/heads/` prefix GitHub sometimes returns so the prompt sees the bare branch name
@@ -303,6 +319,21 @@ export async function doGenerateWalkthrough(
       // platform-scopes the call (substitutes the all-ones sentinel). Genuine platform jobs would pass
       // PLATFORM_INVOCATION_INSTALLATION_ID; the walkthrough is per-PR, so the PR's installation owns it.
       installationId: prMeta.installation_id,
+      // de-Temporal Phase 2 (D2 / W2.2 / F9) — ledger this PR-level paid call by PURPOSE. The stable key is
+      // review_id (prMeta.pr_id — the PR/review identity) + the purpose chunk-key surrogate
+      // (purposeChunkId("walkthrough"), E8) + role + model + prompt hash + WALKTHROUGH_TOOL_SCHEMA_VERSION.
+      // run_id is deliberately NOT in the key (D2: the output need not change per run). On a retry the
+      // stored provider response replays instead of buying a second paid Bedrock completion. F9: the SAME
+      // "walkthrough" token drives BOTH the chunk-key surrogate AND the metric purpose label
+      // (ledgerPurpose), so cost observability and replay keying never diverge. The client only acts on
+      // this when constructed with a ledger; unit tests / platform jobs (no ledger) behave as the frozen
+      // Python (invoke, no replay).
+      idempotency: {
+        reviewId: prMeta.pr_id,
+        chunkId: purposeChunkId("walkthrough"),
+        toolSchemaVersion: WALKTHROUGH_TOOL_SCHEMA_VERSION,
+        ledgerPurpose: "walkthrough",
+      },
     });
     rawBlocks = result.raw_content_blocks;
   } catch (e) {
