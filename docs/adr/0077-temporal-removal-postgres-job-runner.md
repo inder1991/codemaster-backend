@@ -1,136 +1,182 @@
 # ADR-0077: Temporal removal — decision, and the right way to do it
 
-- Status: **Proposed**
+- Status: **Proposed** (architecture direction approved in review; execution gaps below close it toward Accepted)
 - Date: 2026-06-09
-- **Recommendation (v4):**
-  - **If the objection is operational weight** → **Stage 0**: run Temporal Server on PostgreSQL-only persistence. ~zero code, ~zero risk.
-  - **If the objection is the Temporal dependency itself** → build a **coarse-grained `review_jobs` runner** (one job = one whole review, run in-process). This is the recommended No-Temporal path at our scale. **DBOS** (a Postgres-only durable-execution *library*) is the alternative if fine-grained durable resume is wanted without owning any runner code.
-  - **Do NOT build a fine-grained, per-step job runner** (one job per clone/classify/chunk/aggregate). That design — the one the three review passes shredded — is preserved only as a cautionary appendix (Appendix B).
-- Revision: **v4** — adds the coarse-vs-fine-grained distinction. v1–v3 evaluated only the *fine-grained* runner and (rightly) recommended against it; the catalog of failures was an indictment of **over-decomposition**, not of a Postgres runner per se. Because codemaster is an **internal, advisory** tool (the bot is comment-only and never blocks a merge — invariant 9), the reliability bar permits a far simpler **coarse-grained** runner that sidesteps the entire risk register.
-- Relates to: ADR-0066, ADR-0068 (the LLM ledger — load-bearing here), ADR-0074/0075/0076; `docs/architecture/temporal-workflow-integration.md`; proof-of-concept spikes in `docs/adr/0077-spikes/`.
+- **Recommendation:**
+  - **Objection = operational weight** → **Stage 0**: Temporal on PostgreSQL-only persistence. ~zero code, ~zero risk.
+  - **Objection = the Temporal dependency itself** → a **coarse-grained `review_jobs` runner** (one job = one whole review, executed in one process). Recommended at our scale. **DBOS** (a Postgres-only durable-execution *library*) is the alternative if fine-grained durable resume is wanted without owning runner code.
+  - **Do NOT build a fine-grained, per-step job runner** (Appendix B).
+- Revision: **v5** — closes the execution gaps from the v4 review. Specifically: (1) `orchestrate()` is reused *mostly* unchanged but needs a new non-Temporal **review-job shell**; (2) a small **cancellation/failure/metrics seam** to de-Temporalize `degradation.ts`/`posting.ts`; (3) **admin commands** (knowledge approve/reject, embedder cancel) replace `signalWorkflow`; (4) the **LLM-ledger guarantee is weakened** + a cost/ledger reconcile job; (5) the **post-tail side-effects** are enumerated with per-effect retry behavior; (6) **per-activity internal retries stay** so a whole-review re-run is only for hard crashes; (7) the **schema is expanded**; (8) a **finalizer protocol**; (9) the **scheduler default is fixed** (in-app + advisory lock); (10) **duplicate posting is a bug to prevent**, not an acceptable outcome; (11) the **cutover is detailed**; (12) a **chaos test plan**.
+- Relates to: ADR-0066, ADR-0068 (LLM ledger — load-bearing), ADR-0074/0075/0076; `docs/architecture/temporal-workflow-integration.md`; spikes in `docs/adr/0077-spikes/`.
 
 ## Context
 
-The team is evaluating whether codemaster-backend should stop depending on Temporal, motivated by the operational weight of self-hosting Temporal Server on on-prem OpenShift. **The decision hinges on one question: is the objection Temporal's operational weight, or the dependency itself?** And — the v4 insight — *if* the dependency must go, the granularity of the replacement matters more than the choice of "Postgres runner vs library."
+The decision hinges on one question: **is the objection Temporal's operational weight, or the dependency itself?** If the dependency must go, the **granularity** of the replacement matters more than "Postgres runner vs library": the three review passes (14 + 17 + 28 findings) showed a *fine-grained, per-step* runner is unbuildable-without-multi-quarter-pain, while a *coarse-grained* runner (the whole review as one in-process job) sidesteps the entire register.
 
-What Temporal provides (a replacement must account for all): durable checkpointing; retries+backoff; timers; cancellation propagation; activity heartbeats; timeout handling; workflow-ID conflict policy; schedule durability; replay/versioning; per-attempt history + a Web UI; signals (unused here).
+**The decisive property: the bot is advisory** (comment-only; never blocks a merge — invariant 9). That lowers the **availability** bar (a missing or late review is tolerable) — but **not** the bar on *what gets posted*: a duplicate or superseded-review comment damages trust and is a **bug to prevent**, not a normal outcome (see §Correctness below).
 
-What we already operate in Postgres: `core.outbox` (lease/attempts/dead-letter), `core.review_runs` (lifecycle + supersede + `current_run_id`), `audit.workflow_events`, the ADR-0068 LLM ledger, the `pr_review_mutex` + janitor/reaper. The review pipeline’s `orchestrate()` is a **pure, in-process async driver** already callable without any Temporal context (its unit tests call it directly).
-
-**The decisive property: the bot is advisory.** A failed, delayed, or duplicated review is a *missing or duplicate advisory comment*, never a blocked merge or data loss. That lowers the reliability bar enough that "simple + self-healing" beats "bulletproof + complex."
+What we already operate in Postgres: `core.outbox` (lease/attempts/dead-letter), `core.review_runs` (lifecycle + supersede + `current_run_id`), `audit.workflow_events`, the ADR-0068 ledger, `pr_review_mutex` + janitor/reaper. `orchestrate()` is a pure in-process async driver, unit-tested without Temporal.
 
 ## Decision
 
-| If the objection is… | Recommended path | Cost | Risk |
+| Objection | Recommended path | Cost | Risk |
 |---|---|---|---|
-| **operational weight** | **Stage 0** — Temporal on Postgres-only persistence (drop Cassandra/ES) | an afternoon | ~none (no code change) |
-| **the dependency itself** | **Coarse-grained `review_jobs` runner** (below) | ~3–5 weeks | low–moderate (small bespoke poller; reuses existing primitives) |
-| the dependency itself, prefer not to own runner code | **DBOS** (Postgres-only durable-execution library) | ~6–9 weeks | moderate (maturity bet on a young library on the core loop) |
-| — | **Fine-grained per-step runner** | multi-quarter | high — **do not build** (Appendix B) |
+| operational weight | **Stage 0** (Temporal on Postgres-only) | an afternoon | ~none |
+| the dependency itself | **Coarse-grained `review_jobs` runner** | ~4–6 weeks | low–moderate |
+| dependency, prefer not to own runner code | **DBOS** (library) | ~6–9 weeks | moderate (young library on the core loop) |
+| — | fine-grained per-step runner | multi-quarter | high — **do not build** (Appendix B) |
 
 ## The coarse-grained `review_jobs` runner (recommended, if No Temporal)
 
-**One job = one whole review, executed in a single process.** Not one job per step.
+**One job = one whole review, in one process.** Reuse `orchestrate()` *mostly* unchanged, wrapped in a new **non-Temporal review-job shell** that replaces the Temporal workflow body.
 
-### Model
+### What is reused vs. built (correcting v4's "unchanged")
+
+- **Reused mostly as-is:** `orchestrate()` (the 9-stage pipeline), all 52 activities (called as plain async functions), the in-process `fanOutReview`, the contracts/repos.
+- **Built new — the review-job shell** (replacing `review_pull_request.workflow.ts`’s body): the start-review **gate**, **mutex lease renewal** during the run, **workspace allocate/release**, **placeholder post/delete**, run **lifecycle finalization**, and the **failed/cancelled mapping** the Temporal body did.
+- **Built new — a small de-Temporal seam (finding #2):** `degradation.ts` and `posting.ts` currently reach for Temporal failure/cancellation types and the workflow **metric meter**. Introduce a tiny abstraction — `isCancelled(err)`, `classifyFailure(err)`, and a `Metrics` port (→ OTel directly) — so the pipeline helpers carry no `@temporalio` import.
+
+### Schema (expanded — finding #7)
 
 ```sql
 CREATE TABLE core.review_jobs (
   job_id          uuid PRIMARY KEY,
-  run_id          uuid NOT NULL,        -- the execution identity (FK core.review_runs.run_id)
-  review_id       uuid NOT NULL,        -- the PR-review grouping (metadata)
-  installation_id uuid NOT NULL,        -- tenancy + fairness dimension
-  state           text NOT NULL DEFAULT 'ready',  -- ready | leased | done | failed | dead
+  run_id          uuid NOT NULL,        -- execution identity (FK core.review_runs.run_id)
+  review_id       uuid NOT NULL,        -- PR-review grouping
+  installation_id uuid NOT NULL,        -- tenancy + fairness
+  repo_id         uuid NOT NULL,
+  provider        text NOT NULL,        -- e.g. 'github'
+  state           text NOT NULL DEFAULT 'ready',  -- ready|leased|done|failed|dead|cancelled
+  priority        int  NOT NULL DEFAULT 0,         -- fair scheduling
   attempts        int  NOT NULL DEFAULT 0,
   max_attempts    int  NOT NULL DEFAULT 3,
   lease_owner     text,
   attempt_token   uuid,                 -- fencing: minted fresh on every claim
   leased_until    timestamptz,
   heartbeat_at    timestamptz,
-  run_after       timestamptz NOT NULL DEFAULT now(),  -- retry backoff
+  timeout_at      timestamptz,          -- per-review hard ceiling
+  run_after       timestamptz NOT NULL DEFAULT now(),
+  started_at      timestamptz,
+  finished_at     timestamptz,
+  cancel_reason   text,
+  dead_reason     text,
   last_error      text,
+  target_engine   text,                 -- cutover only: 'temporal' | 'review_jobs'
   created_at      timestamptz NOT NULL DEFAULT now()
 );
+-- at most one active job per run/review:
+CREATE UNIQUE INDEX uq_review_jobs_active ON core.review_jobs (run_id)
+  WHERE state IN ('ready','leased');
 ```
 
-A worker loop:
+### Worker loop & retry economics (finding #6)
 
-1. **Claim** the next review with `FOR UPDATE SKIP LOCKED`, set `lease_owner` + a fresh `attempt_token` + `leased_until` (DB `now()` is the sole lease clock).
-2. **Run the existing `orchestrate()` unchanged, in this process** — clone → classify → chunk → fan-out chunk reviews (in-process `Promise.all`, exactly as today) → aggregate → post.
-3. **Heartbeat** the lease while the review runs (extend under the full fence); a single per-review timeout bounds a stuck review.
-4. **Finalize**: mark `done`/`failed`; on terminal failure past `max_attempts`, `dead`.
-5. **Crash** → the lease expires → another worker re-claims (fresh `attempt_token`) and **re-runs the whole review from scratch.**
+1. **Claim** with `FOR UPDATE SKIP LOCKED` (fair by `priority, run_after`); set `lease_owner` + fresh `attempt_token` + `leased_until` (DB `now()` is the sole lease clock); `started_at = now()`.
+2. **Run the shell + `orchestrate()` in-process.** **Each activity call keeps its existing `RETRY_POLICIES` retry/backoff internally** — so a transient late-stage failure (a flaky GitHub post) retries *locally and cheaply*. A whole-review re-run is reserved for a **hard process crash**, not a transient error; otherwise late failures become expensive full reruns.
+3. **Heartbeat** the lease (and renew the PR mutex) while running; `timeout_at` bounds a stuck review.
+4. **Finalize** via the finalizer protocol (below); set `finished_at`, `state`.
+5. **Hard crash** → lease expires → re-claim (fresh `attempt_token`) → **whole-review re-run** (semantics below).
 
-### Why the entire v1–v3 risk register vanishes
+### Why the v1–v3 risk register vanishes (unchanged from v4)
 
-Every structural finding came from decomposing the review into independently-claimed per-step jobs. Keeping the whole review as one in-process job removes the root cause:
-
-| Fine-grained failure (v1–v3) | Coarse-grained outcome |
+| Fine-grained failure | Coarse-grained outcome |
 |---|---|
-| pod-local workspace: clone on pod A, classify on pod B finds an empty dir | one process holds the clone for the whole review ✅ |
-| no home for shared `ReviewWorkflowState` | stays in memory, exactly like today ✅ |
-| fan-in N=0 wedge; the ~11-stage tail collapsed into one step | it's all just code inside `orchestrate()`, not a job graph ✅ |
-| §1 schema won't compile (unique index on a partitioned table) | no per-chunk rows, no partitioning gymnastics ✅ |
-| per-chunk retrieval loses the query-vector cache / pinned generation | in-process cache preserved ✅ |
-| `arbitrationNow` frozen-clock loss | a single in-process run; same as today ✅ |
+| pod-local workspace; clone on A, classify on B finds empty dir | one process holds the clone for the whole review ✅ |
+| no home for shared `ReviewWorkflowState` | stays in memory, as today ✅ |
+| fan-in N=0 wedge; 11-stage tail as one step | it's all code inside `orchestrate()`, not a job graph ✅ |
+| schema won't compile (partitioned unique index) | no per-chunk rows ✅ |
+| lost query-vector cache / pinned generation; frozen clock | one in-process run; as today ✅ |
 
-### Reused primitives (this is "more of the same," not new infrastructure)
+### Side effects & idempotency on re-run (finding #5)
 
-- **PR mutex** (`pr_review_mutex`) → already prevents two workers running the same PR's review; the claim-gate re-checks it.
-- **Supersede + `current_run_id`** → a newer push allocates a new `review_jobs` row; the older review’s in-`orchestrate()` claim-checks abort before it posts (unchanged behavior).
-- **LLM ledger (ADR-0068)** → a whole-review re-run **replays the expensive Bedrock calls instead of re-paying** — so a crash costs a re-clone + re-analysis (seconds), not real LLM spend.
-- **Post idempotency** → the existing 2-phase atomic-claim + `comment_ids` invariant + stale-write guard already make re-posting safe.
-- **Reaper / janitor** → already the model for "a wedged review gets re-run"; point it at `review_jobs`.
-- **Outbox pattern** → the template for lease/attempts/dead-letter; `review_jobs` is the same shape.
+A whole-review re-run replays the tail; each external effect needs a defined behavior:
 
-### Crash & failure semantics (honest)
+| Side effect | On re-run | Mechanism |
+|---|---|---|
+| Bedrock LLM call | replay if the ledger write committed; else **re-pay** | ADR-0068 ledger (weakened guarantee below) |
+| `post_review` (findings) | safe (no duplicate) | 2-phase atomic-claim + `comment_ids` invariant + stale-write guard |
+| `post_check_run` | safe (upsert at head SHA) | neutral check-run keyed to head SHA |
+| `update_pr_description` | **must be idempotent** (no re-append) | read-modify-write guarded by a marker block; needs a dedicated key |
+| `fix_prompt` comment | **must not double-post** | needs a deterministic external key (GitHub has no native idempotency) |
+| placeholder delete | safe | best-effort, marker-matched |
+| delivery-lifecycle setters | safe (idempotent on rfid) | `record_delivery_*` keyed to finding ids |
 
-- **Whole-review re-run on crash** — coarse, not fine-grained resume. Acceptable because (a) crashes are rare, (b) the ledger memoizes the costly LLM calls, and (c) re-clone + re-analysis is cheap.
-- **At-most-one running** per PR via the mutex; **fencing** (`attempt_token`) makes a stolen lease’s late write a no-op.
-- **Double-post** is bounded by the post-step idempotency; worst case is a duplicate advisory comment, not corruption.
-- **Cost-cap drift**: a crashed run can leave a small unreconciled cost reservation; bounded and healable by a periodic reconcile sweep (the daily cap is coarse).
+### LLM-ledger guarantee (corrected — finding #4)
 
-### What you still build
+v4 over-claimed "replays instead of re-paying." Accurate statement: **the ledger replays a call only when its ledger write completed.** It does **not** cover: a crash *after the provider call but before the ledger write* (→ a re-run re-pays), *concurrent* duplicate provider calls (the `lookup` is a plain `SELECT`, no `FOR UPDATE`), or a crash *after the ledger write but before `recordCallCost`* (→ a leaked cost reservation). Mitigations: (a) make the ledger `lookup` acquire `FOR UPDATE`/an advisory lock on the idempotency key so a concurrent invoker blocks rather than races; (b) add a **cost/ledger reconcile job** that releases reservations with no matching completed call and reconciles ledger-without-recordCallCost rows. Net for an advisory tool: occasional small re-spend on a crash is acceptable; unbounded cost drift is not — the reconcile job bounds it.
 
-A small, bounded surface: the leased `review_jobs` poller + heartbeat + reaper wiring; the schedules (an in-app scheduler with an advisory-lock leader, or `pg_cron` if the platform approves — **not** a new heavy component); minimal **per-review** operator views (far less than per-attempt history — list/inspect/retry/cancel a review, with action audit + RBAC); and the cutover/parity work shared by any option. The dispatch fork (Temporal vs `review_jobs`) is resolved once, inside the existing webhook transaction, by a `target_engine` on the outbox row — one dispatcher, no second path.
+### Finalizer protocol (finding #8)
+
+Every terminal path (done / failed / dead / cancelled / superseded) runs **idempotent finalizers**:
+- release the **PR mutex**;
+- release the **workspace** (lease + disk);
+- delete the **placeholder** where appropriate;
+- **release/reconcile the cost reservation**;
+- set the run **lifecycle** (`COMPLETED`/`FAILED`/`CANCELLED`) + `review_jobs.state`.
+
+Graceful paths run finalizers in the shell's `finally`. **Hard crashes** (the process dies before `finally`) are healed by the **reaper/janitor**, which on lease-expiry runs the same idempotent finalizers before re-enqueueing — so mutex/workspace/cost are never leaked past one lease window.
+
+### Scheduler (decided — finding #9)
+
+The crons (mutex-janitor, review-run reaper, retention, confluence sync) run on an **in-app scheduler with a Postgres advisory-lock leader election** — **no new component.** `pg_cron` is optional and only if the platform explicitly approves the extension.
+
+### Correctness vs availability (recalibrated — finding #10)
+
+Advisory ⇒ the **availability** bar is relaxed: a late/missing/retried review is tolerable. It does **not** relax *posting correctness*: a duplicate, stale, or superseded-review comment erodes trust. Therefore the post-step idempotency (table above) and the supersede claim-checks are **hard requirements**, validated by the chaos tests below — not "cosmetic" outcomes.
+
+### Crash & failure semantics
+
+- **At-most-one running** per PR (the unique active-job index + the PR mutex). **Fencing** voids a stolen lease's late write.
+- **Whole-review re-run** only on hard crash; transient failures retry per-activity in-process (finding #6).
+- **Cost drift** from crashes is bounded + healed by the reconcile job (finding #4).
+
+### Admin commands (finding #3 — replaces `signalWorkflow`)
+
+`AdminTemporalPort.signalWorkflow` (knowledge approve/reject; embedder cancel) has no signal equivalent here. Replace with **durable admin-command rows** (a `command` table or columns on the target row) that the relevant worker/loop observes and acts on idempotently: knowledge approve/reject → a command consumed by the knowledge flow; embedder cancel → a `cancel_requested` flag the embedder job checks at its safe points; a review cancel → set `review_jobs.cancel_reason` + the run’s supersede/cancel, which the running shell honors at its claim-checkpoints. Each command is audited (RBAC on destructive ones).
 
 ### Effort
 
-**~3–5 weeks** — the smallest of the No-Temporal options. The runner core is small (a leased poller over a table you already have the pattern for), `orchestrate()` is reused verbatim in-process, and the heavy reliability primitives already exist. The bulk of the time is cutover/parity + the small operator UI + a soak.
+**~4–6 weeks** (v4 said 3–5; the shell + de-Temporal seam + finalizers + reconcile job + cutover detail add ~a week). Still the smallest No-Temporal option, no new dependency, no maturity bet; the bulk is the shell, cutover/parity, the small per-review operator UI, and the chaos soak.
 
-## Why an advisory internal tool justifies "simple"
+## Cutover & rollback (finding #11)
 
-The reviewers’ failure modes are tolerable here precisely because the bot is comment-only:
-- occasional **double-post** → cosmetic;
-- occasional **wedge → reaper retry** → a slightly late comment;
-- **whole-review re-run** → cheap (ledger replays the LLM spend).
+- **Dispatch fork:** resolve `target_engine` (by installation/repo) **inside the existing `persistWebhook` transaction**, written onto the outbox row; **one dispatcher** routes to Temporal `startWorkflow` *or* a `review_jobs` insert based on it — no second dispatch path.
+- **Drain old Temporal rows:** stop routing *new* webhooks to Temporal for a flipped install; let in-flight Temporal workflows finish on Temporal (≤30 min); a drain check confirms none remain before decommissioning the Temporal worker.
+- **GitHub redelivery:** dedup on a **content key** (installation+repo+pr+head_sha+action), *not* `delivery_id` (GitHub re-mints it); route a redelivery to the engine that owns the current `run_id`, not the static flag.
+- **Pause the runner:** a global/per-install `runner_paused` flag stops claiming new `review_jobs` while letting in-flight ones finish.
+- **Rollback (before Temporal is removed):** flip `target_engine` back to Temporal for new work; for in-flight `review_jobs`, either let them finish on the runner, or abandon-and-re-allocate a Temporal run (idempotent post makes the re-review safe); the reaper/janitor must understand `review_jobs` before cutover.
 
-None is data loss or an outage. This is the canonical case where right-sizing the reliability bar (and the design) beats importing a general-purpose engine.
+## Required chaos test plan (finding #12)
 
-## Why NOT the fine-grained per-step runner (the cautionary path)
-
-Preserved in **Appendix B**. Three independent review passes (14 + 17 + a 28-finding Opus pass, several verified vs PostgreSQL 18.3 and live source) showed that decomposing the review into independently-claimed per-step jobs breaks five load-bearing properties and produces a schema that does not even compile, silent double-posts, deleted in-flight jobs, cost leaks, shadow contamination, and a multi-quarter scope. **Coarse-grained avoids all of it by not decomposing.** If anyone proposes per-step jobs "for fine-grained resume," the answer is: use DBOS (it provides that, hardened) rather than hand-rolling it.
+Pre-merge, against a disposable Postgres + a real multi-worker harness:
+- **kill worker during clone** → re-run produces a correct single review; workspace not leaked.
+- **kill during the LLM call** → re-run re-pays at most the in-flight call (ledger), no double-post.
+- **kill after GitHub post, before DB mark-done** → re-run does **not** double-post (post idempotency holds); job reconciles to done.
+- **lease stolen while the old worker is still alive** → the old worker's late writes are fenced out (0 rows); no double effect.
+- **supersede during a review** → the older run no-ops at its next claim-checkpoint; never posts.
+- **SIGTERM graceful drain** → stop claiming, finish in-flight, finalizers run, exit within the deadline.
+- **multi-pod same-PR contention** → the unique active-job index + mutex admit exactly one runner.
 
 ## Alternatives considered
 
-- **Stage 0 (Temporal on Postgres-only)** — recommended if the objection is operational weight; preserves the in-process model at ~zero cost.
-- **Coarse-grained `review_jobs` runner (recommended if No Temporal)** — simplest, no new dependency, reuses `orchestrate()` + existing primitives.
-- **DBOS** — Postgres-only durable-execution *library* (no server, no new pod); gives fine-grained durable resume + recovery + versioning without owning runner code; cost is a young framework on the core loop.
-- **Fine-grained per-step runner** — **rejected** (Appendix B): the over-decomposed design the review passes shredded.
-- **LangGraph** — a different *layer*: an agent/LLM-orchestration framework (great for making a step *agentic*), not a durable distributed-execution backbone. The library leaves you owning the reliability layer; its distributed story is a separate self-hosted server. Not a Temporal replacement; could compose *inside* a step if a review ever becomes agentic.
-- **Restate / Hatchet** — a new server component (→ ADR); not preferred while Postgres-native options work.
+- **Stage 0** (Temporal on Postgres-only) — recommended if the objection is operational weight.
+- **Coarse-grained `review_jobs` runner** (recommended if No Temporal) — simplest; no new dependency; reuses `orchestrate()` + existing primitives.
+- **DBOS** — Postgres-only durable-execution library (no server); fine-grained durable resume without owning runner code; young-framework-on-core-loop cost.
+- **Fine-grained per-step runner** — rejected (Appendix B).
+- **LangGraph** — a different layer (agent/LLM orchestration, not a durable distributed backbone); could compose *inside* a step if a review becomes agentic.
+- **Restate / Hatchet** — new server component (→ ADR).
 - **BullMQ + Redis** — rejected (Redis excluded; a queue, not durable execution).
 
 ## Open question (the decision)
 
-**Is the objection Temporal's operational weight, or the dependency itself?** Operational weight → **Stage 0**. The dependency itself → **the coarse-grained `review_jobs` runner** (recommended at our scale), or **DBOS** if fine-grained durable resume is wanted without owning runner code. In all cases, **avoid the fine-grained per-step runner.**
+**Operational weight → Stage 0. The dependency itself → the coarse-grained `review_jobs` runner** (or DBOS to avoid owning runner code). **Avoid the fine-grained per-step runner.**
 
 ---
 
 ## Appendix A — proof-of-concept spikes (honest scope)
 
-`docs/adr/0077-spikes/spike.mjs` (the engine) and `spike2.mjs` (fencing/heartbeat/idempotency under a forced lease-steal), runnable against a throwaway Postgres. **They prove** the toy engine mechanics in isolation (hand-off, fan-in for N≥1, lease-steal recovery, fencing, heartbeat, idempotency). **They do NOT prove** a concurrent in-flight paid provider call, multi-process workers, real clone/analysis durations, clock skew, the production pipeline’s shared state/workspace, or the N=0 base case. Note: for the **coarse-grained** design the spikes are largely moot — there is no per-step fan-in to fence; the unit of work is the whole review.
+`docs/adr/0077-spikes/spike.mjs` + `spike2.mjs`. They prove the toy engine mechanics in isolation (hand-off, fan-in for N≥1, lease-steal recovery, fencing, heartbeat, idempotency). They do **not** prove a concurrent in-flight paid call, multi-process, real durations, clock skew, or the N=0 case. For the **coarse-grained** design they are largely moot — there is no per-step fan-in to fence; the unit of work is the whole review. The required evidence for coarse-grained is the **chaos test plan** above, not the spikes.
 
 ## Appendix B — the fine-grained per-step runner (DO NOT BUILD)
 
-Retained as a cautionary record of the rejected design and the verified reasons. A fine-grained runner (one job per step) must close all of: a schema that compiles (no partitioned-table unique-index for fan-in; `run_id` PK; per-sink non-partitioned idempotency ledgers); DB-`now()` lease clock + fencing + fenced watchdog; the fan-in N=0 base case; persisted shared `ReviewWorkflowState`; pinned retrieval generation + a `run_logical_now` clock; **workspace locality (a new RWX infra dependency or sticky claims)**; the ~11-stage tail expanded with per-step idempotency; `post` decomposed into four idempotent GitHub sub-effects; unified reaper+supersede+fence terminal authority; guaranteed finalizers incl. cost-release; declared cross-tenant privileged claim path; a new high-churn per-attempt history store; and a cutover plan whose shadow mode does not contaminate `pr_id`-keyed `core.review_findings` nor double-spend Bedrock on prompt drift. Each is a sub-project; together they are the multi-quarter scope this ADR recommends against. **The coarse-grained runner exists specifically so none of this is necessary.**
+Retained as a cautionary record. A per-step runner must close all of: a compiling schema (no partitioned-table unique index; `run_id` PK; per-sink non-partitioned idempotency ledgers); DB-`now()` lease clock + fencing + fenced watchdog; the fan-in N=0 base case; persisted shared `ReviewWorkflowState`; pinned retrieval generation + a `run_logical_now` clock; **workspace locality (new RWX infra or sticky claims)**; the 11-stage tail expanded with per-step idempotency; `post` decomposed into four idempotent GitHub sub-effects; unified reaper+supersede+fence authority; guaranteed finalizers incl. cost-release; a declared cross-tenant privileged claim path; a new high-churn per-attempt history store; and a shadow-cutover that does not contaminate `pr_id`-keyed findings nor double-spend Bedrock on prompt drift. Each is a sub-project; together, multi-quarter. **The coarse-grained runner exists so none of this is necessary.**
