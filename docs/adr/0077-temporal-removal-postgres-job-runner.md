@@ -1,250 +1,125 @@
-# ADR-0077: Temporal removal — a Postgres-backed durable job runner
+# ADR-0077: Temporal removal — decision and the Postgres-runner option
 
-- Status: **Proposed** (NOT yet Accepted — gated behind Stage 0 below and the open questions at the end)
+- Status: **Proposed**
 - Date: 2026-06-09
-- Revision: **v2** — incorporates the design review of 2026-06-09 (fencing, heartbeats, external-side-effect idempotency, supersede protocol, versioning, backpressure, Postgres-queue ops, shadow-mode parity, rollback, observability acceptance criteria, and the queue-substrate decision). Review findings are addressed inline and cross-referenced as `[R-n]`.
-- Relates to: ADR-0066, ADR-0068 (LLM invocation ledger — load-bearing here), ADR-0074, ADR-0075, ADR-0076, and `docs/architecture/temporal-workflow-integration.md`
+- **Recommendation (v3): adopt _Stage 0_ — run Temporal Server on PostgreSQL-only persistence — and do NOT undertake the full Postgres job-runner rewrite, UNLESS the team decides the Temporal _dependency itself_ (not merely its operational weight) must go.** The full runner is a multi-quarter rewrite of the sacred core loop carrying the unresolved-risk register in Appendix B; the evidence below is why it is documented but not recommended.
+- Revision: **v3** — re-frames the decision after three adversarial review passes. v1 (design review) raised 14 findings; a second human review raised 17; an Opus-4.8 6-lens adversarial pass raised ~28 more, several empirically verified against PostgreSQL 18.3 and the live codebase. The cumulative finding is structural (below), not a punch-list — so v3 leads with the decision and demotes the runner design to Appendix B.
+- Relates to: ADR-0066, ADR-0068 (LLM invocation ledger — load-bearing here), ADR-0074, ADR-0075, ADR-0076; `docs/architecture/temporal-workflow-integration.md` (the map of what would be replaced); proof-of-concept spikes in `docs/adr/0077-spikes/` (scope in Appendix A).
 
 ## Context
 
-The team is evaluating whether codemaster-backend should **stop depending on Temporal**. The motivation is operational: Temporal Server is a self-hosted, multi-service stateful component on on-prem OpenShift, and the team would prefer to lean on the PostgreSQL it already runs. This ADR records the analysis, a recommended option, and an execution-grade design so the decision is made deliberately — and so we first rule out the cheap alternative.
+The team is evaluating whether codemaster-backend should **stop depending on Temporal**, motivated by the operational weight of self-hosting Temporal Server (a multi-service stateful component) on on-prem OpenShift. This ADR records the analysis and a recommendation.
 
-### What Temporal actually provides `[R-2]`
+**The decision hinges on one question:** *is the objection Temporal's operational weight, or the Temporal dependency itself?*
 
-The v1 of this ADR claimed the "single missing capability" is automatic checkpointing. That was too narrow. Temporal gives us — and a replacement must consciously account for — **all** of:
+- **Operational weight** → Stage 0 solves it at ~zero cost (below). Recommended.
+- **The dependency itself** → the full Postgres runner (Appendix B), a multi-quarter core-loop rewrite. Only undertake with eyes open to the risk register.
 
-| Capability | Do we rebuild it? |
-|---|---|
-| durable step checkpointing (crash-resume) | **Yes** — the core of the runner |
-| automatic per-step retries + backoff | Yes — but the outbox already does exactly this |
-| timers / `sleep` | Yes — a `run_after` column (we use no long workflow timers today) |
-| **cancellation propagation** | **Yes** — the supersede protocol §5 |
-| **activity heartbeats** (long steps) | **Yes** — the heartbeat/lease protocol §3 |
-| activity timeout handling | Yes — `timeout_at` + a watchdog |
-| **workflow-ID conflict policy** | Yes — the dispatch/dedup rules (one webhook ⇒ one run) |
-| schedule durability | Yes — `pg_cron` / a small scheduler |
-| **replay / versioning** (`workflow.patched`) | **Yes** — explicit `workflow_version` / `step_version` §6 |
-| history / audit | Mostly have it — `audit.workflow_events` + the jobs table |
-| **query / debug tooling (Web UI)** | **Yes, and this is the biggest single loss** §10 |
-| signal handling | **No** — we define no signals today |
+### What Temporal actually provides
 
-So this is not "rebuild one thing." It is "rebuild a focused slice of a workflow engine, deliberately, and re-earn its operational guarantees."
+A replacement must consciously account for all of: durable step checkpointing (crash-resume); per-step retries+backoff; timers; **cancellation propagation**; **activity heartbeats**; activity timeout handling; workflow-ID conflict policy; schedule durability; **replay/versioning** (`workflow.patched`); per-attempt **history + a Web UI**; and signal handling. We use no signals today, but everything else is in active use.
 
-### The load-bearing fact: most durable state is already in Postgres
+### The load-bearing fact, restated honestly
 
-Roughly **70% of what Temporal manages for the review pipeline already lives in our schema**: `core.outbox` (lease/attempts/dead-letter), `core.review_runs` (lifecycle state machine + supersede + `current_run_id`), `audit.workflow_events` (a history), the ADR-0068 LLM ledger (idempotency for paid calls), the `pr_review_mutex` leases + janitor/reaper. Every activity is already a single-input, typed, mostly-idempotent function. The one capability we wholly lack is durable step checkpointing.
-
-### Measured footprint `[R-13]` (corrected)
-
-- **16** files under `workflows/` (**14** workflows) · **53** files under `activities/` (**52** activities)
-- **~50** files import `@temporalio` (**32** in `apps/backend/src` non-test, **14** in tests, ~4 elsewhere)
-- **146** `proxyActivities` references across **25** files
-
-| Disposition | What | ~LOC |
-|---|---|---|
-| Delete | temporal_port + real_temporal_client, data_converter, temporal_config, activity_proxy, gates.ts ledger, ensure_schedule, check_workflow_bundle, the workflow shells, the two-worker bootstrap, the temporal-helmchart, `@temporalio/*` | ~1.5–2k |
-| Rewrite | `orchestrator.ts` (1,491), the review workflow body (~1,100), `parallelism.ts` (212), `activity_ports.ts` retry config (487), the bootstraps | ~3.5k |
-| Reuse (light) | **`activities/` 12,956 LOC** (drop the wrapper), `build_activities` DI (1,020), degradation/state (470), outbox table+repo+sinks, run-state machine, supersede, mutex, contracts, clock/random seams | ~14k |
-| New | the `core.workflow_jobs` runner, fencing/heartbeat/idempotency, supersede + versioning, backpressure, the shadow harness, the operator UI, migrations | ~2–3k |
+~70% of the review pipeline's durable *data* already lives in Postgres (`core.outbox`, `core.review_runs` + supersede, `audit.workflow_events`, the ADR-0068 ledger, mutex leases). But the adversarial passes showed that the **execution model** — not just the data — is load-bearing: the review is **one in-process stateful durable execution**, and several correctness properties exist *only* because of that (next section). The "70% already in Postgres" figure understated the rewrite because it counted data, not the in-process execution semantics.
 
 ## Decision
 
-### Stage 0 — gate the whole effort on the actual objection (do first)
+1. **Recommended — Stage 0: run Temporal Server on PostgreSQL-only persistence** (no Cassandra, no Elasticsearch). Zero application-code change; removes the heavy-datastore/component objection; **preserves the in-process durable-execution model the pipeline silently depends on.** If the objection is operational weight, this is the answer, and stages below never happen.
 
-If the real complaint is **operational component count**, note that **Temporal Server runs on PostgreSQL-only persistence** (no Cassandra, no Elasticsearch) for moderate scale. That removes the heavy-datastore objection with **zero application-code change**, and stages 1–6 never happen. Evaluate this before funding a rewrite.
+2. **Not recommended — the full `core.workflow_jobs` runner (Appendix B).** Undertake only if the team decides the Temporal dependency itself must go. It is a multi-quarter rewrite of the sacred core loop (invariant 1) that must first close the unresolved-risk register in Appendix B. The proof-of-concept spikes (Appendix A) validate the *toy engine* in isolation; they do **not** validate the production workflow, and the gaps below show why that distinction is decisive.
 
-### Queue substrate: build `core.workflow_jobs`, do NOT layer on Graphile Worker `[R-1]`
+3. **Documented fallback if (2) is chosen but a server is acceptable — DBOS** (durable execution as a Postgres-only library): it keeps the in-process model and so sidesteps most of the runner's structural gaps, at the cost of a young framework on the core loop.
 
-v1 said "use Graphile Worker" while also defining custom `workflow_runs`/`jobs` — an ambiguity that would create two queue semantics, two retry systems, and unclear ownership. **Resolved: build our own `core.workflow_jobs` runner on `FOR UPDATE SKIP LOCKED`, and do not adopt Graphile Worker for the queue.** The runner needs *workflow-aware* semantics that do not map onto Graphile's generic job model — lease **fencing**, fan-in on the parent row, the four-point **supersede** check, **workflow/step/payload versioning**, **idempotency keys**, and **per-dimension backpressure**. Wrapping those around Graphile means fighting its retry/locking/scheduling. This is also the pattern we already operate (`core.outbox` is precisely a fenced Postgres queue). Time-based triggers use **`pg_cron`** (or a tiny in-app scheduler), not Graphile. One queue, one retry system, one owner.
+## Why the full runner is not recommended — the evidence
 
-### If Temporal must go — the model
+Three independent review passes converged on **one root cause**: the ADR's runner models each step as an *independent, idempotent, retryable job*, but the live review is **one in-process stateful durable execution**. Five properties only hold because of that, and decomposing into job rows breaks all five:
 
-- **`core.workflow_runs`** (parent): state + context only. No lease.
-- **`core.workflow_jobs`** (children): one row per executable step. Lease, attempts, retry, dead-letter, **fencing**, **idempotency**, **versioning** live here.
-- **workers** claim **job rows**, never the whole run.
+1. a shared mutable `ReviewWorkflowState` object that ~8 stages read/write;
+2. a **pod-local `emptyDir` workspace** — the cloned repo lives on one node's disk;
+3. a fan-in denominator computed from a **mutable live-findings snapshot**;
+4. an in-process query-vector cache + a **pinned retrieval generation**;
+5. a frozen deterministic clock + an **~11-stage stateful tail** the model collapses into one `aggregate` step.
 
-A ~250-line spike (`dtemporal-spike/spike.mjs`) proves the engine; a second spike (`spike2.mjs`) proves the production failure modes below — fencing, heartbeat, and external-effect idempotency under a real lease-steal.
+The risk register that follows is the argument. It is organized by theme; **bold = verified against PG 18.3 or the live source**; ⚠ = no cheap mitigation (these are exactly what Stage 0 avoids).
 
-DBOS / Restate / Hatchet were considered and **rejected for the core loop** (a young framework, or a new server component, on the sacred loop, when we own every primitive). DBOS (Postgres-only library) is the documented fallback if the team prefers to *rent* durable execution rather than *own* it.
+### A. The §1 schema does not even build (critical)
+- ⚠ **A UNIQUE index on a partitioned table must include the partition key**, so the "fan-in backstop" indexes are *rejected by Postgres* (reproduced on 18.3). The schema fails at `CREATE`.
+- **The obvious workaround — append `created_at` to the key — silently destroys the singleton guarantee** (verified: two `aggregate` jobs for one review both insert), so a fan-in race **double-posts to a customer PR** (violates invariant 9 + the `comment_ids` invariant).
+- `idempotency_key` has no DB uniqueness and **cannot** be made unique under partitioning → §4's "single effect at the DB" is unenforced; real enforcement needs **per-sink, non-partitioned ledger tables**.
+- Retention partition-DROP is **by `created_at`, blind to job state** → it **silently deletes `ready`/`leased`/version-`parked` jobs** of long-lived reviews (couples lethally with §6 deploy-parking) → silent stuck reviews invisible to every specified alert.
 
----
+### B. Correctness & liveness the linear model breaks (critical/major)
+- ⚠ **Fan-in N=0 wedges the review.** Path-filtered-out or fully carry-forwarded PRs enqueue *zero* chunk jobs, so `completed==total` never fires, the aggregate is never minted, and the run hangs until the reaper mis-cancels it as a timeout (found by 3 lenses independently). A normal, frequently-exercised branch.
+- **Spine-retry re-reads live parent findings** → a *different* `total_chunks` denominator than the chunk jobs a prior partial attempt enqueued → permanent fan-in stall or unique-index abort. Carry-forward is a snapshot of mutable cross-run state; Temporal replays it byte-identically, a retryable job does not.
+- **Lease-clock authority is unspecified**, and the cited exemplar (outbox) compares the *worker's* wall clock to `leased_until` while the mutex deliberately uses DB `now()` (the M1 fix) → adopting the outbox convention reopens the pod/DB clock-skew steal window.
+- **`arbitrationNow` is `workflowInfo().startTime`** (a replay-frozen instant) stamped onto `suppressed_at`; the runner has no equivalent per-run frozen clock, so retried steps write drifting audit timestamps.
 
-## Design (the sections the review required)
+### C. Shared state & physical locality the model has no home for (critical) ⚠
+- ⚠ **No schema slot for the shared `ReviewWorkflowState`** (policyBundles, queryVectorCache, retrievedKnowledgeChunkIds, inlinePostFilterMetadata, arbitration, persistedFindingIds, postedReview). v2 mis-buckets `state.ts` as "reuse light"; it is net-new persisted-state design that dwarfs the fencing work.
+- ⚠ **The workspace is a pod-local `emptyDir`.** Clone runs on pod A; with `replicaCount=2`, ~50% of downstream steps land on pod B and read an *empty directory* → ENOENT or a silent empty review. Requires sticky/affinity claims **or a ReadWriteMany shared volume — a new infra dependency the ADR never named.**
+- **The ~11-stage stateful tail** (dedup → aggregate → cap → config-notice → policy-post-filter → citation-validate → persist → arbitration → record-tool-runs → walkthrough → persist-walkthrough → post → update-PR-description → fix-prompt) is collapsed into one `aggregate` step → crash-resume granularity is the *whole tail*, re-running non-idempotent DB writes (persist, arbitration) and re-posting the fix-prompt comment.
+- **`post` is not a leaf**: `update_pr_description` (read-modify-write) and a *second* `fix_prompt` GitHub comment fire inside post-success with asymmetric fail-open semantics → a coarse `post` retry double-posts.
+- **Lifecycle bookkeeping** (`PostReviewCapture`: comment_ids / kept_finding_indices / dropped_classifications + the F9 length invariant) must cross the post→bookkeeping job boundary; no schema home → findings stay `delivery_outcome = NULL` (the stuck-row class the team already burned on).
 
-### 1. Job & run schema
+### D. Cost, tenancy & audit regressions (major) ⚠
+- ⚠ **Cost-cap is a two-phase reserve/reconcile straddling the paid edge.** A crash/steal between the SDK call and `recordCallCost` leaks the reservation; the ledger *replay* path **skips reconciliation**, so `cost_daily` is permanently inflated → the fail-closed cap eventually **denies legitimate reviews org-wide.** Supersede-mid-call leaks it too.
+- **Concurrent in-flight double-spend.** Lease-steal during a 40s Bedrock call leaves two paid completions genuinely in flight; the ledger `lookup` is a plain `SELECT` (no `FOR UPDATE`/advisory lock) → it dedupes *sequential* retries, not *concurrent* invokers. The stubbed spike cannot reproduce this (Appendix A).
+- **The claim query is a cross-tenant path** with no `installation_id` filter; the runtime tenancy plugin bypasses raw SQL and the PR-time gate is WARN-mode + token-presence — so it is green by *coincidence*, never declared a privileged path.
+- **`audit.workflow_events` is not Temporal's per-attempt history** — it is coarse milestones. "Mostly have it" is false; the runner must build a new high-churn `workflow_job_attempts` store (input/output/error/retry/lease-steal per attempt), unbudgeted in the estimate.
 
-```sql
-CREATE TABLE core.workflow_runs (
-  review_id        uuid PRIMARY KEY,
-  workflow_version int  NOT NULL,                 -- §6 the runner version that owns this run
-  state            text NOT NULL,                 -- pipeline stage (observability + supersede oracle)
-  current          boolean NOT NULL DEFAULT true, -- false once superseded
-  total_chunks     int,
-  completed_chunks int  NOT NULL DEFAULT 0,
-  created_at       timestamptz NOT NULL DEFAULT now(),
-  updated_at       timestamptz NOT NULL DEFAULT now()
-);
+### E. Shadow-parity & cutover are not as simple as v2 claimed (critical/major)
+- ⚠ **Shadow contaminates live data.** `review_finding_id` is derived from `pr_id` (not `run_id`) with `ON CONFLICT DO NOTHING`, so a "read-only" shadow run **writes into the live PR's finding rows** — polluting or swallowing real findings. §11 only isolated GitHub, not `core.*`.
+- **Shadow double-spends Bedrock.** The ledger key is `promptSha256`; the ANN `ORDER BY` has no tiebreaker → prompt bytes drift across engines → ledger *miss* → a second real completion per chunk.
+- **The parity oracle "identical findings" is unsatisfiable** — Bedrock runs at temperature 1.0 with no seed, so output varies run-to-run. Needs a pin-the-LLM + fuzzy-structural-diff oracle, not exact equality.
+- **"One engine claims a webhook" has nowhere to live** — run-allocation + outbox-append are inside the single ingest transaction, before any dispatcher sees the row.
+- **GitHub redelivery mints a fresh `delivery_id`** → never deduped → always supersedes; during cutover it routes across engines → double-post race. Dedup must move to a content key (head_sha).
+- **Rollback orphans in-flight runner job-graphs** — the kill switch only models forward in-flight (Temporal finishing its own).
 
-CREATE TABLE core.workflow_jobs (
-  id               bigint GENERATED ALWAYS AS IDENTITY,
-  review_id        uuid NOT NULL,                 -- parent FK
-  installation_id  uuid NOT NULL,                 -- tenancy + backpressure dimension
-  step_type        text NOT NULL,                 -- clone|classify|chunk_and_redact|review_chunk|aggregate|post|…
-  chunk_index      int,                            -- only for review_chunk
-  state            text NOT NULL DEFAULT 'ready',  -- ready|leased|done|dead
-  attempts         int  NOT NULL DEFAULT 0,
-  max_attempts     int  NOT NULL DEFAULT 5,
-  -- fencing §2
-  lease_owner      text,
-  attempt_token    uuid,                           -- minted fresh on EVERY claim; invalidates a stolen prior lease
-  leased_until     timestamptz,
-  heartbeat_at     timestamptz,                    -- §3
-  timeout_at       timestamptz,                    -- per-step hard deadline §3
-  run_after        timestamptz NOT NULL DEFAULT now(),  -- retry backoff / timers
-  -- versioning §6
-  step_version     int  NOT NULL,
-  payload          jsonb NOT NULL,
-  payload_schema_version int NOT NULL,
-  -- idempotency §4
-  idempotency_key  text,                           -- deterministic external-effect key for this step
-  trace_context    jsonb,
-  last_error       text,
-  dead_reason      text,
-  created_at       timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (id, created_at)                     -- partitioned by created_at (range) for retention §9
-) PARTITION BY RANGE (created_at);
-```
+### The shape of the argument
 
-Indexes: a partial **claim index** `WHERE state IN ('ready','leased')`; a singleton-step unique index (`review_id, step_type` where the step is singleton) and a per-chunk unique index (`review_id, chunk_index`) — the fan-in backstop; `(installation_id)` for backpressure; `(review_id)` for the operator timeline.
+Count the ⚠ items: **workspace locality (new infra), shared-state persistence, per-attempt history, the two-phase cost split, fan-in N=0, shadow determinism.** None has a cheap fix; each is a multi-week sub-project on the sacred loop; and **Stage 0 avoids every one of them by keeping the in-process execution model.** That is the case for the recommendation: the rewrite costs far more than the operational weight it removes — unless the team's goal is specifically to eliminate the Temporal dependency, in which case Appendix B is the honest scope.
 
-### 2. Job completion protocol — with fencing `[R-3]`
+## Effort (revised)
 
-The claim mints a fresh `attempt_token`; a reclaimed (lease-expired) job gets a **new** token, which is exactly what invalidates the previous owner. Completion is gated on the full fence and committed atomically with the next-step writes:
-
-```sql
--- inside ONE transaction:
-UPDATE core.workflow_jobs SET state='done'
-  WHERE id = $job AND state='leased' AND lease_owner = $me AND attempt_token = $token;
--- if rowcount <> 1  → ROLLBACK and abort (our lease was stolen; another worker owns it)
--- else → fan-in / enqueue-next writes, then COMMIT
-```
-
-Fan-in increments the parent counter under its row lock, so exactly one transaction observes `completed == total` and creates the single `aggregate` job (unique index as backstop). **Proven in `spike2.mjs`:** under a forced lease-steal, the late worker's completion affected 0 rows and was discarded — `completed_chunks` stayed exact (4/4) and exactly one aggregate job was created.
-
-### 3. Lease, heartbeat & timeout protocol `[R-4]`
-
-Lease expiry alone duplicates work for legitimately-long steps (clone, static analysis, LLM, GitHub post). Therefore:
-
-- **Heartbeat loop:** a worker running a long step extends its lease every `heartbeat_interval` via `UPDATE … SET leased_until = now()+lease WHERE id AND lease_owner AND attempt_token AND state='leased'`. If that returns 0 rows the worker **lost the lease** and must cooperatively abort (don't commit, don't post).
-- **Per-step timeout:** `timeout_at` is a hard ceiling; a watchdog fails a job past it. Heartbeat keeps a *healthy* long step alive; `timeout_at` kills a *stuck* one.
-- **Cooperative abort:** the step body checks an abort signal (heartbeat-loss or shutdown) at each safe point.
-
-**Proven in `spike2.mjs`:** the heartbeated long step was never stolen (ran once); the non-heartbeated long step was stolen and recovered safely.
-
-### 4. External side-effect idempotency protocol `[R-5]`
-
-A DB transaction cannot contain Bedrock / GitHub / Vault / git. Rules:
-
-- **LLM (Bedrock):** keyed through the **ADR-0068 invocation ledger** by a deterministic request id minted *before* the provider call; a retried step finds the ledger row and reuses the result (no double spend).
-- **GitHub comments / check-runs:** deterministic external idempotency keys (we already do 2-phase atomic-claim posting with the `comment_ids` invariant + stale-write guard); a re-run reuses/updates rather than re-creates.
-- **Post-review step is idempotent across retry** by construction.
-- **Crash after external call, before DB commit:** the step does the effect *through* the ledger keyed by `idempotency_key`, then commits. On resume, the same key suppresses the duplicate effect; the fence discards the stale completion.
-
-**Proven in `spike2.mjs`:** a chunk body that executed on two workers produced exactly one external effect (the second was suppressed on the idempotency key).
-
-### 5. Supersede / cancellation protocol `[R-6]`
-
-"Check the parent before each job" is insufficient. A long job re-checks `workflow_runs.current = true` (and that `current_run_id` still points at this run) at **four** points: (a) before starting, (b) before any external side effect, (c) before committing output, (d) before enqueueing the next step. A newer commit's webhook flips `current=false` (the existing `supersedeRun`), so a superseded run's jobs no-op before they can post. Fencing is the second line of defense; the `current` check is the first.
-
-### 6. Workflow & payload versioning `[R-7]`
-
-`workflow.patched()` goes away, so pending jobs must survive deploys. Every job carries `workflow_version`, `step_version`, and `payload_schema_version`. A worker only claims jobs whose versions it understands; jobs from a newer version are **parked** (not failed) until the matching worker rolls out; payload migrations are explicit, versioned transforms. A new breaking step shape is a new `step_version`, retired over the three-deploy lifecycle (the discipline ADR-0047 / the patched-lifecycle used).
-
-### 7. Worker shutdown behavior
-
-On `SIGTERM`: stop claiming new jobs; signal in-flight steps to reach a safe checkpoint; either finish quickly or release the lease (so another worker resumes immediately rather than waiting for expiry); exit within a drain deadline. Heartbeat-loss and shutdown share the one cooperative-abort path.
-
-### 8. Backpressure & concurrency model `[R-9]`
-
-Cost-caps alone are insufficient. Explicit caps enforced at claim time (via partial-index claim filters + per-dimension running-counts / advisory locks):
-
-- per **step_type** (cap concurrent `clone` and `review_chunk` separately)
-- per **installation** and per **repository** (fairness; no single org starves others)
-- per **LLM provider/model** (provider concurrency / TPM limits)
-- **GitHub API rate-limit** budget per installation
-- **DB pool** pressure (claimers back off when the pool is saturated)
-- **workspace disk** pressure (gate `clone`/`allocate_workspace` when disk is low)
-
-### 9. Postgres-as-queue operations `[R-10]`
-
-A high-churn jobs table is itself a production risk. Required: **partition `workflow_jobs` by `created_at`** with scheduled detach/drop of old partitions (retention) — `done`/`dead` rows never accumulate unbounded; aggressive **autovacuum** on the hot partition; the **partial claim index** to keep claims cheap; mitigate **lock contention on the fan-in counter** (the parent row is a hot lock for wide fan-outs — shard the counter or cap fan-out width); if `LISTEN/NOTIFY` is used for wakeups, treat it as an optimization with **fallback polling** (NOTIFY can be lost); **alerts** on queue depth by step, lease age (stuck jobs), and dead-letter rate.
-
-### 10. Observability / debugging UI — acceptance criteria `[R-8]`
-
-Losing the free Temporal Web UI is the biggest operational cost; the replacement is a **hard deliverable**, not "an admin frontend idea." Minimum, per review: **job timeline per review**, **current blocking job**, **retry history**, **dead-letter reason**, **queue depth by step**, **lease age / stuck jobs**, and **manual retry / cancel / supersede controls**. Natural home: the admin frontend. This gates the PR-pipeline cutover (Stage 5).
-
-### 11. Shadow-mode parity plan `[R-11]`
-
-Side-by-side must be **shadow mode**, never dual-posting: **exactly one engine may post to GitHub** (check-runs/comments); the shadow runner compares **pre-post artifacts** (findings set, walkthrough, fix-prompt) against Temporal's; **LLM calls in shadow use cassettes or the shared ledger** (no double spend); all other external effects are **disabled or redirected** for shadow runs. Parity oracle: for the same PR, identical findings/comments/outcome.
-
-### 12. Rollback & cutover plan `[R-12]`
-
-"Drain, don't migrate" is correct (reviews are ephemeral, ≤30 min — we never migrate live histories) but needs: a **dispatch flag by installation/repo** routing each webhook to exactly one engine (so **both engines never claim the same webhook**); a **kill switch back to Temporal**; **GitHub redelivery handling** during cutover (idempotency keys make redelivery safe); **detect in-flight Temporal workflows before disabling that worker** (drain check). At cutover, in-flight reviews finish on Temporal; new PRs route to the runner.
-
----
-
-## Production checklist — foundation vs new
-
-| Concern | Foundation | New |
-|---|---|---|
-| supersede / cancel | **Strong** (`supersedeRun`, `current_run_id`, claim-check) | the 4-point protocol §5 |
-| retry → dead-letter | **Strong** (outbox) | generalize onto jobs |
-| LLM idempotency | **Strong** (ADR-0068 ledger) | reuse |
-| GitHub idempotency | **Medium** (2-phase post + invariant) | idempotent post step §4 |
-| per-step timeout | **Strong (data)** (RETRY_POLICIES) | watchdog §3 |
-| stuck-job janitor | **Strong** (janitor/reaper) | tune/alert |
-| manual retry | **Medium** (admin API exists) | one endpoint + UI §10 |
-| migration | **Easy** (ephemeral) | drain + rollback §12 |
-| fencing | none | §2 — **proven** in spike2 |
-| heartbeat / long-step | **Medium** (clone heartbeats in Temporal today) | §3 — **proven** in spike2 |
-| backpressure | Medium (cost-caps) | §8 |
-| **observability UI** | **Weak — biggest loss** | §10 (hard deliverable) |
-| **parity testing** | Medium (smoke/cassettes) | §11 shadow harness |
-| versioning | none (was `patched()`) | §6 |
-
-## Staged migration (risk last)
-
-0. **Decision gate** — Temporal-on-Postgres-only. If it satisfies the goal, stop.
-1. Build `core.workflow_runs` + `core.workflow_jobs` runner (fencing, heartbeat, timeout, idempotency, versioning, shutdown) behind tests.
-2. Move simple scheduled jobs (janitor/reaper/retention/partition) to `pg_cron` + the runner.
-3. Move the outbox dispatcher to a plain poller.
-4. Move simple event workflows (reconcile/repair/sync/refresh).
-5. Move the PR review pipeline last — spine, fan-out/fan-in, supersede, **observability UI**.
-6. **Shadow-mode** the runner against Temporal until parity; then **cutover by installation/repo with a kill switch**.
-
-## Consequences
-
-**Effort `[R-14]`:** **5–8 weeks to a first production candidate**; **8–12 weeks for confidence equivalent to Temporal** (observability UI, shadow parity, versioning, backpressure, ops hardening); **longer calendar** if one engineer owns implementation *and* validation. The hard, genuinely-new work is fencing/heartbeat/idempotency (now proven), the operator UI, shadow parity, versioning, and backpressure — not the durability basics, most of which we already own.
-
-**Gain:** delete the workflow sandbox, payload converter, replay-determinism gates *as workflow constraints*, `workflow.patched()`, the bundle gate, the two-worker split, and the temporal-helmchart. Activities become plain functions; the spine becomes a queryable state machine; one less component to operate.
-
-**Lose:** free durable replay, free per-step retry/timer ergonomics, the battle-tested-at-scale guarantee, and the **free Web UI**. We take on fencing, idempotency, versioning, backpressure, and operator tooling ourselves.
-
-**Reversibility:** low once the PR pipeline cuts over — hence Stage 0, shadow mode, and the kill switch are mandatory.
+The v2 figure (5–8 / 8–12 weeks) is now understood to be low. Adding shared-state persistence, workspace locality (incl. an infra decision), tail decomposition, a per-attempt history store, cost-accounting rework, and a parity harness that cannot use exact equality makes the full runner a **multi-quarter program on the core loop with low reversibility**. **Stage 0 is an afternoon.**
 
 ## Alternatives considered
 
-- **Temporal-on-Postgres-only (Option 0)** — near-zero cost; correct if the objection is operational weight. *Evaluate first.*
-- **`core.workflow_jobs` runner (chosen if Temporal must go)** — owns workflow-aware semantics on the Postgres we run; one queue, one retry, one owner.
-- **DBOS** — Postgres-only durable-execution library; lowest churn; documented fallback (own-vs-rent / core-loop-maturity call).
-- **Graphile Worker as the queue** — **rejected** `[R-1]`: its generic model can't carry fencing/fan-in/supersede/versioning without two-systems drift. (Considered for cron only; `pg_cron` preferred.)
-- **Restate / Hatchet** — new component (→ ADR); not preferred while Postgres-native works.
-- **BullMQ + Redis** — rejected: Redis is excluded; BullMQ is a queue, not durable execution.
+- **Stage 0 — Temporal on Postgres-only (recommended).** Removes the operational objection; preserves the execution model.
+- **DBOS — Postgres-only durable-execution library (documented fallback).** Keeps the in-process model, so it dodges the §C/§D structural gaps; cost is a young framework on the core loop.
+- **`core.workflow_jobs` runner (Appendix B, not recommended).** Owns the mechanism on Postgres but must close the entire risk register first.
+- **Restate / Hatchet** — new component (→ ADR); not preferred while Postgres-native options exist.
+- **BullMQ + Redis** — rejected (Redis excluded; not durable execution).
 
-## Open questions (to reach Accepted)
+## Open question (the decision)
 
-1. Is the objection operational weight (→ Option 0 ends it) or the Temporal dependency itself (→ proceed)?
-2. Sign-off to fund the operator/debugging UI (§10) as a gating deliverable.
-3. Acceptance of shadow-mode parity (§11) + the install/repo kill-switch cutover (§12) as the criteria.
-4. Confirm the queue-substrate decision (build `core.workflow_jobs`; `pg_cron` for schedules; no Graphile) `[R-1]`.
-5. Accept the revised estimate (5–8 weeks to candidate; 8–12 to Temporal-equivalent confidence).
+**Is the objection Temporal's operational weight, or the dependency itself?** Operational weight → Stage 0 (recommended, ~zero cost). The dependency itself → Appendix B, accepting the multi-quarter program and its risk register.
+
+---
+
+## Appendix A — proof-of-concept spikes (honest scope)
+
+Committed at `docs/adr/0077-spikes/spike.mjs` (the engine) and `spike2.mjs` (the production failure modes), runnable against a throwaway Postgres.
+
+**What they prove** (the toy engine, in isolation, ~250 lines): the durable hand-off (mark-done + enqueue-next in one txn), race-safe fan-in for N≥1, lease-steal crash recovery, fencing via `attempt_token`, lease heartbeat keeping a long step alive, and external-effect idempotency via a key — all green under a forced lease-steal.
+
+**What they do NOT prove** (and the ADR must not claim they do): a **concurrent in-flight paid provider call** (stub effects return instantly, so the two workers never overlap inside the effect — the real double-spend window), multi-process workers, real clone/static-analysis durations, worker↔DB clock skew, the N=0 fan-in base case, the shared `ReviewWorkflowState`, the pod-local workspace, the ~11-stage tail, supersede-mid-call, or the two-phase cost reservation. "Proven in spike2" therefore means *the engine mechanics in isolation*, never the production workflow.
+
+## Appendix B — the runner design, if the team proceeds anyway
+
+Retained for completeness; **not recommended.** A real design must first close every ⚠ above. The corrected skeleton (incorporating all three review passes):
+
+- **Identity:** parent `core.workflow_runs(run_id uuid PRIMARY KEY, review_id, …)` keyed on the *execution* identity (not `review_id`); supersede truth stays `pull_request_reviews.current_run_id` (no duplicate `current` flag); child `core.workflow_jobs(job_id uuid PRIMARY KEY, run_id FK, …)`.
+- **Do NOT partition the hot active jobs table** — that is what makes the fan-in/singleton unique indexes legal again; archive `done`/`dead` rows to a separate `workflow_jobs_archive`, deleting by *terminal-state + age*, never by `created_at` alone.
+- **Fencing** on `(lease_owner, attempt_token)`; **DB `now()` is the sole lease clock** (the M1 mutex convention, not the outbox one); **heartbeat** extends the lease under the full fence; **watchdog** transitions are themselves fenced (terminal-state-wins).
+- **Single-effect** is enforced by **per-sink non-partitioned ledger tables** (the ADR-0068 ledger is the template); LLM lookups need `FOR UPDATE`/advisory lock to block concurrent invokers; cost reserve+reconcile must be crash-atomic with the ledger, and replay/supersede paths must *release* orphaned reservations.
+- **Shared run-state** (the §C `ReviewWorkflowState` fields) needs a persisted run-scoped artifact (claim-check) with a read-back contract; pin the **retrieval generation** + per-path query vectors into the spine payload; add a `run_logical_now` column for the frozen clock.
+- **Workspace locality:** decide before any Stage-5 work — sticky/affinity claims on `workflow_jobs` *or* a RWX shared volume (its own infra ADR).
+- **Branching & tail:** model the path-filters-excluded-all early exit as a skip-edge; expand the `aggregate` step into the real ordered tail with per-step idempotency; decompose `post` into `post_review` / `post_check_run` / `update_pr_description` / `fix_prompt`, each with its own idempotency key and failure policy; persist `PostReviewCapture` for the bookkeeping step (carry the F9 length invariant).
+- **Cancellation:** unify reaper + supersede + fence into one terminal-state authority over **both** tables (the §5 check must gate on parent `lifecycle_state`, not only `current`); guaranteed finalizer jobs (mutex/workspace/placeholder/**cost-release**) on every terminal path incl. supersede-no-op.
+- **Tenancy:** declare the claim/heartbeat/watchdog queries an explicit `@privileged_path` cross-tenant exemption; every per-tenant write validates `installation_id`/`repo_id`.
+- **Per-attempt history:** a new append-only `workflow_job_attempts` table feeding the §10 operator UI (timeline / blocking job / retries / dead-letter / lease age / manual retry-cancel-supersede, with action audit + RBAC).
+- **Cutover:** resolve `target_engine` inside `persistWebhook` so a single dispatcher routes by row (no second dispatch path); dedup redelivery on a content key (head_sha) and pin engine per-`current_run_id`; shadow isolated by a `run_kind` discriminator on every `core.*` write key; parity via pin-the-LLM + fuzzy structural diff; rollback as a drain, with the reaper/janitor taught about `workflow_jobs`.
+
+**Unresolved-risk register to close before Accepted:** the workspace-locality infra decision; the shared-state persistence layer; the per-attempt history store + its write-amplification budget; the two-phase cost-accounting rework; the concurrent-in-flight double-spend mutual-exclusion; the shadow-determinism oracle. Each is a sub-project; together they are the multi-quarter scope.
