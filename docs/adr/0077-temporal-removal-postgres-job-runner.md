@@ -1,12 +1,12 @@
 # ADR-0077: Temporal removal — decision, and the right way to do it
 
-- Status: **Proposed** (architecture direction approved in review; execution gaps below close it toward Accepted)
+- Status: **Accepted for implementation *planning*; not yet Accepted for *build*** — the architecture direction is approved in review; the v6 "Implementation design" section below closes the production details required before build starts.
 - Date: 2026-06-09
 - **Recommendation:**
   - **Objection = operational weight** → **Stage 0**: Temporal on PostgreSQL-only persistence. ~zero code, ~zero risk.
   - **Objection = the Temporal dependency itself** → a **coarse-grained `review_jobs` runner** (one job = one whole review, executed in one process). Recommended at our scale. **DBOS** (a Postgres-only durable-execution *library*) is the alternative if fine-grained durable resume is wanted without owning runner code.
   - **Do NOT build a fine-grained, per-step job runner** (Appendix B).
-- Revision: **v5** — closes the execution gaps from the v4 review. Specifically: (1) `orchestrate()` is reused *mostly* unchanged but needs a new non-Temporal **review-job shell**; (2) a small **cancellation/failure/metrics seam** to de-Temporalize `degradation.ts`/`posting.ts`; (3) **admin commands** (knowledge approve/reject, embedder cancel) replace `signalWorkflow`; (4) the **LLM-ledger guarantee is weakened** + a cost/ledger reconcile job; (5) the **post-tail side-effects** are enumerated with per-effect retry behavior; (6) **per-activity internal retries stay** so a whole-review re-run is only for hard crashes; (7) the **schema is expanded**; (8) a **finalizer protocol**; (9) the **scheduler default is fixed** (in-app + advisory lock); (10) **duplicate posting is a bug to prevent**, not an acceptable outcome; (11) the **cutover is detailed**; (12) a **chaos test plan**.
+- Revision: **v5** — closes the execution gaps from the v4 review. Specifically: (1) `orchestrate()` is reused *mostly* unchanged but needs a new non-Temporal **review-job shell**; (2) a small **cancellation/failure/metrics seam** to de-Temporalize `degradation.ts`/`posting.ts`; (3) **admin commands** (knowledge approve/reject, embedder cancel) replace `signalWorkflow`; (4) the **LLM-ledger guarantee is weakened** + a cost/ledger reconcile job; (5) the **post-tail side-effects** are enumerated with per-effect retry behavior; (6) **per-activity internal retries stay** so a whole-review re-run is only for hard crashes; (7) the **schema is expanded**; (8) a **finalizer protocol**; (9) the **scheduler default is fixed** (in-app + advisory lock); (10) **duplicate posting is a bug to prevent**, not an acceptable outcome; (11) the **cutover is detailed**; (12) a **chaos test plan**. **v6** — adds the full **Implementation design** section closing the pre-build details: non-review workloads, the exact review-job shell contract, the activity retry wrapper, the in-flight LLM ledger protocol, cost-reservation reconciliation, fix-prompt/PR-description idempotency, workspace-cleanup ownership, the job state machine, explicit supersede checkpoints, scheduler table/overlap semantics, the outbox-sink migration, the operator API/UI minimum, and a 13th chaos case.
 - Relates to: ADR-0066, ADR-0068 (LLM ledger — load-bearing), ADR-0074/0075/0076; `docs/architecture/temporal-workflow-integration.md`; spikes in `docs/adr/0077-spikes/`.
 
 ## Context
@@ -156,6 +156,121 @@ Pre-merge, against a disposable Postgres + a real multi-worker harness:
 - **supersede during a review** → the older run no-ops at its next claim-checkpoint; never posts.
 - **SIGTERM graceful drain** → stop claiming, finish in-flight, finalizers run, exit within the deadline.
 - **multi-pod same-PR contention** → the unique active-job index + mutex admit exactly one runner.
+
+## Implementation design (v6 — closes the pre-build production details)
+
+### 1. Non-review workloads (Temporal runs more than reviews)
+
+`review_jobs` is the hot path; the other Temporal workflows get coarse homes too — **two coarse tables + the scheduler + the existing outbox**:
+
+| Temporal workload | New home |
+|---|---|
+| outbox dispatcher | a plain Postgres **poller** (it is already a queue; drop the singleton-loop workflow) |
+| reconcile / repair, sync_code_owners, refresh_semantic_docs, confluence sync, mark_stale_chunks, trigger_page_resync | **`core.background_jobs`** — one generic coarse table, same lease/attempts/fence/finalizer shape as `review_jobs`; each job = one whole workflow run, in-process |
+| mutex-janitor, review-run reaper, retention (run_id / partition / workspace) | **scheduled** → the in-app scheduler emits a `background_jobs` row each tick |
+| admin-triggered (embedder reembed/validate/gc; knowledge approval) | **admin-command rows** → `background_jobs` (§ Admin commands) |
+
+So nothing is orphaned: `review_jobs` (hot review path) + `background_jobs` (everything else) share one runner skeleton; the outbox stays.
+
+### 2. The review-job shell contract (exact stages)
+
+The shell is the de-Temporalized `review_pull_request.workflow.ts` body; `orchestrate()` is called unchanged inside it.
+
+```text
+shell(run):
+  gate = startReviewForWebhook(run)          # re-check tenancy + acquire PR mutex
+  if not gate.accepted: finalize(skipped); return
+  try:
+    startMutexHeartbeat(gate.mutex_id)        # renew the mutex lease in the background
+    placeholder = postPlaceholder(run)
+    ws          = allocateWorkspace(run)      # per-attempt workspace
+    emit ANALYSIS_STARTED
+    result      = orchestrate(ctx)            # the 9-stage pipeline, REUSED
+    runLifecycleBookkeeping(result)           # delivery_outcome flips (idempotent on rfid)
+    emit ANALYZED
+    finalizeRun(COMPLETED)
+  except (Cancelled | Superseded): finalizeRun(CANCELLED)
+  except err:                     finalizeRun(mapFailure(err))   # FAILED → re-enqueue or dead
+  finally:                        runFinalizers(run)             # idempotent; see §8 v5
+```
+
+`mapFailure(err)` uses the de-Temporal `classifyFailure` seam; `runFinalizers` is the §"Finalizer protocol" set.
+
+### 3. Activity retry wrapper
+
+Temporal supplied per-activity retry; replace it with a shared `runWithRetry(policy, fn)`:
+- reads the activity's `RETRY_POLICIES` entry (start-to-close timeout, `initialInterval`/`maximumInterval`/`backoffCoefficient`/`maximumAttempts`);
+- retries on transient errors with exponential backoff; **does not** retry errors in `nonRetryableErrorTypes` (`BedrockBudgetExceededError`, `PrClosedError`, `StaleWriteError`, …);
+- on exhaustion, throws the last error to the shell.
+
+Activity-port calls become `runWithRetry(RETRY_POLICIES.x, () => activityX(input))`. This keeps transient failures cheap (local retry) so the whole-review re-run is reserved for hard crashes.
+
+### 4. In-flight LLM ledger protocol
+
+The ADR-0068 ledger is today a *completed-result* ledger. Extend it into a 2-phase in-flight coordinator — add `status (in_flight|completed|failed)`, `owner`, `lease_until`:
+- **before** the provider call: `INSERT (status=in_flight, owner, lease) ON CONFLICT(idempotency_key) DO NOTHING RETURNING`; then, in one `SELECT … FOR UPDATE`: a `completed` row → **replay**; an `in_flight` row with a **live** lease → **block/await** (a concurrent invoker waits, not races); an `in_flight` row with an **expired** lease → **stale-owner recovery** (take over);
+- **after** the call: `UPDATE → completed`, store result;
+- **on failure**: `UPDATE → failed` (retryable per policy).
+
+This closes the concurrent-double-spend window the v5 review flagged.
+
+### 5. Cost-reservation reconciliation
+
+Correlate the reservation to the ledger by a shared key. The reserve step writes `cost_reservations(reservation_id, idempotency_key, estimated_cents, state='reserved', created_at)` **in the same transaction** as the ledger `in_flight` insert; `recordCallCost` settles it by `reservation_id` (`reserved → settled` with the actual cost). The **reconcile job**: (a) `reserved` rows older than T with no `completed` ledger row → **release** (orphan from a crash); (b) `completed` ledger rows whose reservation is still `reserved` → **settle**. Reservations become correlatable and self-healing; `cost_daily` cannot drift unboundedly.
+
+### 6. Fix-prompt & PR-description idempotency (deterministic keys)
+
+GitHub has no native comment idempotency, so use a hidden marker keyed by `run_id`:
+- **fix-prompt:** post with `<!-- codemaster:fix-prompt run_id=<run_id> -->`. On (re)post, list the PR's issue comments, find the marker; present → **PATCH (update)**, absent → **create**.
+- **PR-description:** replace a fenced block `<!-- codemaster:summary -->…<!-- /codemaster:summary -->` in place (no re-append).
+
+Same marker discipline the placeholder already uses; deterministic on `run_id`, so a re-run updates rather than duplicates.
+
+### 7. Workspace cleanup ownership (pod-local)
+
+Add `owner_pod` + `lease_until` to the workspace-lease row. Each pod runs a **local** workspace janitor that sweeps **only its own** `CODEMASTER_WORKSPACE_ROOT` for directories whose lease is released/expired **and** `owner_pod = self` — a pod never tries to delete another pod's `emptyDir`. A crashed pod's `emptyDir` dies with the pod (K8s reclaims it), so cross-pod orphans need no disk action; the reaper marks the dead pod's lease rows released so the run re-allocates a fresh per-attempt workspace on its next pod (it re-clones — acceptable for a coarse re-run).
+
+### 8. Job state machine (precise)
+
+```text
+ready ──claim──▶ leased ──┬─ done       (terminal)
+                          ├─ cancelled  (terminal)
+                          └─ failed ──┬─ attempts < max ─▶ ready  (run_after = backoff)
+                                      └─ attempts ≥ max ─▶ dead   (terminal)
+```
+
+- `failed` is a **transient** internal step: finalizers run, then the job returns to `ready` with a backoff `run_after` if attempts remain, else `dead`.
+- Terminal = `done | cancelled | dead`.
+- Mapping to `core.review_runs.lifecycle_state`: `leased`→`RUNNING` (or `WAITING_RETRY` between attempts), `done`→`COMPLETED`, `dead`→`FAILED`, `cancelled`→`CANCELLED`. (`PARTIAL` remains a `publication_outcome`, orthogonal.)
+
+### 9. Supersede checkpoints (explicit, part of the contract)
+
+An `assertStillCurrent(run)` helper (returns false if `current_run_id ≠ run.run_id` or the run is `CANCELLED`) is checked — abort-and-no-op on loss — at **five** points: **(a)** before start (the gate); **(b)** before the expensive LLM fan-out; **(c)** before persisting findings; **(d)** before posting the GitHub review; **(e)** before finalizing `done`. (a–d) reuse the existing in-`orchestrate()` claim-checks; (e) is new. These are a named part of the shell/orchestrator contract, not incidental.
+
+### 10. Scheduler table & overlap semantics
+
+- Config: a `schedules(schedule_id, cron, input, overlap_policy, enabled)` table (or static config to start).
+- **Leader** = holder of a `pg_advisory_lock`; only the leader ticks.
+- Each due tick `INSERT`s a `background_jobs` row with a **deterministic key** `schedule_id:<tick-window>` under a `UNIQUE` constraint ⇒ **overlap = skip** (a still-running prior tick's key collides → no-op); `replace`/`queue` by varying the key.
+- **Missed ticks** (leader was down): on election, emit at most **one** catch-up tick per schedule — never backfill a storm.
+- **Leader failover**: the advisory lock releases when the leader's session dies; another pod acquires it and resumes. The deterministic key prevents any double-tick during the handover.
+
+### 11. Outbox sink migration (payload-level)
+
+Today: `sink='temporal_workflow_start'` + `TemporalWorkflowStartPayloadV1`. Add `sink='review_job_enqueue'` + `ReviewJobEnqueuePayloadV1 (run_id, review_id, installation_id, repo_id, provider)` and bump `OUTBOX_PAYLOAD_SCHEMA_VERSION`. The **one** dispatcher branches on `sink`: `temporal_workflow_start` → Temporal `startWorkflow` (during rollout); `review_job_enqueue` → `INSERT INTO review_jobs`. The webhook writes one or the other by `target_engine`. Old and new rows coexist during rollout; once an install is fully on the runner and Temporal drained, only the new sink is written.
+
+### 12. Operator API/UI minimum contract
+
+Per-job read + controls, RBAC-gated, every action `audit.audit_events`-logged:
+- **read:** state, attempts, `lease_owner`, heartbeat age, `run_id`, `last_error`, `dead_reason`/`cancel_reason`, finalizer status, timeline.
+- **list/filter:** by state (running / stuck / dead), install, repo.
+- **controls:** retry (`dead`→`ready`), cancel (→ supersede + finalizers), force-release (mutex/workspace) for a wedged job.
+
+Lives in the admin frontend (the migration sub-project), reading the `review_jobs`/`background_jobs` tables.
+
+### 13. Additional chaos case
+
+Add to §"Required chaos test plan": **crash after `post_review` succeeds but before the delivery-lifecycle setters complete** → the re-run must **not** re-post (post idempotency) **and** must finish the lifecycle bookkeeping so no finding is left `delivery_outcome = NULL` (the exact stale-outcome class the current system guards).
 
 ## Alternatives considered
 
