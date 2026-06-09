@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **SCOPE (v3):** This document is **implementation-ready for Phase 1 only** (the runner foundation). Phases 0 and 2–6 are the **roadmap** with explicit "must detail before coding" gates — do **not** let agents start them until each is detailed into its own bite-sized plan.
+> **SCOPE (v4):** This document is **implementation-ready for Phase 1 only** (the runner foundation). Phases 0 and 2–6 are the **roadmap** with explicit "must detail before coding" gates — do **not** let agents start them until each is detailed into its own bite-sized plan.
 
 **Goal:** Replace Temporal with a coarse-grained Postgres job runner — *one durable `review_jobs` row per whole review attempt, executed in one process* — per ADR-0077 v8, without re-decomposing the review into per-step jobs.
 
@@ -26,6 +26,16 @@
 | 9 | LOW | Final/ready states kept stale lease metadata | `markDone`/`markFailed`/`reapCrashLooped` clear `lease_owner`/`attempt_token`/`leased_until`/`timeout_at`/`heartbeat_at` |
 
 Plus a correction the v2 draft carried: the integration DSN is **`:5434/codemaster`** (the existing harness), not `:5439`.
+
+### v4 changelog (resolves the 6 v3-review findings)
+| # | Sev | Finding | Fix (task) |
+|---|---|---|---|
+| 1 | HIGH | `claim()`'s inline `-- tenant:exempt …` markers sit on internal SQL lines, but the gate keys the violation line on `tpl.getStartLineNumber()` and only checks that line + the one above it (`check_tenant_scoped_raw_sql.ts:56,71`) → not recognized | One `// tenant:exempt …` JS comment on the line **immediately above** `const r = await sql…`; it covers every table ref in the template (Task 1.4) |
+| 2 | HIGH | Migration didn't enforce the attempt invariants the crash-loop cap relies on | `CHECK (attempts >= 0)`, `CHECK (max_attempts >= 1)`, `CHECK (priority >= 0)` (new table → inline CHECKs, no expand-contract) (Task 1.1) |
+| 3 | HIGH | Hard timeout frees the runner slot but doesn't stop the underlying work — the orphaned handler can still post/write externally | Phase-2 **hard contract**: handlers MUST be abort-aware and MUST NOT perform external side effects after `signal.aborted`; DB fence protects `core.*`, post-claim idempotency backstops GitHub (Phase-2 checklist + Task 1.10 note) |
+| 4 | MED | `scripts/gates/_registry.ts` only **re-exports** `TENANT_SCOPED_TABLES` from the platform module (`_registry.ts:10`) — it has no own list to edit | Add `"core.review_jobs"` to `libs/platform/src/db/tenant_scoped_tables.ts` **only** (feeds both gate + plugin) (Task 1.1b) |
+| 5 | MED | Fixture `provider_pr_id = pr-${prNumber}` (100k values) can collide on the real `uq (provider, provider_pr_id)` index | Tie both unique indexes to the globally-unique `reviewId`: `provider_pr_id = gh-${reviewId}`, `repo_id` = 48 bits of `reviewId` (Task 1.3) |
+| 6 | LOW | `delivery_id` documented for audit/dedup/rollback but no index + no Phase-1 consumer | Clarify it is **write-only correlation metadata** in Phase 1 (no consumer → no index per schema-with-consumer discipline); the lookup index lands in Phase 4 cutover with its redelivery-dedup consumer (Task 1.1) |
 
 ---
 
@@ -60,6 +70,7 @@ Plus a correction the v2 draft carried: the integration DSN is **`:5434/codemast
 - the **fix-prompt** marker keyed on **`review_id`** + a DB-fenced claim (`ON CONFLICT(review_id)`).
 - the **5 supersede checkpoints** (mutex-lease fail-open inline + `current_run_id` fail-closed at write boundaries) and `mapFailure` → `StateDrift(CANCELLED)`/`StaleWriteError` = terminal-cancelled (never re-enqueue) — **this is where `review_jobs.state='cancelled'` first gets a writer.**
 - the **finalizer protocol** + **two-reaper unification** (one liveness clock = the job lease; disable the `review_run_reaper` for runs with a live `review_jobs` row; fold Phase-1's `reapCrashLooped` into the unified reaper).
+- **HARD CONTRACT: the handler must actually STOP on abort, not merely be abandonable (v4 #3).** Phase 1's `runOneJob` hard runtime ceiling (Task 1.10) guarantees the *worker slot* returns when a handler overruns, but the abandoned handler promise keeps running. The DB fence protects `core.*` writes (a stale completion affects 0 rows), but it does **NOT** protect *external* side effects. So the Phase-2 shell MUST: (a) thread `signal` into every abortable call — `fetch` (pass `signal`), subprocess (process-group kill on abort), the Bedrock/LLM client, and the GitHub post — via the `runWithRetry` `signal` contract; (b) **re-check `signal.aborted` immediately before any external write** (the GitHub review post in particular) and bail rather than post; (c) rely on the post-claim idempotency (`comment_ids`/fix-prompt keyed on `review_id`, ADR-0068 ledger) as the backstop so that even a racing late post is deduped. Without (a)+(b)+(c), a hard-timed-out review could still be posting to GitHub while the runner has already started the next job on another pod. This is a Phase-2 acceptance gate, not optional.
 
 ---
 
@@ -67,7 +78,7 @@ Plus a correction the v2 draft carried: the integration DSN is **`:5434/codemast
 
 ### File structure (Phase 1)
 - Create `migrations/0036_review_jobs.sql` — `core.review_jobs` (FK to `core.review_runs`; **no** `repo_id`/`provider`).
-- Modify `scripts/gates/_registry.ts` **and** `libs/platform/src/db/tenant_scoped_tables.ts` — register `core.review_jobs` as tenant-scoped.
+- Modify `libs/platform/src/db/tenant_scoped_tables.ts` — register `core.review_jobs` as tenant-scoped (single canonical source; `scripts/gates/_registry.ts` re-exports it).
 - Create `libs/contracts/src/review_jobs.v1.ts` — `ReviewJobV1`, `JobState`, `JOB_STATES`.
 - Create `apps/backend/src/runner/review_jobs_repo.ts` — `ReviewJobsRepo` (enqueue/getById/claim/heartbeat/markDone/markFailed/reapCrashLooped) — fenced; lease via SQL `now()`.
 - Create `apps/backend/src/runner/clock_async.ts` — `cancellableSleep(clock, seconds, signal)` (clock-gate-clean cancellable wait).
@@ -95,15 +106,17 @@ CREATE TABLE core.review_jobs (
   review_id       uuid NOT NULL,                     -- grouping key (the Phase-2 shell loads context by review_id)
   installation_id uuid NOT NULL,                     -- DENORMALIZED at enqueue (review_runs does NOT carry it):
                                                      -- tenancy + future per-installation fairness. Not FK-anchored.
-  delivery_id     text,                              -- correlation to the webhook/outbox row (audit/dedup/rollback)
+  delivery_id     text,                              -- WRITE-ONLY correlation metadata in Phase 1 (no reader yet):
+                                                     -- the lookup index lands in Phase 4 cutover with its redelivery-dedup consumer.
   -- 'cancelled' is reachable only in Phase 2 (supersede gets the first writer); Phase 1 ships the vocabulary
   --   and exercises ready/leased/done/dead only.
   -- 'failed' is TRANSIENT (markFailed maps it to ready|dead); it is NOT a persisted resting state:
   state           text NOT NULL DEFAULT 'ready'
                   CHECK (state IN ('ready','leased','done','dead','cancelled')),
-  priority        int  NOT NULL DEFAULT 0,
-  attempts        int  NOT NULL DEFAULT 0,
-  max_attempts    int  NOT NULL DEFAULT 3,
+  -- attempt invariants the crash-loop cap RELIES ON (v3 #2 / v4 #2) — enforced at the DB, not just in app code:
+  priority        int  NOT NULL DEFAULT 0  CHECK (priority >= 0),
+  attempts        int  NOT NULL DEFAULT 0  CHECK (attempts >= 0),
+  max_attempts    int  NOT NULL DEFAULT 3  CHECK (max_attempts >= 1),
   lease_owner     text,
   attempt_token   uuid,                              -- fencing: minted fresh on every claim; CLEARED on every terminal/ready transition
   leased_until    timestamptz,
@@ -126,19 +139,18 @@ CREATE INDEX ix_review_jobs_installation ON core.review_jobs (installation_id);
 > **Denormalization is explicit, not FK-anchored (v3 #7).** Only `run_id` is integrity-anchored (`→ core.review_runs`, which itself FKs the review). `installation_id` is *denormalized at enqueue* from the webhook context — `core.review_runs` does **not** carry `installation_id`, so there is nothing to FK without joining through `pull_request_reviews → repositories`; the enqueuer (Phase 2/4) already holds it. `repo_id` and `provider` are **not stored** on `review_jobs` (the v2 draft wrongly typed `repo_id` as `uuid`; `core.pull_request_reviews.repo_id` is a **GitHub `bigint`** surrogate) — derive them via the `run_id → review_id → pull_request_reviews` join when the Phase-2 shell needs them. Document this in the commit body.
 
 - [ ] **Step 2: Apply** — `CODEMASTER_PG_CORE_DSN=postgresql://postgres:postgres@localhost:5434/codemaster npm run migrate:up`
-  Expected: `Migrations complete!`; `\d core.review_jobs` shows the FK `run_id → core.review_runs`, the two partial indexes + the installation index, the 5-value state CHECK, and **no** `repo_id`/`provider` columns.
+  Expected: `Migrations complete!`; `\d core.review_jobs` shows the FK `run_id → core.review_runs`, the two partial indexes + the installation index, the 5-value state CHECK, the three attempt-invariant CHECKs (`attempts >= 0`, `max_attempts >= 1`, `priority >= 0`), and **no** `repo_id`/`provider` columns.
 - [ ] **Step 3: Commit** — `git add migrations/0036_review_jobs.sql && git commit -m "feat(runner): review_jobs table (FK run_id, DB-now lease, transient-failed state machine, denormalized installation_id)"`
 
-### Task 1.1b: Register `core.review_jobs` as tenant-scoped
+### Task 1.1b: Register `core.review_jobs` as tenant-scoped (single canonical source)
 
-**Files:** Modify `scripts/gates/_registry.ts` (raw-SQL gate) **and** `libs/platform/src/db/tenant_scoped_tables.ts` (runtime Kysely plugin)
+**Files:** Modify **only** `libs/platform/src/db/tenant_scoped_tables.ts`
 
-> Why both: `review_jobs` carries `installation_id` → it is tenant data and must be *documented* as such. The raw-SQL gate (`check_tenant_scoped_raw_sql.ts`) reads `scripts/gates/_registry.ts` to decide which raw-SQL table refs need a tenancy escape hatch; it is **WARN-mode** (always exit 0) so a missing marker won't block `validate-fast`, but registering arms the markers for the tracked ERROR-mode flip. The runtime plugin's `TENANT_SCOPED_TABLES` only fires on **Kysely ORM** statements — our repo uses raw `sql\`\``, so this addition is **inert today** but guards any future query-builder access. There are no existing queries on the new table, so neither addition can break a current call site.
+> **One source, two consumers (v4 #4).** Since the 2026-06-04 consolidation, the tenant-scoped table list lives **once** at `libs/platform/src/db/tenant_scoped_tables.ts`; `scripts/gates/_registry.ts:10` is a thin `export { TENANT_SCOPED_TABLES } from "#platform/db/tenant_scoped_tables.js"` (it has **no** own `Set` literal to edit — do NOT touch it). Adding the table to the platform set feeds **both** the PR-time raw-SQL gate (`check_tenant_scoped_raw_sql.ts`, via that re-export) **and** the runtime Kysely tenancy plugin (`tenancy_plugin.ts`). `review_jobs` carries `installation_id`, so it is tenant data and must be documented as such; the gate is **WARN-mode** (exit 0, won't block `validate-fast`) but registering arms the `// tenant:exempt` markers for the tracked ERROR-mode flip. The runtime plugin only fires on **Kysely ORM** statements — our repo uses raw `sql\`\``, so this is **inert today** but guards future query-builder access. No existing query touches the new table, so this cannot break a call site.
 
-- [ ] **Step 1: Add to the gate registry** — in `scripts/gates/_registry.ts`, add `"core.review_jobs"` to `TENANT_SCOPED_TABLES` (keep the set sorted if it is).
-- [ ] **Step 2: Add to the runtime set** — in `libs/platform/src/db/tenant_scoped_tables.ts`, add `"core.review_jobs"` to the exported `TENANT_SCOPED_TABLES` set (alongside `"core.review_runs"`).
-- [ ] **Step 3: Verify** — `npm run gates` (the tenant gate prints `[INFO] … WARN-mode … Exit 0`; if a registry-parity unit test exists, it stays green). `npm run typecheck` clean.
-- [ ] **Step 4: Commit** — `git add scripts/gates/_registry.ts libs/platform/src/db/tenant_scoped_tables.ts && git commit -m "chore(tenancy): register core.review_jobs as tenant-scoped (gate + runtime set)"`
+- [ ] **Step 1: Add to the canonical set** — in `libs/platform/src/db/tenant_scoped_tables.ts`, add `"core.review_jobs"` to the exported `TENANT_SCOPED_TABLES` set (alongside `"core.review_runs"`; keep the existing ordering convention).
+- [ ] **Step 2: Verify** — `npm run gates` (the tenant gate prints `[INFO] … WARN-mode … Exit 0`; the gate sees the new table via the re-export). `npm run typecheck` clean; if a registry-parity unit test exists, it stays green.
+- [ ] **Step 3: Commit** — `git add libs/platform/src/db/tenant_scoped_tables.ts && git commit -m "chore(tenancy): register core.review_jobs as tenant-scoped (canonical set; re-exported to gate + plugin)"`
 
 ### Task 1.2: Contracts — `review_jobs.v1`
 
@@ -188,14 +200,16 @@ export type ReviewJobV1 = z.infer<typeof ReviewJobV1>;
 
 ```typescript
 // test/integration/runner/_fixtures.ts
-import { randomInt, randomUUID } from "node:crypto"; // test/ is OUT of the clock/random gate's scope
+import { randomUUID } from "node:crypto"; // test/ is OUT of the clock/random gate's scope
 import { Kysely, sql } from "kysely";
 
 /**
  * Seed a real review chain (pull_request_reviews → review_runs) so review_jobs.run_id FK holds.
- * Column sets verified against :5434/codemaster:
+ * Column sets + UNIQUE indexes verified against :5434/codemaster:
  *  - core.pull_request_reviews NOT NULL: review_id, provider, repo_id(bigint), pr_number, provider_pr_id,
  *    status(CHECK ∈ open|closed|merged), created_at. (repo_id is a GitHub bigint, NOT a hard FK — orphans allowed.)
+ *    UNIQUE (provider, provider_pr_id) AND UNIQUE (provider, repo_id, pr_number) — the fixture ties BOTH to the
+ *    globally-unique reviewId so parallel/repeated seeds cannot collide (v4 #5).
  *  - core.review_runs NOT NULL: run_id, review_id(FK→pull_request_reviews.review_id), trigger_type
  *    (CHECK ∈ pr_opened|pr_synchronize|manual_rerun|comment_trigger|retry|scheduled), attempt_number(≥1),
  *    lifecycle_state(CHECK ∈ PENDING|RUNNING|WAITING_RETRY|COMPLETED|FAILED|CANCELLED|PARTIAL), is_ephemeral,
@@ -203,11 +217,14 @@ import { Kysely, sql } from "kysely";
  */
 export async function seedRun(db: Kysely<unknown>): Promise<{ runId: string; reviewId: string; installationId: string }> {
   const runId = randomUUID(), reviewId = randomUUID(), installationId = randomUUID();
-  const repoId = randomInt(1, 2_000_000_000);            // GitHub bigint surrogate
-  const prNumber = randomInt(1, 100_000);
+  // Derive uniqueness from the globally-unique reviewId so NEITHER unique index can flake:
+  //   provider_pr_id carries the full reviewId  → UNIQUE (provider, provider_pr_id) holds.
+  //   repo_id = 48 bits of the reviewId         → UNIQUE (provider, repo_id, pr_number) holds (collision-proof for tests;
+  //   48-bit birthday bound ≈ 16M rows, exact as a JS integer < 2^53, fits the bigint column). pr_number is fixed at 1.
+  const repoId = parseInt(reviewId.replace(/-/g, "").slice(0, 12), 16);
   await sql`INSERT INTO core.pull_request_reviews
       (review_id, provider, repo_id, pr_number, provider_pr_id, status, created_at)
-    VALUES (${reviewId}, 'github', ${repoId}, ${prNumber}, ${`pr-${prNumber}`}, 'open', now())`.execute(db);
+    VALUES (${reviewId}, 'github', ${repoId}, 1, ${`gh-${reviewId}`}, 'open', now())`.execute(db);
   await sql`INSERT INTO core.review_runs
       (run_id, review_id, trigger_type, attempt_number, lifecycle_state, is_ephemeral, started_at, created_at)
     VALUES (${runId}, ${reviewId}, 'pr_opened', 1, 'PENDING', false, now(), now())`.execute(db);
@@ -307,17 +324,18 @@ describeDb("ReviewJobsRepo.claim", () => {
 
 > Note: `setTimeout` in **test** files is allowed (the clock gate scans production `src/**` only, never `test/`).
 
-- [ ] **Step 2: Run → FAIL** ; **Step 3: Implement** — the claim is a privileged cross-tenant path; carry an inline marker on **each** `core.review_jobs` reference (the `UPDATE` line and the subquery `FROM` line):
+- [ ] **Step 2: Run → FAIL** ; **Step 3: Implement** — the claim is a privileged cross-tenant path; one `// tenant:exempt …` marker on the line **immediately above** `const r = await sql…` covers BOTH `core.review_jobs` references in the template (the `UPDATE` and the subquery `FROM`):
 
 ```typescript
   async claim(a: { owner: string; leaseMs: number; maxRuntimeMs: number }): Promise<ReviewJobV1 | null> {
+    // tenant:exempt reason=worker-pool-claim-across-tenants follow_up=FOLLOW-UP-gf3-error-mode
     const r = await sql<ReviewJobV1>`
-      UPDATE core.review_jobs SET state = 'leased', lease_owner = ${a.owner}, attempt_token = gen_random_uuid(),  -- tenant:exempt reason=worker-pool-claim-across-tenants follow_up=FOLLOW-UP-gf3-error-mode
+      UPDATE core.review_jobs SET state = 'leased', lease_owner = ${a.owner}, attempt_token = gen_random_uuid(),
              leased_until = now() + (${a.leaseMs}::double precision / 1000) * interval '1 second',
              timeout_at   = now() + (${a.maxRuntimeMs}::double precision / 1000) * interval '1 second',
              heartbeat_at = now(), started_at = COALESCE(started_at, now()), attempts = attempts + 1
         WHERE job_id = (
-          SELECT job_id FROM core.review_jobs  -- tenant:exempt reason=worker-pool-claim-across-tenants follow_up=FOLLOW-UP-gf3-error-mode
+          SELECT job_id FROM core.review_jobs
             WHERE (state = 'ready'  AND run_after <= now())
                OR (state = 'leased' AND leased_until < now() AND attempts < max_attempts)  -- maxed crashes are NOT reclaimed
             ORDER BY priority DESC, run_after FOR UPDATE SKIP LOCKED LIMIT 1)
@@ -326,7 +344,7 @@ describeDb("ReviewJobsRepo.claim", () => {
   }
 ```
 
-> The trailing `-- …` SQL comments end their lines cleanly (nothing follows them on the line); the inline marker text matches the gate's `tenant:exempt\s+reason=\S+\s+follow_up=\S+` regex on that same line. The `ready` branch needs no attempts guard — a `ready` row always has `attempts < max_attempts` by construction (initial enqueue is 0; `markFailed`'s ready branch only fires when `attempts < max_attempts`). An expired lease at `attempts == max_attempts` is left for `reapCrashLooped` (Task 1.7b) to dead-letter.
+> **Marker placement (v4 #1).** `check_tenant_scoped_raw_sql.ts` reports each violation at `tpl.getStartLineNumber()` (the line where the `sql\`` tagged template begins) and `hasExemptMarker` checks only that line + the line above it (`:56,71`) — it does **not** look at the internal SQL line where `UPDATE`/`FROM` matched. So a single `// tenant:exempt …` comment immediately above `const r = await sql…` satisfies the gate for **every** table ref inside the template (all matches share the same start-line). The v3 inline `-- …` comments sat on internal SQL lines and would NOT have been recognized. The `ready` branch needs no attempts guard — a `ready` row always has `attempts < max_attempts` by construction (initial enqueue is 0; `markFailed`'s ready branch only fires when `attempts < max_attempts`). An expired lease at `attempts == max_attempts` is left for `reapCrashLooped` (Task 1.7b) to dead-letter.
 
 - [ ] **Step 4: Run → PASS** ; **Step 5: Commit** — `git commit -m "feat(runner): claim (DB-now lease + fence + SKIP LOCKED + max-attempts-guarded reclaim + timeout_at + tenant markers)"`
 
@@ -697,7 +715,7 @@ export async function runOneJob(o: { repo: ReviewJobsRepo; clock: Clock; owner: 
 }
 ```
 
-> When the handler settles first, `stop.abort()` in the `finally` wakes both helpers' `cancellableSleep` (no dangling timers). A handler that truly ignores `work.signal` leaves an orphaned promise behind — that is the unavoidable cost of a contract violation; the hard race is what frees the worker slot regardless.
+> When the handler settles first, `stop.abort()` in the `finally` wakes both helpers' `cancellableSleep` (no dangling timers). A handler that truly ignores `work.signal` leaves an orphaned promise behind — the hard race frees the worker *slot*, but the abandoned work can keep running. The DB fence makes a late `markDone`/`markFailed` a no-op (affects 0 rows), so `core.*` is safe — but **external** side effects (a GitHub post) are NOT fenced. That is why the **Phase-2 shell carries a HARD CONTRACT** (see the Phase-2 checklist): every handler path must be abort-aware (`signal` threaded into fetch/subprocess/LLM/GitHub), must re-check `signal.aborted` immediately before any external write, and must rely on post-claim idempotency (`comment_ids`/fix-prompt keyed on `review_id`) as the backstop. Phase 1's hard ceiling protects the runner; Phase 2 must protect the outside world.
 
 - [ ] **Step 4: Run → PASS** ; **Step 5: Commit** — `git commit -m "feat(runner): runOneJob (fenced outcome + cancellable heartbeat + hard runtime ceiling)"`
 
@@ -812,7 +830,7 @@ export class RunnerLoop {
 ---
 
 ## Self-review (writing-plans)
-- **Spec coverage (Phase 1):** runner table (FK, DB-`now()` lease, 5-state machine, **no `repo_id`/`provider`**), tenant registration (gate + runtime set), repo (enqueue/getById/claim/heartbeat/markDone/markFailed/**reapCrashLooped** — all fenced; lease metadata cleared on terminal/ready), `timeout_at` semantics (set on claim, enforced in heartbeat, abort in runOneJob), the **hard runtime ceiling** in runOneJob, the **max-attempts crash-loop cap** (claim reclaim guard + reapCrashLooped), `runWithRetry` (hard timeout + AbortSignal contract + **seam jitter**), `cancellableSleep`, `runOneJob`, chaos, metrics, RunnerLoop (**cancellable idle** + SIGTERM drain + idle reap). Each of the 9 v2-review findings maps to a task per the v3 changelog table above.
+- **Spec coverage (Phase 1):** runner table (FK, DB-`now()` lease, 5-state machine, **no `repo_id`/`provider`**), tenant registration (gate + runtime set), repo (enqueue/getById/claim/heartbeat/markDone/markFailed/**reapCrashLooped** — all fenced; lease metadata cleared on terminal/ready), `timeout_at` semantics (set on claim, enforced in heartbeat, abort in runOneJob), the **hard runtime ceiling** in runOneJob, the **max-attempts crash-loop cap** (claim reclaim guard + reapCrashLooped), `runWithRetry` (hard timeout + AbortSignal contract + **seam jitter**), `cancellableSleep`, `runOneJob`, chaos, metrics, RunnerLoop (**cancellable idle** + SIGTERM drain + idle reap), plus the migration's attempt-invariant CHECKs (`attempts>=0`, `max_attempts>=1`, `priority>=0`) and the abort-aware Phase-2 hard contract. Each of the 9 v2-review findings maps to a task per the v3 changelog table; each of the 6 v3-review findings maps per the v4 changelog table above.
 - **Placeholder scan:** Phase-1 tasks carry complete test + impl code + exact commands; Tasks 1.12/1.13 reference an existing OTel test idiom + the process SIGTERM hook to mirror (named, not vague). Phases 0/2–6 are explicitly *outlines/checklists*, not in-phase placeholders.
 - **Type consistency:** `ReviewJobsRepo` (`enqueue(EnqueueArgs)`/`getById`/`claim`/`heartbeat`/`markDone`→`FencedResult`/`markFailed`→`{applied,terminal}`/`reapCrashLooped`→`number`), `EnqueueArgs` (no `repoId`/`provider`), `RetryPolicy` (seconds), `runWithRetry(clock,random,policy,fn)`, `cancellableSleep(clock,seconds,signal)`, `runOneJob`/`RunOutcome`/`RunnerLoop`, and `seedRun(db) → {runId,reviewId,installationId}` are consistent across Tasks 1.3–1.13. Every integration test calls `seedRun(db)` and `repo.enqueue(s)` (or `{...s, maxAttempts}`).
-- **Verify-against-code (already grounded for v3):** `core.review_runs`/`core.pull_request_reviews` NOT-NULL + CHECK columns (fixture verified vs `:5434/codemaster`), `repo_id` is a GitHub `bigint`, the `#platform/clock.js`/`#platform/randomness.js` exports (`WallClock`, `SystemRandom`/`SeededRandom`, `uuid4`), the `test/integration/_db.ts` harness (`describeDb`/`INTEGRATION_DSN`, no DSN default), `migrate:up` reads `CODEMASTER_PG_CORE_DSN`, `check_clock_random` bans `Math.random()` in `src/`, and `check_tenant_scoped_raw_sql` (WARN-mode; registry at `scripts/gates/_registry.ts`; same/preceding-line marker rule).
+- **Verify-against-code (grounded for v3 + v4):** `core.review_runs`/`core.pull_request_reviews` NOT-NULL + CHECK columns + the two real UNIQUE indexes `(provider, provider_pr_id)` and `(provider, repo_id, pr_number)` (fixture verified vs `:5434/codemaster`), `repo_id` is a GitHub `bigint`, the `#platform/clock.js`/`#platform/randomness.js` exports (`WallClock`, `SystemRandom`/`SeededRandom`, `uuid4`), the `test/integration/_db.ts` harness (`describeDb`/`INTEGRATION_DSN`, no DSN default), `migrate:up` reads `CODEMASTER_PG_CORE_DSN`, `check_clock_random` bans `Math.random()` in `src/`, and `check_tenant_scoped_raw_sql` (WARN-mode; the table list lives once in `libs/platform/src/db/tenant_scoped_tables.ts` and `scripts/gates/_registry.ts:10` re-exports it; the gate keys each violation at `tpl.getStartLineNumber()` and checks that line + the one above — so one marker above `const r = await sql…` covers a whole multi-ref template).
