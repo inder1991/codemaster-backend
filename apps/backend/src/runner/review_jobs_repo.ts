@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto"; // sanctioned hashing primitive (clock_random gate bans random.*, NOT createHash)
 import { type Kysely, sql } from "kysely";
 import { uuid4 } from "#platform/randomness.js";
+import { type Clock, WallClock } from "#platform/clock.js";
+import { getPool, withPgTransaction } from "#platform/db/database.js";
+import { bindAuditContext, emitAuditEvent } from "#backend/audit/emit.js";
 import { ReviewJobV1 } from "#contracts/review_jobs.v1.js";
 import { ReviewPullRequestPayloadV1 } from "#contracts/review_pull_request.v1.js";
 
@@ -53,7 +56,18 @@ function sha256hex(s: string): string {
 }
 
 export class ReviewJobsRepo {
-  constructor(private db: Kysely<unknown>) {}
+  /**
+   * @param db          Kysely over the (shared, ADR-0062) pool — drives every fenced single-statement op.
+   * @param reaperDeps  Collaborators for {@link reapStuckRuns}, which needs a raw `pg` transaction (so the
+   *   per-run audit emit commits in the SAME txn as the job/run/mutex flip). Both OPTIONAL: `dsn` defaults
+   *   to `CODEMASTER_PG_CORE_DSN` (the pool is resolved via the shared {@link getPool}, NOT a fresh pool —
+   *   honoring ADR-0062), and `clock` defaults to {@link WallClock} (stamps the audit `created_at` only;
+   *   the run's `cancelled_at` is the DB `now()`, faithful with `reviewRunReaperActivity`).
+   */
+  constructor(
+    private db: Kysely<unknown>,
+    private reaperDeps: { dsn?: string; clock?: Clock } = {},
+  ) {}
 
   async enqueue(a: EnqueueArgs): Promise<string> {
     // D1: the job becomes the durable workflow-argument store. (1) validate the inner contract
@@ -275,13 +289,113 @@ export class ReviewJobsRepo {
     });
   }
 
-  async reapCrashLooped(): Promise<number> {
-    // tenant:exempt reason=watchdog-sweep-across-tenants follow_up=FOLLOW-UP-gf3-error-mode
-    const r = await sql`UPDATE core.review_jobs
-        SET state = 'dead', dead_reason = COALESCE(dead_reason, 'lease expired with attempts exhausted (crash loop)'),
-            finished_at = now(),
-            leased_until = NULL, lease_owner = NULL, attempt_token = NULL, timeout_at = NULL, heartbeat_at = NULL
-      WHERE state = 'leased' AND leased_until < now() AND attempts >= max_attempts`.execute(this.db);
-    return Number(r.numAffectedRows ?? 0n);
+  /**
+   * The UNIFIED stuck-run reaper (D3, gate ④) — supersedes the old `reapCrashLooped` (which only
+   * dead-lettered the job and left the run stuck at RUNNING + the PR-mutex held forever, so the review
+   * read "In Progress" in the UI and the next push on the same PR was blocked).
+   *
+   * ONE {@link withPgTransaction} transaction does the whole sweep so a throw rolls EVERYTHING back (no
+   * split-brain). For every STUCK job — `state='leased' AND leased_until < now() AND attempts >=
+   * max_attempts` (lease expired AND attempts EXHAUSTED, so `claim()` will NOT reclaim it; an expired
+   * lease with attempts REMAINING is deliberately LEFT for `claim()` to reclaim) — it atomically:
+   *
+   *   (1) flips the JOB → `dead` (`dead_reason` set, `finished_at=now()`, ALL lease metadata cleared) —
+   *       a CTE `UPDATE … RETURNING (job_id, run_id, mutex_id)` so the reaped set drives steps 2-4;
+   *   (2) flips each reaped run → `CANCELLED` (`lifecycle_state='CANCELLED'`, `cancelled_at=now()` (DB
+   *       clock), `cancel_reason='timeout'`). CHECK-safe: `ck_review_runs_cancelled_at_present` +
+   *       `ck_review_runs_cancel_reason` admit `'timeout'`; `superseded_by_run_id` is NOT set (only the
+   *       `'superseded'` reason couples that invariant);
+   *   (3) for each job that held a PR-mutex (`mutex_id IS NOT NULL`) releases that row
+   *       (`released_at=now()` WHERE still live) so the mutex janitor/next push is unblocked;
+   *   (4) records EXACTLY ONE `review_run.reaped` audit event per reaped run (resolving `installation_id`
+   *       via the FK chain `review_id → pull_request_reviews.repo_id (github_repo_id) →
+   *       repositories.installation_id`; an ORPHAN whose repo FK chain is broken — NULL installation —
+   *       is reaped WITHOUT audit so one orphan cannot roll back the entire sweep, 1:1 with
+   *       `reviewRunReaperActivity`).
+   *
+   * Cross-tenant by design (liveness backstop — MUST see every tenant's stuck runs); the raw-SQL sites
+   * carry the inline `tenant:exempt` markers. Returns the count of jobs/runs reaped.
+   */
+  async reapStuckRuns(): Promise<number> {
+    const dsn = this.reaperDeps.dsn ?? process.env["CODEMASTER_PG_CORE_DSN"];
+    if (dsn === undefined || dsn === "") {
+      throw new Error("reapStuckRuns: CODEMASTER_PG_CORE_DSN is not set and no dsn injected");
+    }
+    const clock: Clock = this.reaperDeps.clock ?? new WallClock();
+    const pool = getPool(dsn);
+
+    return withPgTransaction(pool, async (client) => {
+      // (1) Flip every STUCK job → dead in ONE statement, RETURNing the run + mutex it stranded. The
+      //     `attempts >= max_attempts` predicate is the exhaustion gate (an expired-but-retryable lease is
+      //     NOT matched — claim() owns reclaiming those). The outer SELECT resolves installation_id for the
+      //     audit fan-out via the same FK chain + LEFT JOIN as reviewRunReaperActivity (orphan → NULL).
+      // tenant:exempt reason=worker-pool-claim-across-tenants follow_up=FOLLOW-UP-gf3-error-mode
+      const reapedRes = await client.query<{
+        job_id: string; run_id: string; mutex_id: string | null; installation_id: string | null;
+      }>(
+        "WITH reaped AS ( " +
+          "  UPDATE core.review_jobs " +
+          "     SET state = 'dead', " +
+          "         dead_reason = COALESCE(dead_reason, 'lease expired with attempts exhausted (stuck run)'), " +
+          "         finished_at = now(), " +
+          "         leased_until = NULL, lease_owner = NULL, attempt_token = NULL, " +
+          "         timeout_at = NULL, heartbeat_at = NULL " +
+          "   WHERE state = 'leased' AND leased_until < now() AND attempts >= max_attempts " +
+          "  RETURNING job_id, run_id, mutex_id " +
+          ") " +
+          "SELECT rj.job_id, rj.run_id, rj.mutex_id, rep.installation_id " +
+          "FROM reaped rj " +
+          "JOIN core.review_runs rr ON rr.run_id = rj.run_id " +
+          "JOIN core.pull_request_reviews ppr ON ppr.review_id = rr.review_id " +
+          "LEFT JOIN core.repositories rep ON rep.github_repo_id = ppr.repo_id",
+        [],
+      );
+      const reaped = reapedRes.rows;
+
+      for (const row of reaped) {
+        // (2) The run dies WITH the job: CANCELLED / timeout / cancelled_at=now() (DB clock). CHECK-safe.
+        // tenant:exempt reason=PK-update-by-run_id-lockstep-with-job follow_up=FOLLOW-UP-gf3-error-mode
+        await client.query(
+          "UPDATE core.review_runs " +
+            "   SET lifecycle_state = 'CANCELLED', cancelled_at = now(), cancel_reason = 'timeout' " +
+            " WHERE run_id = $1",
+          [row.run_id],
+        );
+
+        // (3) Release the held PR-mutex (only if still live) so the next push on this PR is unblocked.
+        if (row.mutex_id !== null) {
+          // tenant:exempt reason=PK-update-by-mutex_id-release-stranded-lease follow_up=FOLLOW-UP-gf3-error-mode
+          await client.query(
+            "UPDATE core.pr_review_mutex SET released_at = now() " +
+              "WHERE mutex_id = $1 AND released_at IS NULL",
+            [row.mutex_id],
+          );
+        }
+
+        // (4) EXACTLY ONE audit event per reaped run. Orphan (NULL installation_id via the LEFT JOIN) →
+        //     skip the per-tenant emit rather than let bindAuditContext(null) roll back the whole sweep.
+        if (row.installation_id === null) {
+          console.warn(
+            `review_run.reaped: no installation_id via repo FK chain for run ${row.run_id}; ` +
+              "reaped without audit row",
+          );
+          continue;
+        }
+        bindAuditContext(client, { installationId: row.installation_id });
+        await emitAuditEvent({
+          client,
+          actorKind: "system",
+          actorId: null,
+          action: "review_run.reaped",
+          targetKind: "review_run",
+          targetId: String(row.run_id),
+          before: { lifecycle_state: "RUNNING" },
+          after: { lifecycle_state: "CANCELLED", cancel_reason: "timeout" },
+          clock,
+        });
+      }
+
+      return reaped.length;
+    });
   }
 }

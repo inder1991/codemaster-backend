@@ -14,7 +14,7 @@ if (INTEGRATION_DSN) { pool = new Pool({ connectionString: INTEGRATION_DSN, max:
   db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) }); }
 afterAll(async () => { await db?.destroy(); });          // destroys the OWN pool; no disposePool double-end
 
-// AUTHORIZED DEVIATION (test isolation): vitest.config.ts shuffles test order, and claim()/reapCrashLooped()
+// AUTHORIZED DEVIATION (test isolation): vitest.config.ts shuffles test order, and claim()/reapStuckRuns()
 // are CROSS-TENANT scans over ALL core.review_jobs rows. Without per-test cleanup a prior (shuffled) test's
 // leftover 'ready'/'leased' job gets claimed instead of the just-enqueued one and flakes the outcome assertions.
 // Safe because test:integration runs --no-file-parallelism (no other file writes core.review_jobs concurrently)

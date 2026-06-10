@@ -11,7 +11,7 @@ if (INTEGRATION_DSN) { pool = new Pool({ connectionString: INTEGRATION_DSN, max:
   db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) }); }
 afterAll(async () => { await db?.destroy(); });          // destroys the OWN pool; no disposePool double-end
 
-// AUTHORIZED DEVIATION (test isolation): vitest.config.ts shuffles test order, and claim()/reapCrashLooped()
+// AUTHORIZED DEVIATION (test isolation): vitest.config.ts shuffles test order, and claim()/reapStuckRuns()
 // are CROSS-TENANT scans over ALL core.review_jobs rows. Without per-test cleanup a prior (shuffled) test's
 // leftover 'ready'/'leased' job gets claimed/reaped instead of the just-enqueued one and flakes 'attempts===1'.
 // Safe because test:integration runs --no-file-parallelism (no other file writes core.review_jobs concurrently)
@@ -238,20 +238,6 @@ describeDb("ReviewJobsRepo.terminalSettle", () => {
   });
 });
 
-describeDb("ReviewJobsRepo.reapCrashLooped", () => {
-  it("dead-letters an expired lease with attempts exhausted; leaves a live lease alone", async () => {
-    const repo = new ReviewJobsRepo(db);
-    // (A) crash-looped job: maxAttempts=1, claimed (attempts→1), lease expires, never markFailed'd
-    const a = await seedRun(db); await repo.enqueue({ ...a, maxAttempts: 1, payload: minimalReviewPayload(a) });
-    const ca = await repo.claim({ owner: "w1", leaseMs: 1, maxRuntimeMs: 60_000 });
-    await new Promise((r) => setTimeout(r, 50));
-    // (B) live job: freshly claimed with a long lease — must NOT be reaped
-    const b = await seedRun(db); await repo.enqueue({ ...b, payload: minimalReviewPayload(b) });
-    const cb = await repo.claim({ owner: "w2", leaseMs: 60_000, maxRuntimeMs: 60_000 });
-    expect(await repo.reapCrashLooped()).toBe(1);
-    const dead = await repo.getById(ca!.job_id);
-    expect(dead!.state).toBe("dead"); expect((dead as Record<string, unknown>).dead_reason).toContain("crash loop");
-    expect((dead as Record<string, unknown>).attempt_token).toBeNull();          // lease metadata cleared (v3 #9)
-    expect((await repo.getById(cb!.job_id))!.state).toBe("leased"); // live lease untouched
-  });
-});
+// NOTE: `reapCrashLooped` was REPLACED by the unified `reapStuckRuns` (W6.1, D3, gate ④). Its coverage
+// (the stuck-detection scan + job→dead + run→CANCELLED + mutex release + ONE audit event per run) lives in
+// test/integration/runner/reap_stuck_runs.integration.test.ts.

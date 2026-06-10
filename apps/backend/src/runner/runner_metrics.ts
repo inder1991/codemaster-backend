@@ -21,7 +21,7 @@
  *   * codemaster_runner_handler_duration_ms     — histogram: wall time the handler ran (claim → settle).
  *   * codemaster_runner_retry_attempts_total    — counter: a job re-enqueued for another attempt (markFailed
  *                                                  non-terminal).
- *   * codemaster_runner_crash_loop_reaped_total — counter: rows dead-lettered by `reapCrashLooped()`.
+ *   * codemaster_runner_crash_loop_reaped_total — counter: stuck runs reaped by `reapStuckRuns()`.
  *
  * ## Cardinality discipline
  * Bounded-enum labels ONLY: `op` ∈ {markDone, markFailed}; `outcome` ∈ {idle, done, failed, lease_lost, cancelled}.
@@ -82,8 +82,8 @@ const RETRY_ATTEMPTS_COUNTER: Counter = METER.createCounter(RETRY_ATTEMPTS_NAME,
 });
 const CRASH_LOOP_REAPED_COUNTER: Counter = METER.createCounter(CRASH_LOOP_REAPED_NAME, {
   description:
-    "Count of rows dead-lettered by reapCrashLooped() (expired leases whose attempts are exhausted). " +
-    "Each reaped row is a job that crashed every attempt before markFailed could run.",
+    "Count of stuck runs reaped by reapStuckRuns() (expired leases whose attempts are exhausted). " +
+    "Each reaped run had its job dead-lettered, its run CANCELLED, and its PR-mutex released in one txn.",
 });
 
 /** Record one claim() round-trip latency (ms). Fail-safe. */
@@ -121,7 +121,7 @@ export function recordRetryAttempt(): void {
   try { RETRY_ATTEMPTS_COUNTER.add(1); } catch { /* telemetry never perturbs the runner */ }
 }
 
-/** Record the count of rows dead-lettered by one reapCrashLooped() sweep (0 emits nothing). Fail-safe. */
+/** Record the count of stuck runs reaped by one reapStuckRuns() sweep (0 emits nothing). Fail-safe. */
 export function recordCrashLoopReaped(count: number): void {
   if (count <= 0) return;
   try { CRASH_LOOP_REAPED_COUNTER.add(count); } catch { /* telemetry never perturbs the runner */ }

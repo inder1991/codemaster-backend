@@ -135,7 +135,7 @@ export class RunnerLoop {
     while (!this.#stopped) {
       const { outcome } = await runOneJob(this.o);          // an in-flight job ALWAYS runs to completion (drain)
       if (outcome === "idle" && !this.#stopped) {
-        recordCrashLoopReaped(await this.o.repo.reapCrashLooped()); // bounded cleanup of maxed-out crashed leases (v3 #2)
+        recordCrashLoopReaped(await this.o.repo.reapStuckRuns()); // unified reaper: job+run+mutex+audit (D3, gate ④)
         await cancellableSleep(this.o.clock, this.o.idleS, this.#stop.signal); // stop() interrupts this wait (v3 #6)
       }
     }
