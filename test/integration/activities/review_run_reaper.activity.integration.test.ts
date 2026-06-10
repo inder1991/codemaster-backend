@@ -145,9 +145,37 @@ async function seedInstallation(installationId: string): Promise<void> {
   );
 }
 
-/** Tear down a tenant's seeded rows in FK order: review_runs → pull_request_reviews → repositories →
- *  audit_events → installations. (review_runs.review_id FK is ON DELETE RESTRICT, so runs go first.) */
+/**
+ * Seed ONE core.review_jobs row for a run in the given `state`, with `leased_until` set from `leasedUntilSql`.
+ * `state='leased'` + a FUTURE `leased_until` models a LIVE job: the gate-④ `NOT EXISTS` predicate (state IN
+ * ('ready','leased')) must shield the run from the age-sweep reaper while this row exists. NOT NULL columns
+ * `payload`/`payload_sha256` (migration 0037, no DB default) are stamped with inert placeholders — the reaper
+ * predicate reads neither; only `run_id` + `state` are load-bearing. Returns the job_id for later dead-letter.
+ */
+async function seedReviewJob(args: {
+  runId: string;
+  reviewId: string;
+  installationId: string;
+  state: string;
+  leasedUntilSql: string;
+}): Promise<string> {
+  const jobId = newUuid();
+  await pool.query(
+    `INSERT INTO core.review_jobs
+       (job_id, run_id, review_id, installation_id, state, leased_until, payload, payload_sha256)
+     VALUES ($1, $2, $3, $4, $5, ${args.leasedUntilSql}, '{}'::jsonb, '')`,
+    [jobId, args.runId, args.reviewId, args.installationId, args.state],
+  );
+  return jobId;
+}
+
+/** Tear down a tenant's seeded rows in FK order: review_jobs → review_runs → pull_request_reviews →
+ *  repositories → audit_events → installations. (review_jobs.run_id FK → review_runs, so jobs go FIRST;
+ *  review_runs.review_id FK is ON DELETE RESTRICT, so runs precede pull_request_reviews.) */
 async function cleanup(installationId: string, runs: ReadonlyArray<RunSeed>): Promise<void> {
+  for (const r of runs) {
+    await pool.query(`DELETE FROM core.review_jobs WHERE run_id = $1`, [r.runId]);
+  }
   for (const r of runs) {
     await pool.query(`DELETE FROM core.review_runs WHERE run_id = $1`, [r.runId]);
   }
@@ -278,6 +306,56 @@ describeDb("reviewRunReaperActivity (integration, disposable PG)", () => {
       expect((await reapedAuditRows(installationId, c.runId)).length).toBe(0);
     } finally {
       await cleanup(installationId, [a, b, c, d]);
+    }
+  });
+
+  it("does NOT reap a stale RUNNING run while a LIVE review_jobs row (state IN ready|leased) shields it [D3, gate ④]", async () => {
+    const installationId = newUuid();
+    await seedInstallation(installationId);
+
+    // A stale RUNNING run (started 2h ago, well past the 3600s threshold) that WOULD be reaped on age alone.
+    const run = await seedRun({
+      installationId,
+      lifecycleState: "RUNNING",
+      startedAtSql: "now() - interval '2 hours'",
+      linkRepo: true,
+    });
+    // A LIVE job for that run: state='leased' with leased_until in the FUTURE. The gate-④ NOT EXISTS predicate
+    // (state IN ('ready','leased')) must shield the run from the age-sweep so the reaper never fights a live job.
+    const jobId = await seedReviewJob({
+      runId: run.runId,
+      reviewId: run.reviewId,
+      installationId,
+      state: "leased",
+      leasedUntilSql: "now() + interval '1 hour'",
+    });
+
+    try {
+      // First sweep: the live job shields the run → it stays RUNNING (NOT reaped) and emits NO audit row.
+      await reviewRunReaperActivity({ dsn: INTEGRATION_DSN!, staleAfterSeconds: 3600 });
+
+      const shielded = await runRow(run.runId);
+      expect(shielded.lifecycle_state).toBe("RUNNING");
+      expect(shielded.cancel_reason).toBeNull();
+      expect(shielded.cancelled_at).toBeNull();
+      expect((await reapedAuditRows(installationId, run.runId)).length).toBe(0);
+
+      // Dead-letter the job (state='dead' falls OUT of the NOT EXISTS predicate's ('ready','leased') set), so the
+      // run is no longer shielded.
+      // tenant:exempt reason=test-dead-letter-job-by-pk follow_up=FOLLOW-UP-gf3-error-mode
+      await pool.query(`UPDATE core.review_jobs SET state = 'dead' WHERE job_id = $1`, [jobId]);
+
+      // Second sweep: no live job → the stale RUNNING run is now reaped to CANCELLED/timeout + audited once.
+      await reviewRunReaperActivity({ dsn: INTEGRATION_DSN!, staleAfterSeconds: 3600 });
+
+      const reaped = await runRow(run.runId);
+      expect(reaped.lifecycle_state).toBe("CANCELLED");
+      expect(reaped.cancel_reason).toBe("timeout");
+      expect(reaped.cancelled_at).not.toBeNull();
+      expect(reaped.completed_at).toBeNull();
+      expect((await reapedAuditRows(installationId, run.runId)).length).toBe(1);
+    } finally {
+      await cleanup(installationId, [run]);
     }
   });
 });

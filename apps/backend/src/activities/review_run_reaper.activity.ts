@@ -25,6 +25,16 @@
  * `completed_at` MUST stay NULL (`ck_review_runs_completed_at_state` requires it NULL unless
  * state='COMPLETED'), and `degradation_notes` does not exist on this table.
  *
+ * ## Live-job shield (D3, gate ④ — ADR-0077)
+ *
+ * The CTE UPDATE WHERE carries `AND NOT EXISTS (SELECT 1 FROM core.review_jobs j WHERE j.run_id =
+ * review_runs.run_id AND j.state IN ('ready','leased'))` so the Temporal age-sweep reaper NEVER fights a
+ * live runner job: a run that still has a claimable/leased `core.review_jobs` row is being actively driven
+ * by the Phase-1 runner loop (its own per-job lease + heartbeat is the liveness authority), so age alone
+ * must not cancel it. The verbatim `state IN ('ready','leased')` rides `uq_review_jobs_active_run`'s partial
+ * index. Once the job reaches a terminal state (done/dead/cancelled), it falls out of the predicate and a
+ * still-stale RUNNING run becomes reapable on the next sweep.
+ *
  * ## Cross-tenant by design (Python `@privileged_path`)
  *
  * The UPDATE/SELECT carry NO `installation_id` filter — the reaper is a liveness backstop that MUST see
@@ -145,6 +155,7 @@ export async function reviewRunReaperActivity(
         "         cancel_reason = 'timeout' " +
         "   WHERE lifecycle_state = 'RUNNING' " +
         "     AND started_at < now() - make_interval(secs => $1) " +
+        "     AND NOT EXISTS (SELECT 1 FROM core.review_jobs j WHERE j.run_id = review_runs.run_id AND j.state IN ('ready','leased')) " +
         "  RETURNING run_id, review_id " +
         ") " +
         "SELECT r.run_id, r.review_id, rep.installation_id " +
