@@ -607,12 +607,15 @@ export async function seedStuckJob(
   const leasedUntil = opts?.leasedUntilSql ?? sql`now() - interval '1 minute'`;
   const mutexId = opts?.mutexId ?? null;
   const leaseOwner = opts?.leaseOwner ?? "g4-worker";
+  // payload_sha256 must satisfy ck_review_jobs_payload_sha256_hex (64 lowercase hex chars, migration 0038).
+  // This stuck-job fixture never reads the sha, so any CHECK-valid placeholder works — encode the SHA-256 of
+  // the '{}' payload (md5 doubled is a deterministic 64-hex stand-in; the reaper does not verifyPayload).
   await sql`INSERT INTO core.review_jobs
       (job_id, run_id, review_id, installation_id, state, lease_owner, attempt_token,
        attempts, max_attempts, leased_until, mutex_id, payload, payload_sha256)
     VALUES (${jobId}, ${seed.runId}, ${seed.reviewId}, ${seed.installationId}, ${state}, ${leaseOwner},
             gen_random_uuid(), ${attempts}, ${maxAttempts}, ${leasedUntil}, ${mutexId},
-            '{}'::jsonb, '')`.execute(db);
+            '{}'::jsonb, ${"0".repeat(64)})`.execute(db);
   return jobId;
 }
 
