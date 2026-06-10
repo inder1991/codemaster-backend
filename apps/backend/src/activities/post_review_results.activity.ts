@@ -80,6 +80,7 @@ import { VaultHttpPort } from "#backend/adapters/vault_http.js";
 import { assertCurrentRun } from "#backend/domain/stale_write_guard.js";
 import { PendingEmits } from "#backend/infra/post_commit_emit.js";
 import { POST_REVIEW_FAILED_WITH_DROPPED_STATE } from "#backend/review/pipeline/posting.js";
+import { TerminalCancelError } from "#backend/runner/review_job_runner.js";
 
 import { type CitationV1, type ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { type PrMetaV1 } from "#contracts/walkthrough.v1.js";
@@ -739,6 +740,22 @@ type SameRunTakeover =
   | { kind: "raced" };
 
 /**
+ * W4.3 (gate ①) — the pre-write abort gate. Throws {@link TerminalCancelError}("aborted") when the
+ * caller-supplied {@link AbortSignal} is already aborted, BEFORE any NEW GitHub write starts. The
+ * enforceable guarantee (F7) is "no NEW external call STARTS after abort" — so this fires immediately
+ * before each create call (`attemptCreateWithBodyOnlyFallback`, on both the won-claim and the same-run
+ * takeover paths) and before `updateReview`. `signal` is OPTIONAL: absent (the Temporal path) → a no-op,
+ * so existing callers stay byte-identical. A `TerminalCancelError` routes through `runOneJob`'s terminal
+ * settlement (the loser exits clean, never re-enqueued), and on the won-claim path the claim row stays
+ * NULL (`github_review_id` never set) so the next run's same-run takeover (W3.2) recovers it.
+ */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new TerminalCancelError("aborted");
+  }
+}
+
+/**
  * The same-run takeover ladder. IN ORDER (W3.2 / v3-F1): (1) scan GitHub by marker (paginated) to recover
  * an orphaned review a crashed self may have created; (2) on a hit re-fetch its comment ids and CAS-store;
  * (3) ONLY when no remote review exists re-attempt createReview, then the same CAS. The CAS
@@ -758,6 +775,8 @@ async function attemptSameRunTakeover(args: {
   keptFindings: ReadonlyArray<ReviewFindingV1>;
   marker: string;
   prMeta: PrMetaV1;
+  // W4.3 (gate ①): the optional abort signal — the create call below is gated on it. Absent → no-op.
+  signal?: AbortSignal;
 }): Promise<SameRunTakeover> {
   const { db, ghClient, owner, repoName, prNumber, body, headSha, inlinePayload, marker, prMeta } =
     args;
@@ -795,6 +814,9 @@ async function attemptSameRunTakeover(args: {
   } else {
     // (3) No remote review exists → the crashed self never created it → re-attempt the create (with the
     //     same inline→body-only 422 ladder the won-claim path uses). A double-422 → DEGRADED.
+    // W4.3 (gate ①): no NEW GitHub write starts after abort — the marker scan above is a READ; this is the
+    // takeover path's only WRITE, so gate immediately before it.
+    throwIfAborted(args.signal);
     const attempt = await attemptCreateWithBodyOnlyFallback({
       ghClient,
       owner,
@@ -1008,6 +1030,16 @@ export type DoPostDeps = {
    * CAS. A 0-row CAS (a racer won) falls through to the lost-claim update path. NEVER blindly re-creates.
    */
   sameRunTakeover?: boolean;
+  /**
+   * W4.3 / gate ① — optional abort signal. When already-aborted, {@link doPost} throws
+   * {@link TerminalCancelError}("aborted") IMMEDIATELY BEFORE each GitHub write (the won-claim and
+   * same-run-takeover `createReview` calls, and the lost-claim `updateReview`). The enforceable guarantee
+   * (F7) is "no NEW external call STARTS after abort". Absent (the Temporal path) → BYTE-IDENTICAL — the
+   * gate is a no-op. On the won-claim path the claim row stays NULL (`github_review_id` never set) so the
+   * next run's same-run takeover (W3.2) recovers it; the `TerminalCancelError` routes through the runner's
+   * terminal settlement (the loser exits clean, never re-enqueued).
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -1164,6 +1196,10 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
     // computed BEFORE the atomic claim INSERT above, so they're in scope on every code path here.
     // Boundary: the double-422 DEGRADED case is a RETURN value (`attempt.created === null`), NOT a throw,
     // so it falls OUTSIDE this try — only a thrown non-422 ladder error is wrapped (matching Python).
+    // W4.3 (gate ①): no NEW GitHub write starts after abort. Gate OUTSIDE the H-2 try so the
+    // TerminalCancelError propagates as itself (it must NOT be rewrapped into the dropped-state
+    // ApplicationFailure). The claim row stays NULL (github_review_id never set) → W3.2 recovers it.
+    throwIfAborted(deps.signal);
     let attempt: PublicationAttempt;
     try {
       attempt = await attemptCreateWithBodyOnlyFallback({
@@ -1346,6 +1382,8 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
       keptFindings,
       marker,
       prMeta,
+      // W4.3 (gate ①): the takeover's create call is gated on this signal.
+      ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
     });
     if (takeover.kind === "recovered") {
       // The CAS landed (1 row): the row now carries the recovered/created review id + comment ids. Return
@@ -1435,6 +1473,9 @@ export async function doPost(input: PostReviewInputV1, deps: DoPostDeps): Promis
   // won-claim wrap above. The classifier output is IDENTICAL here: this branch uses the SAME
   // `keptIndices` + `droppedClassifications` computed at the top of doPost (BEFORE the atomic claim), so
   // the state survives both publication paths. The message carries the "(update path)" variant per Python.
+  // W4.3 (gate ①): no NEW GitHub write starts after abort. Gate OUTSIDE the H-2 try so the
+  // TerminalCancelError propagates as itself (not rewrapped into the dropped-state ApplicationFailure).
+  throwIfAborted(deps.signal);
   try {
     await ghClient.updateReview({
       owner,

@@ -44,6 +44,9 @@ import {
   type GhReviewClient,
   type ReviewComment,
 } from "#backend/integrations/github/review_client.js";
+// W4.3 (gate ①): the terminal-cancel error the abort gate throws. Static import is safe — the runner
+// module has no import cycle back into the activity (it depends only on #platform / #contracts / ./).
+import { TerminalCancelError } from "#backend/runner/review_job_runner.js";
 
 import { describeDb, INTEGRATION_DSN } from "../_db.js";
 
@@ -62,6 +65,9 @@ type DoPost = (
     clock?: FakeClock;
     inFlightWindowSeconds?: number;
     sameRunTakeover?: boolean;
+    // W4.3 (gate ①): optional abort signal. When already-aborted, doPost throws TerminalCancelError
+    // BEFORE any GitHub write (createReview/updateReview). Absent → byte-identical Temporal behaviour.
+    signal?: AbortSignal;
   },
 ) => Promise<PostedReviewV1>;
 type MarkerFor = (prId: string) => string;
@@ -635,5 +641,115 @@ describeDb("post_review_results doPost — same-run takeover w/ remote-recovery 
     // The marker was NEVER searched on the default path (no takeover).
     expect(calls.findExistingReviewByMarker.length).toBe(0);
     expect(calls.createReview.length).toBe(0);
+  });
+});
+
+// ─── W4.3 (gate ①): no GitHub write after abort ─────────────────────────────────────────────────────
+//
+// doPost gains an OPTIONAL `signal`. The enforceable guarantee (F7): no NEW GitHub write STARTS after
+// `signal.aborted`. The gate sits IMMEDIATELY BEFORE each create call (attemptCreateWithBodyOnlyFallback,
+// on both the won-claim and the same-run-takeover paths) and before `updateReview` — it throws
+// TerminalCancelError("aborted"). On the won-claim path the claim row stays NULL (github_review_id never
+// set) so the next run's same-run takeover (W3.2) recovers it. Absent signal → byte-identical (proven by
+// every test above running with no `signal`); a present-but-NOT-aborted signal must proceed normally.
+describeDb("post_review_results doPost — no GitHub write after abort (W4.3 / gate ①)", () => {
+  let seed: Seed;
+
+  beforeEach(async () => {
+    seed = await seedTenant();
+  });
+
+  afterEach(async () => {
+    await cleanupTenant(seed);
+  });
+
+  it("won-claim: aborted signal → throws TerminalCancelError BEFORE createReview (claim row stays NULL)", async () => {
+    // Stub WOULD create the review, but the aborted signal must short-circuit before the create call so
+    // ZERO createReview is started — leaving the claim row at github_review_id NULL for W3.2 recovery.
+    const created: CreatedReviewV1 = { reviewId: 999, commentIds: [1001, 1002] };
+    const { client, calls } = makeStub({ createReview: [created] });
+    const input = makeInput({ seed, findings: [finding({ start_line: 10, end_line: 10 })] });
+    const aborted = AbortSignal.abort();
+
+    await expect(
+      doPost(input, { ghClient: client, dsn: INTEGRATION_DSN!, clock: FIXED_CLOCK, signal: aborted }),
+    ).rejects.toBeInstanceOf(TerminalCancelError);
+
+    // No GitHub write of any kind started after the abort.
+    expect(calls.createReview.length).toBe(0);
+    expect(calls.updateReview.length).toBe(0);
+
+    // The claim row exists (Phase-1 won the claim) but github_review_id is still NULL — the next run's
+    // same-run takeover recovers it (W3.2). The crash-equivalent here is the abort short-circuit.
+    const row = await readPostedRow(seed.prId);
+    expect(row).toBeDefined();
+    expect(row!.github_review_id).toBeNull();
+  });
+
+  it("lost-claim: aborted signal → throws TerminalCancelError BEFORE updateReview (no update started)", async () => {
+    // Pre-seed a winning row (a prior winner published reviewId 4242). A lost-claim re-run would normally
+    // dispatch updateReview; the aborted signal must short-circuit before it so ZERO updateReview starts.
+    await pool.query(
+      `INSERT INTO core.posted_reviews
+         (pr_id, marker, github_review_id, publication_outcome, comment_ids, posted_at)
+       VALUES ($1, $2, $3, 'inline_posted', '[1001]'::jsonb, now())`,
+      [seed.prId, markerFor(seed.prId), 4242],
+    );
+    const { client, calls } = makeStub({});
+    const input = makeInput({ seed, findings: [finding({ start_line: 10, end_line: 10 })] });
+    const aborted = AbortSignal.abort();
+
+    await expect(
+      doPost(input, { ghClient: client, dsn: INTEGRATION_DSN!, clock: FIXED_CLOCK, signal: aborted }),
+    ).rejects.toBeInstanceOf(TerminalCancelError);
+
+    expect(calls.updateReview.length).toBe(0);
+    expect(calls.createReview.length).toBe(0);
+  });
+
+  it("takeover-create: aborted signal → throws TerminalCancelError BEFORE the takeover createReview", async () => {
+    // The same-run-takeover path re-creates the review when the marker search finds nothing. The aborted
+    // signal must short-circuit before that create. (The marker search itself is a read; the gate fires
+    // before the only WRITE — createReview.)
+    await seedNullClaimRow(seed.prId);
+    const created: CreatedReviewV1 = { reviewId: 4242, commentIds: [7001] };
+    const { client, calls } = makeStub({ createReview: [created], findExistingReviewByMarker: null });
+    const input = makeInput({ seed, findings: [finding({ start_line: 10, end_line: 10 })] });
+    const aborted = AbortSignal.abort();
+
+    await expect(
+      doPost(input, {
+        ghClient: client,
+        dsn: INTEGRATION_DSN!,
+        clock: FIXED_CLOCK,
+        sameRunTakeover: true,
+        signal: aborted,
+      }),
+    ).rejects.toBeInstanceOf(TerminalCancelError);
+
+    // ZERO createReview started after the abort (the only write on the takeover path).
+    expect(calls.createReview.length).toBe(0);
+  });
+
+  it("present-but-NOT-aborted signal proceeds normally (won-claim create runs)", async () => {
+    // A live (un-aborted) signal must NOT block the write — the gate only fires on `signal.aborted`.
+    const created: CreatedReviewV1 = { reviewId: 999, commentIds: [1001, 1002] };
+    const { client, calls } = makeStub({ createReview: [created] });
+    const input = makeInput({
+      seed,
+      findings: [finding({ start_line: 10, end_line: 10 }), finding({ start_line: 20, end_line: 20 })],
+    });
+    const live = new AbortController();
+
+    const result = await doPost(input, {
+      ghClient: client,
+      dsn: INTEGRATION_DSN!,
+      clock: FIXED_CLOCK,
+      signal: live.signal,
+    });
+
+    expect(result.review_id).toBe(999);
+    expect(calls.createReview.length).toBe(1);
+    expect(result.comment_ids).toEqual([1001, 1002]);
   });
 });
