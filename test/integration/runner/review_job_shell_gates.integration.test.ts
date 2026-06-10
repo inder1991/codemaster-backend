@@ -1151,6 +1151,105 @@ describeDb("G3 (b) — supersede: E4 fail-close → cancelled (job+run atomic), 
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// G3 (c) — supersede claim-check fail-CLOSES on a NULL / missing current_run_id (review F3).
+//
+// The E4 supersede check must require EXACT identity: a review whose `current_run_id` no longer points at
+// THIS run — whether flipped to another run (G3(b)), CLEARED to NULL, or whose pull_request_reviews row is
+// MISSING entirely — is a genuine anomaly the Temporal-replacement shell MUST fail-CLOSE on (default-deny).
+// By enqueue time allocateRun has set current_run_id = run_id (seedTenant seeds it), so a NULL here is NEVER
+// the steady state — it means the review row was deleted or current_run_id was cleared out from under the
+// live run, and a stale job must NOT proceed to post.
+//
+// Driving the FULL shell (runReviewJob + runOneJob) with a checkpoint port (`dedupFindings`, right before
+// the before-aggregate claim-check) that CLEARS current_run_id to NULL — modelling both "current_run_id was
+// cleared out from under the live run" AND, since `readCurrentRunId` collapses a MISSING review row to the
+// SAME NULL (`r.rows[0]?.current_run_id ?? null`), the "review row no longer exists" anomaly. (The
+// row-deleted variant cannot be staged in-test: `fk_review_runs_review` is ON DELETE RESTRICT, so the
+// pull_request_reviews row cannot be deleted while the live review_runs row references it — the cleared-NULL
+// case exercises the identical readCurrentRunId-returns-NULL code path.) The next claim-check's
+// readCurrentRunId returns NULL → the shell throws TerminalCancelError("superseded"). runOneJob settles
+// cancelled (job+run atomic) + releases the mutex + the REAL postReview (doPost over the scripted GH client)
+// is never reached → ZERO createReview.
+//
+// BEFORE the F3 fix the guard was `if (current !== null && current !== job.run_id)`, so a NULL `current`
+// SKIPPED the throw and the shell PROCEEDED to outcome 'done' — this gate fails red on that code and green
+// once the guard requires exact identity (`if (current !== job.run_id)`).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+describeDb("G3 (c) — supersede fail-closes on null/missing current_run_id (F3)", () => {
+  it("current_run_id CLEARED to NULL mid-run → settles cancelled (superseded); zero createReview; mutex released", async () => {
+    const repo = new ReviewJobsRepo(db);
+    const seed = await seedTenant(db, 305);
+    const payload = payloadFor(seed);
+    // The scripted GH client WOULD create review 999 if doPost were ever reached — "zero createReview" is a
+    // real control: it is zero ONLY because the F3 fail-close fired before the post stage.
+    const gh = makeScriptedGhClient({ createReview: [{ reviewId: 999, commentIds: [1] }] });
+    const calls: Array<string> = [];
+    let cleared = false;
+
+    try {
+      await repo.enqueue({
+        runId: seed.runId, reviewId: seed.reviewId, installationId: seed.installationId, payload, maxAttempts: 1,
+      });
+
+      // Checkpoint: dedupFindings (dispatched right before the before-aggregate claim-check) CLEARS
+      // current_run_id to NULL (the "review row no longer points at this run" anomaly). Fire ONCE.
+      const ports = makeStubPorts(calls, {
+        dedupFindings: async (input) => {
+          calls.push("dedupFindings");
+          if (!cleared) {
+            cleared = true;
+            await sql`UPDATE core.pull_request_reviews SET current_run_id = NULL WHERE review_id = ${seed.reviewId}`.execute(db);
+          }
+          // A valid DedupedFindingsV1 so, IF the F3 guard were too permissive on NULL, the pipeline would
+          // proceed to the post stage (and createReview would fire — the mutation control for this gate).
+          return { schema_version: 1, findings: [...input.llm_findings], semantic_skipped: false };
+        },
+      });
+      const lifecycle = makeStubLifecycle(calls);
+
+      const handler = runReviewJob({
+        repo, pool, dsn: INTEGRATION_DSN!, clock, mutexRenewIntervalS: 999,
+        ports, lifecycle,
+        // REAL postReview port → real doPost → the scripted GH client. Reachable only if the F3 fail-close
+        // does NOT fire — so a createReview here would PROVE the guard is too permissive on NULL.
+        postReviewGhClient: gh.client,
+      });
+
+      const res = await runOneJob({
+        repo, clock, owner: "g3-c1", leaseS: 5, heartbeatS: 1, maxRuntimeS: 60, handler,
+      });
+
+      // The shell reached the checkpoint (cleared current_run_id) before fail-closing.
+      expect(cleared).toBe(true);
+
+      // (c) MEANINGFUL — a NULL current_run_id fail-CLOSES: R1 settled CANCELLED via terminalSettle (job+run
+      // atomic). Before the F3 fix the NULL SKIPPED the throw → outcome 'done', run 'COMPLETED', createReview 1.
+      expect(res.outcome).toBe("cancelled");
+      const job = await repo.getById(res.jobId!);
+      expect(job!.state).toBe("cancelled");
+      const run = await sql<{ lifecycle_state: string; cancelled_at: string | null }>`
+        SELECT lifecycle_state, cancelled_at::text AS cancelled_at FROM core.review_runs WHERE run_id = ${seed.runId}`.execute(db);
+      expect(run.rows[0]!.lifecycle_state).toBe("CANCELLED");
+      expect(run.rows[0]!.cancelled_at).not.toBeNull(); // AD-7 biconditional: CANCELLED ⇔ cancelled_at present
+      // The free-text cause on the JOB is the supersede reason (the F3 fail-close branch).
+      expect(await readJobCancelReason(res.jobId!)).toBe("superseded");
+
+      // (c) MEANINGFUL — R1 posted NOTHING: ZERO createReview (the post stage was never reached).
+      expect(gh.calls.filter((c) => c.method === "createReview")).toHaveLength(0);
+      expect(calls).not.toContain("postReview");
+
+      // (c) MEANINGFUL — R1 released its PR mutex on the E6 abort-EXEMPT finally (released_at NOT NULL).
+      expect(job!.mutex_id).toBeTruthy();
+      const mutexRow = await sql<{ released_at: string | null }>`
+        SELECT released_at FROM core.pr_review_mutex WHERE mutex_id = ${job!.mutex_id!}`.execute(db);
+      expect(mutexRow.rows[0]!.released_at).not.toBeNull();
+    } finally {
+      await cleanup(db, seed, { prId: payload.pr_id });
+    }
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
 // G4 — reaper unification ④ (D3). REPO-LEVEL (does NOT drive the full shell) — exercises the three
 // liveness primitives DIRECTLY: the Temporal age-sweep `reviewRunReaperActivity` (W6.2, with the

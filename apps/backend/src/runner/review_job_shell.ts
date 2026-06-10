@@ -241,8 +241,15 @@ export function runReviewJob(deps: RunReviewJobDeps): JobHandler {
         throw new TerminalCancelError("mutex-lost", new Error("pr_review_mutex lease definitively lost"));
       }
       const current = await readCurrentRunId(deps.pool, payload.review_id);
-      if (current !== null && current !== job.run_id) {
-        throw new TerminalCancelError("superseded", new Error(`current_run_id=${current} != run_id=${job.run_id}`));
+      // F3 — require EXACT identity (fail-CLOSED, default-deny). By enqueue time allocateRun has set
+      // current_run_id = run_id, so a NULL here (review row MISSING, or current_run_id CLEARED out from under
+      // the live run) is a genuine anomaly, NOT the steady state — a stale job whose review no longer points at
+      // it must terminal-cancel rather than proceed to post.
+      if (current !== job.run_id) {
+        throw new TerminalCancelError(
+          "superseded",
+          new Error(`current_run_id=${current} != run_id=${job.run_id} (missing/cleared/superseded)`),
+        );
       }
     };
 
