@@ -25,14 +25,21 @@ import { runOneJob } from "#backend/runner/review_job_runner.js";
 import { runReviewJob } from "#backend/runner/review_job_shell.js";
 import { doPost } from "#backend/activities/post_review_results.activity.js";
 import { REVIEW_TOOL_SCHEMA_VERSION } from "#backend/review/review_activity.js";
+import { WALKTHROUGH_TOOL_SCHEMA_VERSION } from "#backend/review/walkthrough_activity.js";
+import { purposeChunkId } from "#backend/integrations/llm/invocation_ledger.js";
 import { disposeAllPools } from "#platform/db/database.js";
 import { WallClock } from "#platform/clock.js";
 
 import { type PostReviewInputV1 } from "#contracts/post_review_input.v1.js";
-import { type PrMetaV1, type WalkthroughV1 } from "#contracts/walkthrough.v1.js";
+import { type PrMetaV1, type WalkthroughV1, WalkthroughV1 as WalkthroughV1Schema } from "#contracts/walkthrough.v1.js";
 import { AggregatedFindingsV1 } from "#contracts/aggregated_findings.v1.js";
 import { type ReviewFindingV1 } from "#contracts/review_findings.v1.js";
 import { type CreatedReviewV1 } from "#backend/integrations/github/review_client.js";
+import { type DiffChunkV1, computeChunkId } from "#contracts/diff_chunking.v1.js";
+import { ReviewChunkResponseV1 } from "#contracts/review_chunk_response.v1.js";
+import { type ReviewContextV1 } from "#contracts/review_context.v1.js";
+import { type LlmMessage } from "#contracts/llm_message.v1.js";
+import { type LlmSdk } from "#backend/integrations/llm/client.js";
 
 import {
   seedTenant,
@@ -44,6 +51,8 @@ import {
   makeCountingSdk,
   makeCountingLedgerClient,
   purgeLedgerScenarioRows,
+  type CountingSdk,
+  type CountingSdkCall,
   type Seed,
 } from "./_fixtures.js";
 
@@ -362,6 +371,302 @@ describeDb("G1.3 — in-flight paid LLM call completes but ledger-safe (charged 
     } finally {
       await purgeLedgerScenarioRows(db, seed.installationId);
       await cleanup(db, seed);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// G2 — LLM ledger protocol ② (D2): crash AFTER the paid chunk-fanout + walkthrough, re-run replays them all.
+//
+// Where G1.3 drove ONE invokeModel call twice in isolation, G2 drives the FULL shell (runReviewJob +
+// runOneJob) through its REAL chunk-fanout + walkthrough stages, with the reviewChunk + generateWalkthrough
+// ports each calling a REAL strict-ledger LlmClient (makeCountingLedgerClient — real Postgres cost-cap /
+// blob / telemetry + the REAL ADR-0068 ledger) over a COUNTING SDK, using the EXACT stable per-purpose
+// idempotency context the production review_activity / walkthrough_activity pass (reviewId=pr_id, a stable
+// chunkId, toolSchemaVersion, ledgerPurpose). chunkAndRedact is stubbed to a FIXED chunk set so the chunk
+// ids are STABLE across runs; buildRetrievedEvidence (the per-chunk crypto-minting evidence producer) is
+// stubbed to an EMPTY manifest so the fan-out reaches reviewChunk without makeInProcessPorts eagerly
+// constructing the platform-Qwen embedder (which throws "CODEMASTER_QWEN_DSN is required"); generateWalkthrough
+// returns a fully-defaulted WalkthroughV1 so the REAL post stage's walkthrough renderer composes.
+//
+//   run #1 — runs through the fanout (one paid call per chunk) + the walkthrough (one paid call), storing a
+//            ledger row per content-addressed key, THEN the LATE finalizeReviewRun lifecycle stub throws a
+//            NON-terminal Error (the crash-before-finalization). runOneJob's settleFailure re-enqueues the
+//            job (run stays RUNNING, attempts remain) — the same run_id stays claimable.
+//   run #2 — a SECOND runOneJob re-claims the SAME run_id + SAME payload + SAME fixed chunks. The fanout +
+//            walkthrough re-run, but EVERY invokeModel is now a ledger HIT → the stored provider response
+//            replays → the SDK is NOT re-invoked. finalizeReviewRun succeeds (it throws only on run #1).
+//
+// ASSERT across BOTH runs: the counting SDK started EXACTLY one paid call per chunk + one per purpose (the
+// re-run added ZERO new SDK calls); every second-run lookup was a HIT (the ledger row count stayed constant
+// on the re-run); the per-chunk + walkthrough replayed content is BYTE-IDENTICAL across runs (the
+// per-call-distinct SDK stamps a monotonic call index into the response text, so a re-invoke — replay
+// broken — would return a DIFFERENT body; a HIT replays the run-#1 body verbatim). The single ledger row per
+// key is the cost-charged-once witness (no cost-cap spy is wired; the strict-ledger client's check-first
+// skips checkOrRaise + recordCallCost entirely on a HIT, so the one row IS the once-charged proof).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Two FIXED review chunks with deterministic, replay-stable chunk_ids (computeChunkId over fixed path /
+ *  line-range / body). The chunkAndRedact stub returns this same set on every run, so the per-chunk ledger
+ *  key (which folds in chunk_id) is identical across the crash + the re-run. */
+function fixedChunks(): ReadonlyArray<DiffChunkV1> {
+  const make = (path: string, body: string): DiffChunkV1 => ({
+    schema_version: 1,
+    chunk_id: computeChunkId({ path, start_line: 1, end_line: 5, body }),
+    path,
+    language: "typescript",
+    start_line: 1,
+    end_line: 5,
+    body,
+    chunk_kind: "hunk",
+    token_estimate: 12,
+  });
+  return [
+    make("src/alpha.ts", "export const a = 1;\n"),
+    make("src/beta.ts", "export const b = 2;\n"),
+  ];
+}
+
+/**
+ * A {@link CountingSdk}-shaped collaborator whose createMessage returns a response whose first content
+ * block's `.text` is STAMPED with a strictly-monotonic call index. The client maps that first-block text to
+ * `LlmInvokeResultV1.content`, so the stamp lets the gate distinguish a REPLAY (the run-#1 body re-surfaces
+ * byte-for-byte) from a RE-INVOKE (a fresh, higher-indexed body would surface). Every entry is also recorded
+ * in `calls` (the SDK call-count oracle). Distinct from the harness `makeCountingSdk` only in the per-call
+ * stamp + the extra `tool_use` block so the parser yields one finding per chunk.
+ */
+function makeStampingCountingSdk(): CountingSdk {
+  const calls: Array<CountingSdkCall> = [];
+  let callIndex = 0;
+  const sdk: LlmSdk = {
+    async createMessage(args): Promise<Record<string, unknown>> {
+      callIndex += 1;
+      calls.push({
+        at: Date.now(),
+        model: args.model,
+        role: args.role,
+        signalAborted: args.signal?.aborted === true,
+      });
+      // The first block is a `text` block carrying the monotonic stamp (→ LlmInvokeResultV1.content); the
+      // second is a tool_use block with one real finding (→ raw_content_blocks → parser → one finding).
+      return {
+        id: "msg_g2",
+        content: [
+          { type: "text", text: `paid-completion#${callIndex}` },
+          {
+            type: "tool_use",
+            name: "emit_review",
+            input: {
+              findings: [
+                {
+                  file: "src/alpha.ts",
+                  start_line: 1,
+                  end_line: 1,
+                  severity: "issue",
+                  category: "bug",
+                  title: "stamped finding",
+                  body: "a finding from the stored provider response",
+                  confidence: 0.9,
+                },
+              ],
+            },
+          },
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 10, output_tokens: 5 },
+      };
+    },
+  };
+  return { sdk, calls };
+}
+
+describeDb("G2 — crash after chunk-fanout + walkthrough; re-run replays every paid call (D2)", () => {
+  it("re-run is ALL ledger HITs → ZERO new SDK calls; per-chunk + walkthrough content byte-identical; one row per key", async () => {
+    const repo = new ReviewJobsRepo(db);
+    const seed = await seedTenant(db, 204);
+    const payload = payloadFor(seed);
+    const chunks = fixedChunks();
+
+    // The REAL strict-ledger client over a stamping counting SDK — the exact wiring the shell's reviewChunk /
+    // generateWalkthrough ports use in production, sharing the SAME :5434 core.llm_invocation_ledger table.
+    const sdk = makeStampingCountingSdk();
+    const client = makeCountingLedgerClient(INTEGRATION_DSN!, sdk);
+
+    // Per-run capture of the REPLAYED content, keyed by ledger-purpose surrogate. run#1 fills it on the paid
+    // MISS; run#2 fills it on the HIT — the gate asserts run#2[key] === run#1[key] (byte-identical replay).
+    const contentByKey: { run1: Record<string, string>; run2: Record<string, string> } = { run1: {}, run2: {} };
+    let runPhase: "run1" | "run2" = "run1";
+
+    // A deterministic per-purpose user message; identical across runs for the SAME chunk/purpose so the
+    // prompt-hash component of the idempotency key is stable (a drifting message would re-key → a false MISS).
+    const chunkMessages = (ctx: ReviewContextV1): Array<LlmMessage> => [
+      { role: "system", content: "review-system" },
+      { role: "user", content: `review chunk ${ctx.chunk.chunk_id} at ${ctx.chunk.path}` },
+    ];
+    const walkthroughMessages: Array<LlmMessage> = [
+      { role: "system", content: "walkthrough-system" },
+      { role: "user", content: `walkthrough for ${payload.pr_id}` },
+    ];
+
+    let finalizeCalls = 0;
+
+    try {
+      await repo.enqueue({
+        runId: seed.runId, reviewId: seed.reviewId, installationId: seed.installationId, payload,
+      });
+
+      const drive = async (): Promise<ReturnType<typeof runOneJob>> => {
+        const calls: Array<string> = [];
+        const ports = makeStubPorts(calls, {
+          // FIXED chunk set → stable chunk_ids across the crash + the re-run.
+          chunkAndRedact: async () => {
+            calls.push("chunkAndRedact");
+            return [...chunks];
+          },
+          // Stub the per-chunk evidence-manifest producer to an EMPTY manifest. The orchestrator's
+          // buildChunkContext dispatches this port (mints ev_ ids via node:crypto) per chunk; left
+          // un-stubbed, makeInProcessPorts builds the REAL one via buildActivities(), which eagerly
+          // constructs the platform-Qwen embedder and throws "CODEMASTER_QWEN_DSN is required" before the
+          // fan-out ever reaches reviewChunk. An empty manifest is consistent here: the reviewChunk override
+          // emits zero findings with zero evidence_refs, so the parser's evidence-refs subset check is a
+          // no-op (mirrors the workflow composition tests, which stub this port for the same reason).
+          buildRetrievedEvidence: async () => {
+            calls.push("buildRetrievedEvidence");
+            return [];
+          },
+          // reviewChunk → the REAL strict-ledger invokeModel with the EXACT idempotency context
+          // review_activity.ts passes (reviewId=pr_id, chunkId=chunk.chunk_id, REVIEW_TOOL_SCHEMA_VERSION,
+          // ledgerPurpose="bedrock_review_chunk"). The MISS (run#1) pays + stores; the HIT (run#2) replays.
+          reviewChunk: async (ctx: ReviewContextV1) => {
+            calls.push("reviewChunk");
+            const result = await client.invokeModel({
+              role: "primary",
+              model: "claude-sonnet-4-6",
+              messages: chunkMessages(ctx),
+              maxTokens: 2048,
+              purpose: "review_finding",
+              installationId: ctx.installation_id,
+              idempotency: {
+                reviewId: ctx.pr_id,
+                chunkId: ctx.chunk.chunk_id,
+                toolSchemaVersion: REVIEW_TOOL_SCHEMA_VERSION,
+                ledgerPurpose: "bedrock_review_chunk",
+              },
+            });
+            contentByKey[runPhase][`chunk:${ctx.chunk.chunk_id}`] = result.content;
+            return ReviewChunkResponseV1.parse({ findings: [], arbitration_intents: [], sanitization_event: null });
+          },
+          // generateWalkthrough → the REAL strict-ledger invokeModel with the EXACT idempotency context
+          // walkthrough_activity.ts passes (reviewId=pr_id, chunkId=purposeChunkId("walkthrough"),
+          // WALKTHROUGH_TOOL_SCHEMA_VERSION, ledgerPurpose="walkthrough").
+          generateWalkthrough: async () => {
+            calls.push("generateWalkthrough");
+            const result = await client.invokeModel({
+              role: "primary",
+              model: "claude-opus-4-7",
+              messages: walkthroughMessages,
+              maxTokens: 2048,
+              purpose: "walkthrough",
+              installationId: payload.installation_id,
+              idempotency: {
+                reviewId: payload.pr_id,
+                chunkId: purposeChunkId("walkthrough"),
+                toolSchemaVersion: WALKTHROUGH_TOOL_SCHEMA_VERSION,
+                ledgerPurpose: "walkthrough",
+              },
+            });
+            contentByKey[runPhase]["walkthrough"] = result.content;
+            // Parse through WalkthroughV1 so EVERY field carries its schema default (file_rows: [],
+            // suggested_reviewers: [], etc.). A bare object would leave file_rows undefined and the REAL
+            // walkthrough renderer (the post stage runs the real renderWalkthroughForPost) trips on
+            // `walkthrough.file_rows.length`. Mirrors makeStubPorts' default generateWalkthrough shape.
+            return WalkthroughV1Schema.parse({ tldr: "all good", sanitization_event: null });
+          },
+        });
+        const lifecycle = makeStubLifecycle(calls, {
+          // CRASH on run #1 ONLY — a NON-terminal Error thrown from the LATE finalizeReviewRun (after fanout +
+          // walkthrough already paid + ledgered) → settleFailure re-enqueues the run (still RUNNING) so run #2
+          // re-claims the SAME run_id. On run #2 the real finalize runs (RUNNING → COMPLETED).
+          finalizeReviewRun: async (input) => {
+            calls.push("finalizeReviewRun");
+            finalizeCalls += 1;
+            if (finalizeCalls === 1) {
+              throw new Error("g2-injected crash before finalization (run #1)");
+            }
+            const { finalizeReviewRun } = await import("#backend/activities/record_review_lifecycle.activity.js");
+            await finalizeReviewRun(input as never);
+          },
+        });
+        const handler = runReviewJob({
+          repo, pool, dsn: INTEGRATION_DSN!, clock, mutexRenewIntervalS: 999, ports, lifecycle,
+        });
+        return runOneJob({
+          repo, clock, owner: "g2", leaseS: 5, heartbeatS: 1, maxRuntimeS: 60, handler,
+        });
+      };
+
+      // ── run #1: pays one SDK call per chunk + one for the walkthrough, ledgers each, then crashes. ──
+      runPhase = "run1";
+      const res1 = await drive();
+      expect(res1.outcome).toBe("failed"); // settleFailure re-enqueued (attempts remain; run stays RUNNING)
+
+      const sdkCallsAfter1 = sdk.calls.length;
+      // EXACTLY one paid SDK call per chunk + one for the walkthrough (the run-#1 MISS edge for each key).
+      expect(sdkCallsAfter1).toBe(chunks.length + 1);
+
+      // One content-addressed ledger row per key (reviewId=pr_id for ALL of them → query by review_id).
+      const ledgerAfter1 = await sql<{ n: string }>`
+        SELECT count(*) AS n FROM core.llm_invocation_ledger
+         WHERE installation_id = ${seed.installationId}::uuid AND review_id = ${payload.pr_id}::uuid`.execute(db);
+      expect(Number(ledgerAfter1.rows[0]!.n)).toBe(chunks.length + 1);
+
+      // The job re-enqueued (run still RUNNING, claimable) — nudge run_after to now() so the re-claim is
+      // immediate (markFailed pushed it ~1s out under exponential backoff; a test-only timing nudge, NOT the
+      // property under test).
+      await sql`UPDATE core.review_jobs SET run_after = now() WHERE run_id = ${seed.runId}`.execute(db);
+      const runState1 = await sql<{ lifecycle_state: string }>`
+        SELECT lifecycle_state FROM core.review_runs WHERE run_id = ${seed.runId}`.execute(db);
+      expect(runState1.rows[0]!.lifecycle_state).toBe("RUNNING");
+
+      // ── run #2 (the re-run): re-claims the SAME run_id + SAME payload + SAME fixed chunks. Every paid call
+      //    is now a ledger HIT → the stored provider response replays → the SDK is NOT re-invoked. ──
+      runPhase = "run2";
+      const res2 = await drive();
+      expect(res2.outcome).toBe("done"); // finalize succeeded on run #2 → markDone
+
+      // (1) MEANINGFUL ASSERTION — the re-run added ZERO new SDK calls. Every run-#2 lookup was a HIT, so the
+      // counting SDK call count is UNCHANGED from after run #1. Remove the ledger replay (force replayed=null)
+      // and run #2 would re-invoke the SDK for every key → the count would DOUBLE → the gate fails.
+      expect(sdk.calls.length).toBe(sdkCallsAfter1);
+      expect(sdk.calls.length).toBe(chunks.length + 1);
+
+      // (2) MEANINGFUL ASSERTION — the ledger row count stayed CONSTANT on the re-run (no new row written:
+      // every key was a HIT, not a MISS-then-store). One content-addressed row per key is the once-charged
+      // witness (the strict-ledger check-first skips checkOrRaise + recordCallCost entirely on a HIT).
+      const ledgerAfter2 = await sql<{ n: string }>`
+        SELECT count(*) AS n FROM core.llm_invocation_ledger
+         WHERE installation_id = ${seed.installationId}::uuid AND review_id = ${payload.pr_id}::uuid`.execute(db);
+      expect(Number(ledgerAfter2.rows[0]!.n)).toBe(chunks.length + 1);
+
+      // (3) MEANINGFUL ASSERTION — the per-chunk + walkthrough replayed content is BYTE-IDENTICAL across runs.
+      // The stamping SDK encodes a monotonic call index into each response body, so a re-invoke (replay
+      // broken) would surface a DIFFERENT, higher-indexed body on run #2; a HIT replays the run-#1 body
+      // verbatim. Assert both that every key was captured on both runs AND that run#2 === run#1 per key.
+      const keys = [...chunks.map((c) => `chunk:${c.chunk_id}`), "walkthrough"];
+      for (const key of keys) {
+        const run1Content = contentByKey.run1[key];
+        const run2Content = contentByKey.run2[key];
+        expect(run1Content).toBeDefined();
+        expect(run2Content).toBeDefined();
+        expect(run2Content).toBe(run1Content);
+      }
+      // And the run-#1 bodies carry DISTINCT stamps (call#1..call#N+1) — proves the stamp actually varies, so
+      // the byte-identity above is a real replay, not a constant-body tautology.
+      const run1Bodies = new Set(keys.map((k) => contentByKey.run1[k as keyof (typeof contentByKey)["run1"]]));
+      expect(run1Bodies.size).toBe(chunks.length + 1);
+    } finally {
+      await purgeLedgerScenarioRows(db, seed.installationId);
+      await cleanup(db, seed, { prId: payload.pr_id });
     }
   });
 });
