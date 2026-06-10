@@ -966,7 +966,12 @@ export function buildActivities(): Record<string, (input: never) => Promise<unkn
     // 7.7 arbitration + tool-runs; posting.ts fix-prompt).
     applyArbitrationActivity,
     recordToolRuns,
-    generateFixPrompt: fixPromptActivities.generateFixPrompt,
+    // generateFixPrompt's bound arrow property has arity 3 (input, signal?, opts?). Temporal dispatches
+    // activities with exactly ONE positional arg (single-typed-input invariant #11), so the REGISTERED
+    // value is curried to a 1-arg wrapper that forwards only the input — signal/opts default to undefined
+    // (their existing optional behavior). The non-Temporal shell calls the bound method directly with signal.
+    generateFixPrompt: (input: Parameters<typeof fixPromptActivities.generateFixPrompt>[0]) =>
+      fixPromptActivities.generateFixPrompt(input),
     // ── Auto-registration activities (combined-pod worker reuse — project-owner directive) ──
     // Registered under their snake_case TEMPORAL NAMES (NOT camelCase) because the reconcile/repair
     // workflows (reconcile.workflow.ts) proxy them by those exact names — a camelCase key would dispatch

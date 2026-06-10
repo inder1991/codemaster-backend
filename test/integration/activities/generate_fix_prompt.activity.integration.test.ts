@@ -161,7 +161,8 @@ describeDb("generateFixPrompt — recoverable post claim + operational marker (i
     const input = makeInput({ reviewId, installationId });
 
     const r1 = await act.generateFixPrompt(input);
-    const r2 = await act.generateFixPrompt(input);
+    // Second run drives the dedupe short-circuit (createCalls.length === 1 below); result unused.
+    await act.generateFixPrompt(input);
 
     expect(r1.comment_posted).toBe(true);
     // The second run sees comment_posted_at set → short-circuits BEFORE claim/post.

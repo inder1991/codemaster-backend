@@ -288,24 +288,14 @@ class FakeRepo {
     this.persisted.push({ record, installationId: scope.installationId });
   }
 
-  async claimCommentPost(
-    _reviewId: string,
-    owner: string,
-    _ttlS: number,
-    _scope: { installationId: string },
-  ): Promise<boolean> {
+  async claimCommentPost(_reviewId: string, owner: string): Promise<boolean> {
     // Wins iff not yet posted AND no live claim (in these unit tests a claim, once taken, stays live).
     if (this.posted || this.claimOwner !== null) return false;
     this.claimOwner = owner;
     return true;
   }
 
-  async recordCommentPosted(
-    _reviewId: string,
-    owner: string,
-    commentId: number,
-    _scope: { installationId: string },
-  ): Promise<void> {
+  async recordCommentPosted(_reviewId: string, owner: string, commentId: number): Promise<void> {
     // Fenced on the lease owner (a stale holder no-ops).
     if (this.claimOwner !== owner) return;
     this.posted = true;
@@ -313,7 +303,7 @@ class FakeRepo {
     this.claimOwner = null;
   }
 
-  async isCommentPosted(_reviewId: string, _scope: { installationId: string }): Promise<boolean> {
+  async isCommentPosted(): Promise<boolean> {
     return this.posted;
   }
 
@@ -346,12 +336,7 @@ class FakeGh implements FixPromptIssueCommentClient {
     this.posted.push(args);
     return 999;
   }
-  async listIssueComments(_args: {
-    installationId: number;
-    owner: string;
-    repo: string;
-    prNumber: number;
-  }): Promise<Array<Record<string, unknown>>> {
+  async listIssueComments(): Promise<Array<Record<string, unknown>>> {
     return this.listed.map((c) => ({ id: c.id, body: c.body }) as Record<string, unknown>);
   }
 }
@@ -447,7 +432,7 @@ describe("FixPromptActivities.generateFixPrompt", () => {
     expect(repo.persisted).toHaveLength(1);
     // The post failed → the lease is left UNRECORDED (a re-run reclaims it after expiry; never lost).
     expect(repo.recordedCommentId).toBeNull();
-    expect(await repo.isCommentPosted(REVIEW_ID, { installationId: INSTALLATION_ID })).toBe(false);
+    expect(await repo.isCommentPosted()).toBe(false);
   });
 
   it("still generates (deterministic_fallback) + persists + posts when the LLM enrichment fails", async () => {
