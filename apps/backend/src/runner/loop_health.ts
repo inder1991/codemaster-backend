@@ -10,8 +10,9 @@ import type { Clock } from "#platform/clock.js";
 // the platform and self-healing structurally could not trigger. This registry makes "a required
 // loop is dead" an in-process, queryable fact: the composition root registers every supervised
 // loop BEFORE start (initially "up"), the supervisor's crash boundary marks the crashed loop
-// down (in ADDITION to the existing metric + log — never instead of), and a readiness consumer
-// (the CS3 follow-up wires /readyz) asks {@link LoopHealthRegistry.allRequiredUp}.
+// down (in ADDITION to the existing metric + log — never instead of), and the readiness consumer
+// (CS3.2: api/dependency_checks.ts::makeRuntimeLoopsCheck, the 'runtime-loops' /readyz dependency
+// over main.ts's SHARED registry) asks {@link LoopHealthRegistry.allRequiredUp}.
 //
 // Design notes:
 //   * REQUIRED-ness is DECLARED by register(), never assumed — shadow mode omits the review loop

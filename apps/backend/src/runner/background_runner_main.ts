@@ -84,7 +84,8 @@ import { SchedulerLoop, pollAndEnqueue } from "./scheduler.js";
 //     draining. CS3.1 (cutover-safety CS3): the supervisor additionally feeds a LoopHealthRegistry
 //     (loop_health.ts) — every supervised loop registered REQUIRED before start, a crashed loop
 //     marked down with its reason — so a dead required loop is a QUERYABLE readiness signal, not
-//     only a counter on a possibly no-op Meter (the CS3 follow-up wires it into /readyz).
+//     only a counter on a possibly no-op Meter (CS3.2 wired it into /readyz via main.ts's shared
+//     registry + the 'runtime-loops' dependency check).
 //   * {@link runBackgroundRunner} — the process entrypoint: build, run ALL loops concurrently under
 //     runSupervisedLoops, wire SIGINT/SIGTERM → stop() all + drain (an in-flight job/poll/drain
 //     always completes; the loops' cancellableSleep wakes immediately), then dispose the shared
@@ -553,7 +554,8 @@ async function superviseLoop(
  * composed, so shadow never declares it required), and a loop's escaped crash marks THAT loop down
  * with the crash reason — in ADDITION to the existing metric + log. A dead required loop is thereby
  * a queryable in-process fact (`allRequiredUp() === false`) instead of only a counter on a possibly
- * no-op Meter; the CS3 follow-up wires this into /readyz so the platform can self-heal the pod.
+ * no-op Meter; CS3.2 wires this into /readyz (main.ts threads ONE shared registry into both this
+ * supervisor and the 'runtime-loops' dependency check) so the platform can self-heal the pod.
  */
 export async function runSupervisedLoops(loops: {
   runnerLoop: RunnableLoop;
@@ -603,8 +605,19 @@ export async function runSupervisedLoops(loops: {
  * by type AND re-asserted at runtime below: CS1.1 mutual exclusivity, defense-in-depth for
  * non-typechecked callers). Shadow-specific behavior layers onto this seam in the CS follow-ups;
  * the mode is threaded + logged from day one so the runner always knows which posture it boots in.
+ *
+ * `opts.loopHealth` (CS3.2): the SHARED {@link LoopHealthRegistry} the combined pod (main.ts)
+ * created and ALSO surfaced to /readyz as the 'runtime-loops' dependency check — threading the
+ * SAME instance here is what makes a crashed required loop flip readiness (the CS3 closure;
+ * pre-CS3.2 the registry was constructed privately below, so nothing outside this function could
+ * query it and /readyz stayed hardcoded ready). Omitted (the direct `node background_runner_main`
+ * invocation) → a private registry: supervision semantics are identical, the readiness surface is
+ * simply absent because that boot shape has no HTTP server.
  */
-export async function runBackgroundRunner(mode: BackgroundRunnerMode): Promise<void> {
+export async function runBackgroundRunner(
+  mode: BackgroundRunnerMode,
+  opts: { loopHealth?: LoopHealthRegistry } = {},
+): Promise<void> {
   if (mode !== "postgres" && mode !== "shadow") {
     throw new Error(
       `runBackgroundRunner: mode must be 'postgres' or 'shadow'; got '${String(mode)}' — the ` +
@@ -689,10 +702,12 @@ export async function runBackgroundRunner(mode: BackgroundRunnerMode): Promise<v
   //
   // CS3.1: the supervisor registers every composed loop on `loopHealth` as REQUIRED before start
   // and marks a crashed loop down with its reason — a dead required loop is a queryable in-process
-  // fact, not just a counter on a possibly no-op Meter. The CS3 follow-up threads this registry
-  // into the /readyz handler (today hardcoded ready — audit C5/H7/XH11/RT2) so the platform
-  // restarts a degraded pod instead of routing to it forever.
-  const loopHealth = new LoopHealthRegistry({ clock });
+  // fact, not just a counter on a possibly no-op Meter. CS3.2 closed the loop: the combined pod
+  // (main.ts) threads ITS registry in (the same instance /readyz aggregates via the
+  // 'runtime-loops' check — api/dependency_checks.ts), so a crashed required loop flips the pod
+  // not-ready and the platform stops routing to it / replaces it instead of routing forever
+  // (audit C5/H7/XH11/RT2).
+  const loopHealth = opts.loopHealth ?? new LoopHealthRegistry({ clock });
   const crashes = await runSupervisedLoops({ ...handles, health: loopHealth });
 
   process.removeListener("SIGINT", stopAll);

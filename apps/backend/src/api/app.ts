@@ -23,23 +23,53 @@ export type HealthResult = {
   latency_ms: number | null;
   error: string | null;
 };
+/** One dependency probe. MUST be internally time-bounded (its own query/transport timeout): both
+ *  probe routes await it, and an unbounded hang turns into a kubelet probe timeout. */
 export type HealthCheck = () => Promise<HealthResult>;
 const UNKNOWN_HEALTH: HealthResult = { status: "unknown", latency_ms: null, error: null };
 
 /** A named readiness dependency check (ADR-0007 deep-readiness probes; the failed name surfaces in 503). */
 export type DependencyCheck = { name: string; check: HealthCheck };
 
+/** The /healthz LIVENESS wedge signal (CS3.2): `null` = the process can make progress; a string =
+ *  the process is WEDGED (the reason) and ONLY then does liveness fail. Synchronous + in-memory BY
+ *  DESIGN — liveness must never await dependency I/O (see the probe-semantics doc below). */
+export type WedgeCheck = () => string | null;
+
 export type BuildAppDeps = {
   clock?: Clock;
   version?: string;
   buildSha?: string;
-  /** Legacy single Postgres probe (folded into /readyz under the name "postgres"). */
+  /** Postgres probe — aggregated into /readyz under the name "postgres" AND shown (informationally
+   *  only — never status-affecting) in the /healthz snapshot. */
   postgresCheck?: HealthCheck;
-  /** Vault probe for /healthz (not aggregated into /readyz unless also passed as a dependencyCheck). */
+  /** Vault probe — CS3.2: aggregated into /readyz under the name "vault" (pre-CS3.2 it fed only the
+   *  /healthz snapshot, so a dead Vault never failed readiness) AND shown in the /healthz snapshot. */
   vaultCheck?: HealthCheck;
-  /** Sprint-16 deep-readiness checks aggregated by /readyz. */
+  /** Further deep-readiness checks aggregated by /readyz (ADR-0007) — e.g. the CS3.2
+   *  'runtime-loops' loop-liveness check (api/dependency_checks.ts::makeRuntimeLoopsCheck). */
   dependencyChecks?: ReadonlyArray<DependencyCheck>;
+  /** CS3.2 LIVENESS seam: /healthz fails (503) IFF this returns a wedge reason. Omitted → /healthz
+   *  is always 200 — a process that serves HTTP is alive (a TOTAL loop loss exits the process via
+   *  main.ts's fail-loud Promise.all, so K8s restarts it without any probe's help). */
+  wedgeCheck?: WedgeCheck;
 };
+
+/** Run one /healthz SNAPSHOT probe: informational only — a missing check reports "unknown" and a
+ *  THROWN check normalizes to "down" (pre-CS3.2 a throw 500'd the LIVENESS route — a downstream
+ *  outage masquerading as a dead process is exactly the restart-storm shape). */
+async function snapshotHealth(check: HealthCheck | undefined): Promise<HealthResult> {
+  if (check === undefined) {
+    return UNKNOWN_HEALTH;
+  }
+  try {
+    return await check();
+  } catch (e) {
+    const cls = e instanceof Error ? e.constructor.name : typeof e;
+    const msg = e instanceof Error ? e.message.slice(0, 120) : String(e);
+    return { status: "down", latency_ms: null, error: `${cls}: ${msg}` };
+  }
+}
 
 /**
  * Build the HTTP app (1:1 in intent with the Python `build_app`). Registers the three built-in endpoints;
@@ -50,18 +80,59 @@ export function buildApp(deps: BuildAppDeps = {}): FastifyInstance {
   const version = deps.version ?? APP_VERSION;
   const app = Fastify({ logger: false, bodyLimit: BODY_LIMIT_BYTES });
 
-  // GET /healthz — liveness + a dependency status snapshot (1:1 with the Python healthz).
-  app.get("/healthz", async () => {
-    const postgres = deps.postgresCheck !== undefined ? await deps.postgresCheck() : UNKNOWN_HEALTH;
-    const vault = deps.vaultCheck !== undefined ? await deps.vaultCheck() : UNKNOWN_HEALTH;
-    return { schema_version: 1, version, timestamp: clock.now().toISOString(), postgres, vault };
+  // ── K8s PROBE SEMANTICS (CS3.2 — cutover-safety CS3; audit C5/H7/XH11/RT2). The two probes are
+  // distinct and NON-INTERCHANGEABLE; getting them wrong causes restart storms during downstream
+  // outages:
+  //
+  //   * /readyz (READINESS) — fails on DEPENDENCY issues: 503 + the failed name(s) when ANY of
+  //     {Postgres, Vault, a required runtime loop, any further dependencyCheck} is down. Effect:
+  //     Kubernetes stops routing traffic to the pod; the rollout controller replaces a
+  //     persistently-degraded pod via a normal rolling-replace. The pod may recover internally and
+  //     flip back to Ready — NO crash loop.
+  //   * /healthz (LIVENESS) — fails ONLY on a process WEDGE (the explicit wedgeCheck seam): the
+  //     process itself cannot make progress even after internal recovery. It MUST NOT fail merely
+  //     because DB/Vault/a loop is down — otherwise every pod restarts in lockstep while the
+  //     dependency is the actual problem. The dependency snapshot in its body is INFORMATIONAL
+  //     (a thrown check normalizes to "down"; the status code stays 200).
+  //
+  // A TOTAL loss (every runtime loop crashed) needs no wedge signal: runBackgroundRunner re-throws,
+  // main.ts's fail-loud Promise.all exits non-zero, and the platform restarts the pod.
+
+  // GET /healthz — LIVENESS: wedge-only failure + an informational dependency snapshot.
+  app.get("/healthz", async (_req, reply) => {
+    const wedge = deps.wedgeCheck !== undefined ? deps.wedgeCheck() : null;
+    if (wedge !== null) {
+      reply.code(503);
+      return {
+        schema_version: 1,
+        version,
+        timestamp: clock.now().toISOString(),
+        wedged: true,
+        reason: wedge,
+      };
+    }
+    const postgres = await snapshotHealth(deps.postgresCheck);
+    const vault = await snapshotHealth(deps.vaultCheck);
+    return {
+      schema_version: 1,
+      version,
+      timestamp: clock.now().toISOString(),
+      wedged: false,
+      postgres,
+      vault,
+    };
   });
 
-  // GET /readyz — deep readiness (ADR-0007): aggregate all checks; 503 + the failed names if ANY is down.
+  // GET /readyz — READINESS (ADR-0007 deep readiness): aggregate ALL declared checks — the named
+  // postgres/vault slots (CS3.2 folded vault in; it was snapshot-only before) plus every
+  // dependencyCheck; 503 + the failed names if ANY is down.
   app.get("/readyz", async (_req, reply) => {
     const checks: Array<DependencyCheck> = [];
     if (deps.postgresCheck !== undefined) {
       checks.push({ name: "postgres", check: deps.postgresCheck });
+    }
+    if (deps.vaultCheck !== undefined) {
+      checks.push({ name: "vault", check: deps.vaultCheck });
     }
     if (deps.dependencyChecks !== undefined) {
       checks.push(...deps.dependencyChecks);

@@ -18,12 +18,22 @@ import { loadFieldEncryptionKeyRegistry } from "#backend/security/field_encrypti
 import { tenantKysely } from "#platform/db/database.js";
 import { WallClock } from "#platform/clock.js";
 
-import { buildApp } from "./app.js";
+import { buildApp, type BuildAppDeps } from "./app.js";
 import { registerGithubWebhookRoutes } from "./github_webhook_routes.js";
 
+/** The probe seams runServer forwards to buildApp (CS3.2): the readiness dependency checks
+ *  (Postgres / Vault / the 'runtime-loops' loop-liveness check) + the liveness wedge signal.
+ *  The combined pod (main.ts) composes these from env + the shared LoopHealthRegistry; the
+ *  direct api-only entrypoint below passes none (process-up readiness — no runtime loops are
+ *  that pod's job, and nothing is wired that it would gate on). */
+export type RunServerDeps = Pick<
+  BuildAppDeps,
+  "postgresCheck" | "vaultCheck" | "dependencyChecks" | "wedgeCheck"
+>;
+
 /** Build the app, register routers, and listen. Resolves when the server is listening. */
-export async function runServer(): Promise<void> {
-  const app = buildApp();
+export async function runServer(deps: RunServerDeps = {}): Promise<void> {
+  const app = buildApp(deps);
 
   // F1·b — POST /v1/github/webhook (verification edge). The secret provider is source-selected per
   // ADR-0071 (CODEMASTER_VAULT_SECRET_SOURCE): the default lazy Vault provider OR the Vault Agent
