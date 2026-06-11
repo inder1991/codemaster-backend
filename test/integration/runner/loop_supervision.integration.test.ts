@@ -12,8 +12,19 @@
 //   (2) GRACEFUL: with all three loops healthy, stop() resolves the composition with ZERO crashes
 //       and the crash metric never fires (a graceful stop is not misreported as a crash).
 //   (3) TOTAL LOSS: when EVERY loop crashes, the composition resolves on its own (no stop() ever
-//       called) naming all three crashes — the entrypoint's fail-loud exit path fires and the
+//       called) naming all the crashes — the entrypoint's fail-loud exit path fires and the
 //       platform restarts the pod (no zombie process lingering with zero live loops).
+//
+// CS3.1 (cutover-safety finding CS3 — audit C5/H7/XH11/RT2) layers the QUERYABLE liveness signal
+// onto the same seam: runSupervisedLoops registers every supervised loop on the threaded
+// LoopHealthRegistry BEFORE start (initially "up"), and a loop's escaped crash marks THAT loop
+// down (with the crash reason) IN ADDITION to the existing metric + log — so a dead required loop
+// is no longer invisible (the counter is a no-op meter in an unwired pod; /readyz is hardcoded
+// ready). Each scenario asserts the registry alongside the existing supervision contract:
+//   (1) ISOLATION  → the rigged loop is DOWN with its reason, the survivors stay UP,
+//       allRequiredUp() false, and the crash metric STILL fires;
+//   (2) GRACEFUL   → a stop()-drained run leaves every loop UP (a graceful stop is not a crash);
+//   (3) TOTAL LOSS → every supervised loop (review included) is DOWN.
 //
 // Runs ONLY against an explicitly-set CODEMASTER_PG_CORE_DSN (the disposable :5434 DB) — never a
 // shared cluster (test skips when the DSN is absent, per test/integration/_db.ts).
@@ -26,6 +37,7 @@ import { describeDb, INTEGRATION_DSN } from "../_db.js";
 import { BackgroundJobsRepo } from "#backend/runner/background_jobs_repo.js";
 import { BackgroundRunnerLoop } from "#backend/runner/background_runner.js";
 import { HandlerRegistry } from "#backend/runner/handler_registry.js";
+import { LoopHealthRegistry } from "#backend/runner/loop_health.js";
 import { OutboxDispatcherLoop, type OutboxActivityFns } from "#backend/runner/outbox_dispatcher_loop.js";
 import { SchedulerLoop } from "#backend/runner/scheduler.js";
 import { runSupervisedLoops } from "#backend/runner/background_runner_main.js";
@@ -80,7 +92,7 @@ function stubOutboxActivities(onClaim: () => void): OutboxActivityFns {
 }
 
 describeDb("runSupervisedLoops — per-loop supervision (Phase 4b W4b.2, review blocker #3)", () => {
-  it("(1) ISOLATION: a crashed scheduler is metered + stops ALONE; runner + outbox KEEP RUNNING until a real stop()", async () => {
+  it("(1) ISOLATION: a crashed scheduler is metered + marked DOWN on the health registry + stops ALONE; runner + outbox KEEP RUNNING until a real stop()", async () => {
     const clock = new WallClock();
     const repo = new BackgroundJobsRepo(db);
 
@@ -109,13 +121,31 @@ describeDb("runSupervisedLoops — per-loop supervision (Phase 4b W4b.2, review 
       vi.spyOn(runnerLoop, "stop"), vi.spyOn(schedulerLoop, "stop"), vi.spyOn(outboxLoop, "stop"),
     ];
 
+    // CS3.1: the queryable liveness registry the supervisor feeds — registered before start, fed on crash.
+    const health = new LoopHealthRegistry({ clock });
+
     let settled = false;
-    const supervised = runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop })
+    const supervised = runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop, health })
       .then((crashes) => { settled = true; return crashes; });
+
+    // The supervisor registered EXACTLY the supervised set as REQUIRED loops (no review loop here).
+    expect(Object.keys(health.snapshot()).sort()).toEqual(["outbox", "runner", "scheduler"]);
 
     // The scheduler crashes on its first poll → the bounded crash metric fires for IT alone.
     await vi.waitFor(() => { expect(loopCrashSpy).toHaveBeenCalledWith({ loop: "scheduler" }); });
     expect(loopCrashSpy).toHaveBeenCalledTimes(1);
+
+    // CS3.1: the crash is now a QUERYABLE readiness signal — the dead loop is DOWN with its reason
+    // (in ADDITION to the metric above, which is a no-op meter in an unwired pod), the survivors
+    // stay UP, and the aggregate flips.
+    expect(health.allRequiredUp()).toBe(false);
+    const snap = health.snapshot();
+    expect(snap["scheduler"]).toMatchObject({
+      status: "down",
+      reason: expect.stringContaining("rigged: scheduler pass-level failure") as unknown,
+    });
+    expect(snap["runner"]).toMatchObject({ status: "up" });
+    expect(snap["outbox"]).toMatchObject({ status: "up" });
 
     // The RUNNER is still alive: a job enqueued AFTER the crash is claimed + completed.
     const jobId = await repo.enqueue({ jobType, payload: { tag: "post-crash" } });
@@ -137,9 +167,16 @@ describeDb("runSupervisedLoops — per-loop supervision (Phase 4b W4b.2, review 
     expect(settled).toBe(true);
     expect(crashes).toEqual([{ loop: "scheduler", error: expect.any(Error) }]);
     expect(crashes[0]!.error.message).toMatch(/rigged: scheduler pass-level failure/);
+
+    // CS3.1: a GRACEFUL stop() is not a crash — the drained survivors stay UP; only the genuinely
+    // crashed loop reads down after the run ends.
+    const finalSnap = health.snapshot();
+    expect(finalSnap["runner"]).toMatchObject({ status: "up" });
+    expect(finalSnap["outbox"]).toMatchObject({ status: "up" });
+    expect(finalSnap["scheduler"]).toMatchObject({ status: "down" });
   }, 15_000);
 
-  it("(2) GRACEFUL: healthy loops stopped via stop() report ZERO crashes and never fire the crash metric", async () => {
+  it("(2) GRACEFUL: healthy loops stopped via stop() report ZERO crashes, never fire the crash metric, and stay UP on the health registry", async () => {
     const clock = new WallClock();
     const repo = new BackgroundJobsRepo(db);
     const runnerLoop = new BackgroundRunnerLoop({
@@ -148,20 +185,23 @@ describeDb("runSupervisedLoops — per-loop supervision (Phase 4b W4b.2, review 
     });
     const schedulerLoop = new SchedulerLoop({ repo, db, clock, pollIntervalS: 600 });
     const outboxLoop = new OutboxDispatcherLoop({ activities: stubOutboxActivities(() => undefined), clock, idleS: 600 });
+    const health = new LoopHealthRegistry({ clock });
 
     const t = Date.now();
-    const supervised = runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop });
+    const supervised = runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop, health });
     await new Promise((r) => setTimeout(r, 100)); // all loops are inside their idle/poll sleeps
     runnerLoop.stop(); schedulerLoop.stop(); outboxLoop.stop();
     expect(await supervised).toEqual([]);
     expect(Date.now() - t).toBeLessThan(2000); // interrupted the huge sleeps, not waited out
     expect(loopCrashSpy).not.toHaveBeenCalled();
+    // CS3.1: a graceful stop is never misreported as a degradation — every loop stays UP.
+    expect(health.allRequiredUp()).toBe(true);
   }, 10_000);
 });
 
 // ── (3) TOTAL LOSS — pure-composition behavior, no DB needed ────────────────────────────────────
 describe("runSupervisedLoops — every loop crashed (the fail-loud exit path)", () => {
-  it("resolves ON ITS OWN (no stop() ever called) naming all three crashes — no zombie wait", async () => {
+  it("resolves ON ITS OWN (no stop() ever called) naming all four crashes — every loop DOWN on the registry, no zombie wait", async () => {
     const clock = new WallClock();
     loopCrashSpy.mockClear();
     const runnerLoop = new BackgroundRunnerLoop({
@@ -178,10 +218,25 @@ describe("runSupervisedLoops — every loop crashed (the fail-loud exit path)", 
       },
       clock, idleS: 600,
     });
+    // CS2.1's optional fourth loop joins the supervised set structurally ({ run() }) — rigging it
+    // too pins that `review` is registered + health-fed exactly like the always-present three.
+    const reviewLoop = { run: async (): Promise<never> => { throw new Error("rigged: review claim failure"); } };
+    const health = new LoopHealthRegistry({ clock });
 
-    const crashes = await runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop });
-    expect(crashes.map((c) => c.loop).sort()).toEqual(["outbox", "runner", "scheduler"]);
+    const crashes = await runSupervisedLoops({ runnerLoop, schedulerLoop, outboxLoop, reviewLoop, health });
+    expect(crashes.map((c) => c.loop).sort()).toEqual(["outbox", "review", "runner", "scheduler"]);
     expect(crashes.every((c) => c.error.message.startsWith("rigged:"))).toBe(true);
-    expect(loopCrashSpy).toHaveBeenCalledTimes(3);
+    expect(loopCrashSpy).toHaveBeenCalledTimes(4);
+
+    // CS3.1: total loss is fully queryable — EVERY supervised loop reads down with its own reason.
+    expect(health.allRequiredUp()).toBe(false);
+    const snap = health.snapshot();
+    expect(Object.keys(snap).sort()).toEqual(["outbox", "review", "runner", "scheduler"]);
+    for (const [loop, state] of Object.entries(snap)) {
+      expect(state, `loop=${loop}`).toMatchObject({
+        status: "down",
+        reason: expect.stringContaining("rigged:") as unknown,
+      });
+    }
   }, 10_000);
 });
